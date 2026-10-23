@@ -12,7 +12,10 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 from __future__ import annotations
 
+import tkinter as tk
 from importlib import import_module
+from threading import Event as ThreadEvent
+from threading import get_ident
 from tkinter import Event, ttk
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -21,7 +24,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import ardupilot_methodic_configurator.plugins.frontend_tkinter_motor_test as motor_test_module
-from ardupilot_methodic_configurator.plugins.data_model_motor_test import (  # pylint: disable=unused-import
+from ardupilot_methodic_configurator.backend_filesystem_program_settings import ProgramSettings
+from ardupilot_methodic_configurator.backend_flightcontroller import FlightController
+from ardupilot_methodic_configurator.backend_flightcontroller_reconnect import FlightControllerReconnect
+from ardupilot_methodic_configurator.frontend_tkinter_connection_recovery import (
+    ConnectionRecovery,
+    RecoveryCallbacks,
+    RecoveryState,
+)
+from ardupilot_methodic_configurator.frontend_tkinter_navigation_lock import NavigationLock
+from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
+from ardupilot_methodic_configurator.plugins.data_model_motor_test import (
     MotorTestDataModel,
     MotorTestExecutionError,
     MotorTestSafetyError,
@@ -36,17 +49,25 @@ from ardupilot_methodic_configurator.plugins.frontend_tkinter_motor_test import 
     _create_motor_test_view,
     register_motor_test_plugin,
 )
+from ardupilot_methodic_configurator.plugins.plugin_protocol import PluginPauseReason
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
+    from pathlib import Path
     from typing import Any
 
+    from pytest_mock import MockerFixture
 
-# pylint: disable=redefined-outer-name, too-few-public-methods, protected-access, raising-bad-type
+
+# pylint: disable=redefined-outer-name, too-few-public-methods, protected-access, raising-bad-type, too-many-lines
+
+
 class FakeMotorTestModel:  # pylint: disable=too-many-instance-attributes, too-many-public-methods
     """Minimal stand-in for MotorTestDataModel with controllable behavior."""
 
     def __init__(self) -> None:
+        self.frame_class = 1
+        self.frame_type = 1
         self.motor_count = 2
         self.motor_labels = ["A", "B"]
         self.motor_numbers = [1, 2]
@@ -158,8 +179,8 @@ class FakeMotorTestModel:  # pylint: disable=too-many-instance-attributes, too-m
     def get_safety_warning_message(self) -> str:
         return "Proceed with caution"
 
-    def is_battery_related_safety_issue(self, reason: str) -> bool:
-        return self.battery_issue and "voltage" in reason.lower()
+    def is_battery_related_safety_issue(self, reason: MotorTestSafetyError) -> bool:
+        return self.battery_issue and reason.battery_related
 
     def run_single_motor_test(
         self,
@@ -236,6 +257,7 @@ class DummyBaseWindow:
 
     def __init__(self, root) -> None:
         self.root = root
+        self.navigation_lock = NavigationLock()
 
     def put_image_in_label(self, parent, filepath: str, image_height: int, fallback_text: str) -> ttk.Label:
         label = ttk.Label(parent, text=fallback_text)
@@ -283,6 +305,93 @@ def motor_view(
     parent.destroy()
 
 
+@pytest.fixture
+def motor_update_timers(mocker: MockerFixture) -> dict[str, Callable[[], None]]:
+    """Control the real motor view's update clock without entering Tk's event loop."""
+    pending: dict[str, Callable[[], None]] = {}
+    next_id = 0
+
+    def schedule(_view: MotorTestView, delay: int, callback: Callable[[], None]) -> str:
+        nonlocal next_id
+        assert delay == 1000
+        next_id += 1
+        timer_id = f"motor-update-{next_id}"
+        pending[timer_id] = callback
+        return timer_id
+
+    def cancel(_view: MotorTestView, timer_id: str) -> None:
+        pending.pop(timer_id, None)
+
+    mocker.patch.object(MotorTestView, "after", autospec=True, side_effect=schedule)
+    mocker.patch.object(MotorTestView, "after_cancel", autospec=True, side_effect=cancel)
+    return pending
+
+
+@pytest.fixture
+def motor_view_with_controller(
+    tk_root: tk.Tk,
+    dummy_base_window: DummyBaseWindow,
+    mocker: MockerFixture,
+    motor_update_timers: dict[str, Callable[[], None]],  # noqa: ARG001 # pylint: disable=unused-argument
+) -> Generator[MotorTestView, None, None]:
+    """Use the real motor model and frame definitions with an in-memory FC parameter cache."""
+    fc = MagicMock(spec=FlightController)
+    fc.master = object()
+    fc.fc_parameters = {"FRAME_CLASS": 1.0, "FRAME_TYPE": 1.0, "BATT_MONITOR": 0.0}
+    fc.is_battery_monitoring_enabled.return_value = False
+    fc.get_frame_info.side_effect = lambda: (int(fc.fc_parameters["FRAME_CLASS"]), int(fc.fc_parameters["FRAME_TYPE"]))
+    filesystem = MagicMock()
+    filesystem.doc_dict = {}
+    mocker.patch.object(
+        ProgramSettings, "get_setting", side_effect={"motor_test/duration": 3.0, "motor_test/throttle_pct": 25}.get
+    )
+    mocker.patch.object(ProgramSettings, "motor_diagram_exists", return_value=True)
+    mocker.patch.object(
+        ProgramSettings,
+        "motor_diagram_filepath",
+        side_effect=lambda frame_class, frame_type: (f"frame-{frame_class}-{frame_type}.svg", ""),
+    )
+    model = MotorTestDataModel(fc, filesystem)
+    parent = ttk.Frame(tk_root)
+    view = MotorTestView(parent, model, dummy_base_window)
+    try:
+        yield view
+    finally:
+        view.destroy()
+        parent.destroy()
+
+
+@pytest.fixture
+def motor_connection_recovery(motor_view_with_controller: MotorTestView) -> Generator[ConnectionRecovery, None, None]:
+    """Monitor the motor view using the real editor's ownership gate and FC liveness checks."""
+    view = motor_view_with_controller
+    fc = cast("MagicMock", view.model.flight_controller)
+    fc.master = MagicMock(message_hooks=[], portdead=False)
+    fc.info = SimpleNamespace(hw_unique_id="original-fc", system_id=1, component_id=1)
+    fc.comport_device = "/dev/ttyACM0"
+    fc.active_baudrate = 115200
+    fc.get_serial_ports.return_value = []
+    editor = object.__new__(ParameterEditorWindow)
+    editor.root = view.root_window
+    editor.navigation_lock = view.base_window.navigation_lock
+    editor._file_browser_window = None
+    editor.parameter_editor_table = MagicMock(bitmask_editor_open=False)
+    callbacks = RecoveryCallbacks(
+        reader_busy=editor._connection_reader_busy,
+        can_read=lambda: False,
+        pause_receiver=MagicMock(return_value=lambda: None),
+        lock_controls=MagicMock(return_value=lambda: None),
+        show_status=MagicMock(),
+        on_recovered=MagicMock(),
+    )
+    recovery = ConnectionRecovery(MagicMock(), FlightControllerReconnect(fc), callbacks)
+    recovery.start()
+    try:
+        yield recovery
+    finally:
+        recovery.stop()
+
+
 class TestDelayedProgressCallback:
     """Exercises the delayed progress helper used by long-running operations."""
 
@@ -305,7 +414,7 @@ class TestDelayedProgressCallback:
         assert recorded == [(1, 5)]
 
 
-class TestMotorTestView:
+class TestMotorTestView:  # pylint: disable=too-many-public-methods
     """Covers the Tkinter view widget behavior for the motor test UI."""
 
     def test_initialization_populates_widgets(self, motor_view: MotorTestView, fake_model: FakeMotorTestModel) -> None:
@@ -446,6 +555,195 @@ class TestMotorTestView:
         fake_model.raise_frame_error = ValidationError("invalid selection")
         motor_view._on_frame_type_change(object())
 
+    def test_spin_arm_update_holds_navigation_lock_during_progress_window_creation(
+        self,
+        motor_view: MotorTestView,
+        fake_model: FakeMotorTestModel,
+        dummy_base_window: DummyBaseWindow,
+        dialog_spies: SimpleNamespace,
+        mocker: MockerFixture,
+    ) -> None:
+        """
+        Keep recovery blocked throughout the spin-arm update.
+
+        GIVEN: An accepted spin-arm value
+        WHEN: The progress window is created, the value is updated, and the window is destroyed
+        THEN: Navigation stays locked until cleanup completes
+        """
+        lock_states: list[bool] = []
+
+        def destroy_progress_window() -> None:
+            lock_states.append(dummy_base_window.navigation_lock.locked)
+
+        progress_stub = SimpleNamespace(update_progress_bar=lambda *_a: None, destroy=destroy_progress_window)
+
+        def create_progress_window(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            lock_states.append(dummy_base_window.navigation_lock.locked)
+            return progress_stub
+
+        mocker.patch(
+            "ardupilot_methodic_configurator.plugins.frontend_tkinter_motor_test.ProgressWindow",
+            side_effect=create_progress_window,
+        )
+        mocker.patch.object(
+            fake_model,
+            "set_motor_spin_arm_value",
+            side_effect=lambda *_args: lock_states.append(dummy_base_window.navigation_lock.locked),
+        )
+        dialog_spies.askfloat.return_value = 0.2
+
+        motor_view._set_motor_spin_arm()
+
+        assert lock_states == [True, True, True]
+        assert not dummy_base_window.navigation_lock.locked
+
+    @pytest.mark.parametrize("failure_stage", ["construction", "update", "destruction"])
+    def test_spin_arm_update_releases_navigation_lock_after_unexpected_failure(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        failure_stage: str,
+        motor_view: MotorTestView,
+        fake_model: FakeMotorTestModel,
+        dummy_base_window: DummyBaseWindow,
+        dialog_spies: SimpleNamespace,
+        mocker: MockerFixture,
+    ) -> None:
+        """
+        Restore navigation even when the spin-arm workflow raises an unexpected error.
+
+        GIVEN: A failure in progress-window construction, parameter updating, or window destruction
+        WHEN: The operator accepts a spin-arm value
+        THEN: Cleanup runs while locked, navigation is released, and the original error propagates
+        """
+        error = RuntimeError(f"spin-arm {failure_stage} failed")
+        lock_states: list[bool] = []
+        progress_window = MagicMock()
+
+        def create_progress_window(*_args: object, **_kwargs: object) -> MagicMock:
+            lock_states.append(dummy_base_window.navigation_lock.locked)
+            if failure_stage == "construction":
+                raise error
+            return progress_window
+
+        def destroy_progress_window() -> None:
+            lock_states.append(dummy_base_window.navigation_lock.locked)
+            if failure_stage == "destruction":
+                raise error
+
+        mocker.patch.object(motor_test_module, "ProgressWindow", side_effect=create_progress_window)
+        progress_window.destroy.side_effect = destroy_progress_window
+        if failure_stage == "update":
+            fake_model.raise_spin_arm_error = error
+        dialog_spies.askfloat.return_value = 0.2
+
+        with pytest.raises(RuntimeError) as raised:
+            motor_view._set_motor_spin_arm()
+
+        assert raised.value is error
+        assert lock_states == ([True] if failure_stage == "construction" else [True, True])
+        assert not dummy_base_window.navigation_lock.locked
+        if failure_stage == "construction":
+            progress_window.destroy.assert_not_called()
+        else:
+            progress_window.destroy.assert_called_once_with()
+        assert fake_model.parameters["MOT_SPIN_ARM"] == (0.2 if failure_stage == "destruction" else 0.1)
+        dialog_spies.showerror.assert_not_called()
+
+    @pytest.mark.parametrize("handler", ["frame", "spin_arm"])
+    def test_progress_window_is_destroyed_when_parameter_update_fails(
+        self,
+        handler: str,
+        motor_view: MotorTestView,
+        fake_model: FakeMotorTestModel,
+        dialog_spies: SimpleNamespace,
+        mocker,
+    ) -> None:
+        """Failed parameter updates must not leave their progress window allocated."""
+        progress_window = MagicMock()
+        mocker.patch(
+            "ardupilot_methodic_configurator.plugins.frontend_tkinter_motor_test.ProgressWindow",
+            return_value=progress_window,
+        )
+
+        if handler == "frame":
+            motor_view.frame_type_combobox.current(0)
+            fake_model.raise_frame_error = ParameterError("frame update failed")
+            motor_view._on_frame_type_change(object())
+        else:
+            dialog_spies.askfloat.return_value = 0.2
+            fake_model.raise_spin_arm_error = ParameterError("spin-arm update failed")
+            motor_view._set_motor_spin_arm()
+
+        progress_window.destroy.assert_called_once_with()
+        assert not motor_view.base_window.navigation_lock.locked
+
+    @pytest.mark.parametrize("handler", ["frame", "spin_arm"])
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_sequoia_restart_yields_to_tk_without_competing_link_operations(
+        self,
+        motor_view: MotorTestView,
+        dialog_spies: SimpleNamespace,
+        mocker: MockerFixture,
+        handler: str,
+        fails: bool,
+    ) -> None:
+        """
+        Restarting from motor configuration keeps progress and errors on Tk.
+
+        GIVEN: Sequoia and a frame or spin-arm edit requiring a restart
+        WHEN: The restart runs while Tk services a timer and progress updates
+        THEN: Telemetry and shortcuts wait, UI updates stay on Tk, and polling resumes
+        """
+        ui_thread = get_ident()
+        heartbeat = ThreadEvent()
+        rendered: list[int] = []
+        mocker.patch("tkinter.Misc.update")
+        mocker.patch("tkinter.Misc.update_idletasks")
+        # The general view fixture stubs after(); this integration case needs real polling.
+        mocker.patch.object(
+            motor_view.root_window,
+            "after",
+            new=tk.Misc.after.__get__(motor_view.root_window, type(motor_view.root_window)),  # pylint: disable=no-value-for-parameter
+        )
+        mocker.patch.object(motor_test_module, "is_macos_sequoia_or_older", return_value=True)
+        mocker.patch.object(motor_test_module, "DelayedProgressCallback", side_effect=lambda callback, _delay: callback)
+
+        def tick() -> None:
+            assert motor_view._restart_active
+            assert motor_view._timer_id is None
+            shortcut = MagicMock()
+            motor_view._handle_keyboard_shortcut(shortcut)
+            shortcut.assert_not_called()
+            heartbeat.set()
+
+        def render(_window: object, current: int, _total: int) -> None:
+            assert get_ident() == ui_thread
+            rendered.append(current)
+
+        def restart(_value: object, report: Callable[[int, int], None], **_kwargs: object) -> bool:
+            assert get_ident() != ui_thread
+            assert heartbeat.wait(2)
+            report(50, 100)
+            if fails:
+                message = "restart failed"
+                raise ParameterError(message)
+            return True
+
+        mocker.patch.object(motor_test_module, "update_flight_controller_restart_progress", side_effect=render)
+        method = "update_frame_type_by_key" if handler == "frame" else "set_motor_spin_arm_value"
+        mocker.patch.object(motor_view.model, method, side_effect=restart)
+        motor_view.root_window.after(0, tick)
+        if handler == "frame":
+            motor_view.frame_type_combobox.current(0)
+            motor_view._on_frame_type_change(None)
+        else:
+            dialog_spies.askfloat.return_value = 0.2
+            motor_view._set_motor_spin_arm()
+
+        assert rendered == [50]
+        assert not motor_view._restart_active
+        assert motor_view._timer_id is not None
+        assert dialog_spies.showerror.call_count == int(fails)
+
     def test_throttle_change_paths(
         self, motor_view: MotorTestView, fake_model: FakeMotorTestModel, dialog_spies: SimpleNamespace
     ) -> None:
@@ -544,13 +842,13 @@ class TestMotorTestView:
     @pytest.mark.parametrize(
         ("trigger_exception", "expected_call"),
         [
-            (MotorTestSafetyError("voltage low"), "showwarning"),
+            (MotorTestSafetyError("voltage low", battery_related=True), "showwarning"),
             (ValidationError("bad param"), "showerror"),
             (MotorTestExecutionError("fail"), "showerror"),
             (RuntimeError("unexpected"), "showerror"),
         ],
     )
-    def test_test_motor_exceptions(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def test_test_motor_exceptions(
         self,
         motor_view: MotorTestView,
         fake_model: FakeMotorTestModel,
@@ -673,8 +971,46 @@ class TestMotorTestView:
         bind_spy = mocker.patch.object(motor_view.root_window, "bind")
         focus_spy = mocker.patch.object(motor_view.root_window, "focus_set")
         motor_view._setup_keyboard_shortcuts()
-        assert bind_spy.call_count == 4
+        assert {call.args[0] for call in bind_spy.call_args_list} == {"<Escape>", "<Control-s>"}
         focus_spy.assert_called_once()
+
+    def test_destroy_unbinds_keyboard_shortcuts(self, motor_view: MotorTestView, mocker) -> None:
+        """Destroying the view must remove its app-wide actuator shortcuts."""
+        unbind_spy = mocker.patch.object(motor_view.root_window, "unbind")
+
+        motor_view.destroy()
+
+        assert unbind_spy.call_count == 2
+
+    def test_destroy_preserves_preexisting_root_binding(self, motor_view: MotorTestView, mocker) -> None:
+        """Destroying the view must not erase a shortcut owned by another view."""
+        mocker.patch.object(motor_test_module, "sys", SimpleNamespace(version_info=(3, 10)))
+        sequences = ("<Escape>", "<Control-s>", "<Control-a>", "<Control-q>")
+        for sequence in sequences:
+            motor_view.root_window.unbind(sequence)
+        motor_view.root_window.bind("<Control-s>", lambda _event: "break")
+        motor_view._keyboard_bindings.clear()
+        motor_view._setup_keyboard_shortcuts()
+
+        motor_view.destroy()
+
+        assert str(motor_view.root_window.bind("<Control-s>")).strip()
+
+    def test_destroy_deletes_legacy_tcl_binding_commands(self, motor_view: MotorTestView, mocker) -> None:
+        """Legacy cleanup must delete callback commands as well as binding scripts."""
+        mocker.patch.object(motor_test_module, "sys", SimpleNamespace(version_info=(3, 10)))
+        sequences = ("<Escape>", "<Control-s>", "<Control-a>", "<Control-q>")
+        for sequence in sequences:
+            motor_view.root_window.unbind(sequence)
+        motor_view._keyboard_bindings.clear()
+        motor_view._setup_keyboard_shortcuts()
+        binding_ids = [binding_id for _sequence, binding_id, _previous in motor_view._keyboard_bindings]
+
+        assert all(motor_view.root_window.tk.call("info", "commands", binding_id) for binding_id in binding_ids)
+
+        motor_view.destroy()
+
+        assert all(not motor_view.root_window.tk.call("info", "commands", binding_id) for binding_id in binding_ids)
 
     def test_on_activate_and_on_deactivate_paths(
         self,
@@ -944,3 +1280,545 @@ class TestMotorTestViewMotorSwapping:
         # Verify the actual error message was passed to the UI
         assert "Mock FC read error" in dialog_spies.showerror.call_args[0][1]
         assert motor_view.detected_comboboxes[0].get() == ""
+
+
+def test_motor_diagram_displays_a_real_png_and_reuses_the_resolved_path(
+    motor_view: MotorTestView,
+    fake_model: FakeMotorTestModel,
+    dummy_base_window: DummyBaseWindow,
+    tmp_path: Path,
+    mocker: MockerFixture,
+) -> None:
+    """
+    Display and retain the motor-layout PNG through repeated refreshes.
+
+    GIVEN: A valid PNG layout in the selected frame configuration
+    WHEN: The diagram is refreshed twice
+    THEN: The image remains displayed and the resolved path is reused
+    """
+    # Given: Create a genuine PNG and isolate only the external image-loading boundary.
+    path = tmp_path / "motor-layout.png"
+    tk.PhotoImage(master=motor_view, width=2, height=2).write(str(path), format="png")
+    images: list[tk.PhotoImage] = []
+
+    def load(parent: tk.Misc, filepath: str, image_height: int, fallback_text: str) -> ttk.Label:
+        assert image_height == 230
+        image = tk.PhotoImage(master=parent, file=filepath)
+        images.append(image)
+        label = ttk.Label(parent, image=image, text=fallback_text)
+        cast("Any", label).image = image
+        return label
+
+    mocker.patch.object(dummy_base_window, "put_image_in_label", side_effect=load)
+    fake_model.diagram_available = True
+    fake_model.diagram_path = str(path)
+    resolver = mocker.patch.object(fake_model, "get_motor_diagram_path", wraps=fake_model.get_motor_diagram_path)
+    # When: Display the image and refresh it again.
+    motor_view._update_diagram()
+    motor_view._update_diagram()
+    # Then: Tk has a real image, its Python reference is retained and the path was resolved only once.
+    assert tuple(str(image) for image in motor_view.tk.splitlist(motor_view.diagram_label.cget("image"))) == (str(images[-1]),)
+    assert motor_view._current_diagram_image is images[-1]
+    assert motor_view.diagram_label.cget("text") == ""
+    resolver.assert_called_once_with()
+
+
+def test_motor_diagram_shows_the_loader_fallback_when_no_image_is_available(
+    motor_view: MotorTestView, dummy_base_window: DummyBaseWindow, mocker: MockerFixture
+) -> None:
+    """
+    Show useful fallback text when a diagram loader has no image.
+
+    GIVEN: Image loading returns a label describing the unavailable image
+    WHEN: The view loads a PNG diagram
+    THEN: The fallback text replaces the diagram and no stale image reference remains
+    """
+    # Given: A real label without an image represents the loader fallback.
+    mocker.patch.object(
+        dummy_base_window,
+        "put_image_in_label",
+        side_effect=lambda **kwargs: ttk.Label(kwargs["parent"], text="Image unavailable"),
+    )
+    # When: Load the diagram through the real view method.
+    motor_view._load_png_diagram("missing.png")
+    # Then: The fallback is visible without retaining an old diagram.
+    assert motor_view.diagram_label.cget("text") == "Image unavailable"
+    assert motor_view._current_diagram_image is None
+
+
+@pytest.mark.parametrize("exception_type", [FileNotFoundError, OSError, ValueError, TypeError, AttributeError])
+def test_motor_diagram_loading_errors_leave_the_test_controls_usable(
+    motor_view: MotorTestView, dummy_base_window: DummyBaseWindow, mocker: MockerFixture, exception_type: type[Exception]
+) -> None:
+    """
+    Recover the diagram display from expected image-loading failures.
+
+    GIVEN: The loader raises a file, decoding or image-configuration error
+    WHEN: The view attempts to load the PNG
+    THEN: A useful fallback is visible and motor test controls remain enabled
+    """
+    # Given: Fail only at the external image-loader boundary.
+    mocker.patch.object(dummy_base_window, "put_image_in_label", side_effect=exception_type("Cannot load diagram"))
+    # When: Attempt to display the diagram.
+    motor_view._load_png_diagram("layout.png")
+    # Then: The image failure does not prevent motor configuration.
+    assert motor_view.diagram_label.cget("text") == (
+        "Diagram not found" if exception_type is FileNotFoundError else "Error loading diagram"
+    )
+    assert motor_view._current_diagram_image is None
+    assert all(button.instate(["!disabled"]) for button in motor_view.motor_buttons)
+
+
+@pytest.mark.parametrize("operation", ["single", "all", "sequence"])
+def test_declining_the_motor_safety_warning_sends_no_motor_commands(
+    motor_view: MotorTestView, fake_model: FakeMotorTestModel, dialog_spies: SimpleNamespace, operation: str
+) -> None:
+    """
+    Respect declined propeller-removal confirmation for every motor test mode.
+
+    GIVEN: The first motor-test safety warning has not been acknowledged
+    WHEN: The operator declines confirmation
+    THEN: No motor test runs and the warning remains unacknowledged
+    """
+    # Given: The operator declines the safety prompt.
+    dialog_spies.askyesno.return_value = False
+    # When: Request a single, simultaneous or sequential test.
+    if operation == "single":
+        motor_view._test_motor(0, 1)
+    elif operation == "all":
+        motor_view._test_all_motors()
+    else:
+        motor_view._test_motors_in_sequence()
+    # Then: Every motor command path remains inactive.
+    assert fake_model.single_motor_calls == []
+    assert fake_model.all_motor_runs == 0
+    assert fake_model.sequence_runs == 0
+    assert fake_model.should_show_first_test_warning()
+
+
+@pytest.mark.parametrize("operation", ["all", "sequence"])
+@pytest.mark.parametrize("exception_type", [MotorTestSafetyError, ValidationError, RuntimeError])
+def test_batch_motor_failures_show_feedback_without_claiming_success(
+    motor_view: MotorTestView,
+    fake_model: FakeMotorTestModel,
+    dialog_spies: SimpleNamespace,
+    operation: str,
+    exception_type: type[Exception],
+) -> None:
+    """
+    Explain rejected batch motor tests.
+
+    GIVEN: Batch testing fails a safety check, parameter validation or transport operation
+    WHEN: The operator runs all motors or a sequence
+    THEN: The matching warning or error is displayed
+    """
+    # Given: Confirmation was acknowledged but the model rejects execution.
+    fake_model._should_warn = False
+    error = exception_type("Test cannot proceed")
+    if operation == "all":
+        fake_model.next_all_motor_error = error
+        callback = motor_view._test_all_motors
+    else:
+        fake_model.next_sequence_error = error
+        callback = motor_view._test_motors_in_sequence
+    # When: Execute the batch test.
+    callback()
+    # Then: Safety failures are warnings and other failures are errors.
+    if exception_type is MotorTestSafetyError:
+        dialog_spies.showwarning.assert_called_once_with("Safety Check Failed", "Test cannot proceed")
+    else:
+        dialog_spies.showerror.assert_called_once()
+        assert dialog_spies.showerror.call_args.args[1] == "Test cannot proceed"
+
+
+@pytest.mark.parametrize("focused_control", ["throttle_spinbox", "duration_spinbox"])
+def test_periodic_motor_refresh_preserves_the_input_being_edited(
+    motor_view: MotorTestView, mocker: MockerFixture, focused_control: str
+) -> None:
+    """
+    Preserve the operator's unfinished throttle or duration entry.
+
+    GIVEN: A motor-test input has focus and contains an unfinished edit
+    WHEN: The periodic view refresh runs
+    THEN: The focused input is not overwritten by the current model value
+    """
+    # Given: Only one input has focus, as in a real Tk window.
+    control = getattr(motor_view, focused_control)
+    control.delete(0, "end")
+    control.insert(0, "editing")
+    mocker.patch("tkinter.Misc.focus_get", return_value=control)
+    # When: Refresh current values from the model.
+    motor_view._update_spinbox_values()
+    # Then: User input survives the refresh.
+    assert control.get() == "editing"
+
+
+def test_fast_motor_operations_do_not_flash_a_progress_window(mocker: MockerFixture) -> None:
+    """
+    Delay progress feedback until an operation has actually taken long enough.
+
+    GIVEN: A progress callback with a one-second delay
+    WHEN: Updates arrive before and at the delay threshold
+    THEN: Only the update at the threshold is forwarded
+    """
+    # Given: Control the clock rather than sleeping in the test.
+    mocker.patch.object(motor_test_module.time, "time", side_effect=[0.0, 0.0, 0.5, 1.0])
+    progress = MagicMock()
+    delayed = DelayedProgressCallback(progress, delay_seconds=1.0)
+    # When: Report progress over the first second.
+    delayed(1, 3)
+    delayed(2, 3)
+    delayed(3, 3)
+    # Then: Fast intermediate updates do not show progress UI.
+    progress.assert_called_once_with(3, 3)
+
+
+def test_missing_frame_selection_does_not_restart_the_controller(
+    motor_view: MotorTestView, fake_model: FakeMotorTestModel, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Ignore an empty frame-type selection safely.
+
+    GIVEN: No frame type is selected
+    WHEN: A selection-change notification arrives
+    THEN: No controller configuration command is sent and the missing selection is logged
+    """
+    # Given: The combobox has no user selection.
+    motor_view.frame_type_combobox.set("")
+    # When: Handle the selection notification.
+    motor_view._on_frame_type_change(None)
+    # Then: Do not send an invalid frame update or restart.
+    assert fake_model.last_frame_type_key is None
+    assert "No frame type selected" in caplog.messages
+
+
+def test_motor_diagram_without_a_supported_image_format_shows_its_path(
+    motor_view: MotorTestView, fake_model: FakeMotorTestModel
+) -> None:
+    """
+    Retain useful diagram information when only an unsupported image format is available.
+
+    GIVEN: The model has an SVG diagram without a loading error
+    WHEN: The view refreshes the motor diagram
+    THEN: Its path is shown as descriptive fallback text
+    """
+    # Given: A diagram exists but cannot be displayed by the PNG loader.
+    fake_model.diagram_available = True
+    fake_model.diagram_path = "motor-layout.svg"
+    fake_model.diagram_error = ""
+    # When: Refresh the diagram.
+    motor_view._update_diagram()
+    # Then: Preserve useful information instead of showing an empty image.
+    assert motor_view.diagram_label.cget("text") == "Diagram: motor-layout.svg"
+
+
+def test_non_battery_motor_safety_failures_show_the_specific_check_reason(
+    motor_view: MotorTestView, fake_model: FakeMotorTestModel, dialog_spies: SimpleNamespace
+) -> None:
+    """
+    Explain safety rejections that are unrelated to battery voltage.
+
+    GIVEN: Confirmation was acknowledged but the controller cannot safely run a motor
+    WHEN: The user requests a single-motor test
+    THEN: The actual safety reason is shown and the motor status reports the failure
+    """
+    # Given: A safety rejection unrelated to battery telemetry.
+    fake_model._should_warn = False
+    fake_model.next_single_motor_error = MotorTestSafetyError("Vehicle not secured", battery_related=False)
+    # When: Attempt the test.
+    motor_view._test_motor(0, 1)
+    # Then: Do not substitute irrelevant battery guidance.
+    dialog_spies.showwarning.assert_called_once_with("Safety Check Failed", "Vehicle not secured")
+    assert motor_view.motor_status_labels[0].cget("text") == "Safety Check Failed"
+
+
+@pytest.mark.parametrize("handler", ["frame", "spin_arm"])
+@pytest.mark.parametrize("worker_restart", [False, True], ids=["synchronous", "sequoia-worker"])
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+def test_motor_restart_retains_recovery_ownership_and_resumes_polling(
+    motor_update_timers: dict[str, Callable[[], None]],
+    motor_view: MotorTestView,
+    handler: str,
+    worker_restart: bool,
+    fails: bool,
+) -> None:
+    """
+    Motor configuration restarts retain the link and resume continuous polling.
+
+    GIVEN: A frame or spin-arm restart that services Tk events
+    WHEN: Recovery checks run during the restart, which succeeds or fails
+    THEN: Recovery cannot read or reconnect, and battery polling resumes for multiple ticks.
+    """
+    recovery = ConnectionRecovery(MagicMock(), MagicMock(spec=FlightControllerReconnect), MagicMock())
+    progress_window = MagicMock()
+    progress_window.run_task.side_effect = lambda task, *, on_progress: task(on_progress)
+
+    def restart(*_args: object, **_kwargs: object) -> None:
+        assert recovery.operation_active
+        recovery.check()
+        recovery._monitor.poll.assert_not_called()
+        recovery._monitor.reconnect.assert_not_called()
+        if fails:
+            message = "restart failed"
+            raise ParameterError(message)
+
+    method = "update_frame_type_by_key" if handler == "frame" else "set_motor_spin_arm_value"
+    with (
+        patch.object(motor_view.base_window, "_connection_recovery", recovery, create=True),
+        patch.object(motor_test_module, "ProgressWindow", return_value=progress_window),
+        patch.object(motor_test_module, "is_macos_sequoia_or_older", return_value=worker_restart),
+        patch.object(motor_test_module, "askfloat", return_value=0.2),
+        patch.object(motor_view.model, method, side_effect=restart),
+        patch.object(motor_view, "_update_battery_status", wraps=motor_view._update_battery_status) as battery_poll,
+    ):
+        if handler == "frame":
+            motor_view.frame_type_combobox.current(0)
+            motor_view._on_frame_type_change(None)
+        else:
+            motor_view._set_motor_spin_arm()
+        assert not recovery.operation_active
+        for _tick in range(2):
+            motor_update_timers.pop(motor_view._timer_id)()
+            assert len(motor_update_timers) == 1
+        assert battery_poll.call_count == 2
+
+
+class TestMotorTestConnectionOwnership:
+    """Motor operations preserve the exclusive connection owner."""
+
+    @pytest.mark.parametrize("reconnect_fails", [False, True])
+    def test_frame_type_reboot_keeps_recovery_from_reconnecting_at_the_same_time(
+        self,
+        motor_view_with_controller: MotorTestView,
+        motor_connection_recovery: ConnectionRecovery,
+        mocker: MockerFixture,
+        dialog_spies: SimpleNamespace,
+        reconnect_fails: bool,
+    ) -> None:
+        """
+        Keep the frame-type reboot exclusive while its progress window processes events.
+
+        GIVEN: Connection recovery is monitoring a motor-test view
+        WHEN: Changing frame type clears the connection and progress runs a recovery check
+        THEN: No background reconnect starts until the frame-change callback finishes
+        """
+        # Given: Real frame-change and recovery logic share the editor's navigation lock.
+        view = motor_view_with_controller
+        fc = cast("MagicMock", view.model.flight_controller)
+        master = fc.master
+        view.model.filesystem.doc_dict = {"FRAME_TYPE": {"RebootRequired": True}}
+        fc.set_param.return_value = (True, "")
+        fc.fetch_param.return_value = 0.0
+        recovery = motor_connection_recovery
+        worker = mocker.patch("ardupilot_methodic_configurator.frontend_tkinter_connection_recovery.Thread")
+        worker.return_value.is_alive.return_value = False
+        progress_window = MagicMock()
+        mocker.patch.object(motor_test_module, "ProgressWindow", return_value=progress_window)
+        progress_window.update_progress_bar_with_message.side_effect = lambda *_args: recovery.check()
+        ticks = iter([0.0, 2.0])
+        mocker.patch.object(motor_test_module, "time", SimpleNamespace(time=lambda: next(ticks)))
+
+        def reboot(progress: Callable[[int, int], None], extra_sleep_time: int) -> str:
+            assert extra_sleep_time == 2
+            fc.master = None
+            # Simulate the due recovery timer inside the progress window's nested event loop.
+            progress(20, 100)
+            assert recovery.state is RecoveryState.MONITORING
+            worker.assert_not_called()
+            if reconnect_fails:
+                message = "Controller unavailable"
+                raise OSError(message)
+            fc.master = master
+            fc.fc_parameters["FRAME_TYPE"] = 0.0
+            return ""
+
+        fc.reset_and_reconnect.side_effect = reboot
+        view.frame_type_combobox.current(0)
+        assert view.frame_type_combobox.get_selected_key() == "0"
+
+        # When: Select Quad Plus instead of Quad X, requiring a reboot.
+        view._on_frame_type_change(None)
+
+        # Then: Cleanup releases ownership on both success and failure; monitoring can resume.
+        fc.reset_and_reconnect.assert_called_once()
+        progress_window.update_progress_bar_with_message.assert_called_once()
+        progress_window.destroy.assert_called_once()
+        assert not view.base_window.navigation_lock.locked
+        worker.assert_not_called()
+        recovery.check()
+        if reconnect_fails:
+            dialog_spies.showerror.assert_called_once()
+            assert recovery.state is RecoveryState.RECOVERING
+            worker.assert_called_once()
+        else:
+            assert view.model.frame_type == 0
+            assert recovery.state is RecoveryState.MONITORING
+            worker.assert_not_called()
+
+    def test_activation_keeps_one_polling_loop_and_suspend_stops_pending_updates(
+        self,
+        motor_view_with_controller: MotorTestView,
+        motor_update_timers: dict[str, Callable[[], None]],
+        mocker: MockerFixture,
+        pause_polling_plugin_for_recovery: Callable[[tk.Misc], Callable[[], None]],
+    ) -> None:
+        """
+        Stop all polling during recovery even after construction and activation.
+
+        GIVEN: The editor constructs and activates a real motor view
+        WHEN: Recovery suspends it and an already queued callback fires
+        THEN: No battery polling or timers survive, and resume uses the recovered frame
+        """
+        view = motor_view_with_controller
+        view.on_activate()
+        assert len(motor_update_timers) == 1
+        assert view._timer_id is not None
+        callback = motor_update_timers.pop(view._timer_id)
+        callback()
+        assert len(motor_update_timers) == 1
+        callback = next(iter(motor_update_timers.values()))
+        battery_poll = mocker.spy(view.model, "get_battery_display_text")
+
+        resume = pause_polling_plugin_for_recovery(view)
+        assert not motor_update_timers
+        callback()
+        battery_poll.assert_not_called()
+        assert not motor_update_timers
+        fc = cast("MagicMock", view.model.flight_controller)
+        fc.fc_parameters.update(FRAME_CLASS=2.0, FRAME_TYPE=1.0)
+        resume()
+
+        assert (view.model.frame_class, view.model.frame_type) == (2, 1)
+        assert len(view.motor_buttons) == 6
+        assert len(motor_update_timers) == 1
+        battery_poll.assert_called_once()
+        fc.test_motor.assert_not_called()
+        fc.stop_all_motors.assert_not_called()
+        fc.set_param.assert_not_called()
+
+    def test_resume_refreshes_frame_even_when_an_update_is_pending(
+        self, motor_view_with_controller: MotorTestView, motor_update_timers: dict[str, Callable[[], None]]
+    ) -> None:
+        """
+        Refresh cached frame values independently of polling state.
+
+        GIVEN: A motor view with a pending update and newly recovered FC values
+        WHEN: The view resumes
+        THEN: Its model and controls use the new frame without adding a second timer
+        """
+        view = motor_view_with_controller
+        timer_id = view._timer_id
+        fc = cast("MagicMock", view.model.flight_controller)
+        fc.fc_parameters.update(FRAME_CLASS=2.0, FRAME_TYPE=0.0)
+
+        view.on_resume()
+
+        assert (view.model.frame_class, view.model.frame_type) == (2, 0)
+        assert len(view.motor_buttons) == 6
+        assert view.frame_type_combobox.get_selected_key() == "0"
+        assert view._timer_id == timer_id
+        assert len(motor_update_timers) == 1
+
+    @pytest.mark.parametrize(
+        ("frame_class", "frame_type", "motor_numbers"),
+        [(1, 1, [1, 4, 2, 3]), (1, 0, [3, 1, 4, 2]), (2, 1, [5, 1, 4, 6, 2, 3])],
+        ids=["unchanged-quad-x", "quad-plus-same-motor-count", "hexa-x"],
+    )
+    def test_resuming_uses_the_recovered_frame_layout_without_motor_commands(
+        self,
+        motor_view_with_controller: MotorTestView,
+        mocker: MockerFixture,
+        frame_class: int,
+        frame_type: int,
+        motor_numbers: list[int],
+    ) -> None:
+        """
+        Resume with the recovered frame while preserving settings and healthy-link state.
+
+        GIVEN: A Quad X view paused while the same controller's cached frame values change
+        WHEN: The view resumes after recovery or a healthy-link probe
+        THEN: Motor controls, frame selection and diagram match the FC without sending commands
+        """
+        view = motor_view_with_controller
+        fc = cast("MagicMock", view.model.flight_controller)
+        original_buttons = list(view.motor_buttons)
+        view.motor_status_labels[0].configure(text="Running")
+        view.on_suspend(PluginPauseReason.CONNECTION_RECOVERY)
+        fc.fc_parameters.update(FRAME_CLASS=float(frame_class), FRAME_TYPE=float(frame_type))
+
+        view.on_resume()
+
+        assert (view.model.frame_class, view.model.frame_type) == (frame_class, frame_type)
+        assert view.model.motor_numbers == motor_numbers
+        assert len(view.motor_buttons) == len(motor_numbers)
+        assert view.frame_type_combobox.get_selected_key() == str(frame_type)
+        assert view.frame_type_combobox.get_entries_tuple() == view.model.get_frame_type_pairs()
+        assert view.diagram_label.cget("text") == f"Diagram: frame-{frame_class}-{frame_type}.svg"
+        assert view.throttle_spinbox.get() == "25"
+        assert view.duration_spinbox.get() == "3.0"
+        test_motor = mocker.patch.object(view, "_test_motor")
+        for index, (button, motor_number) in enumerate(zip(view.motor_buttons, motor_numbers, strict=True)):
+            button.invoke()
+            test_motor.assert_called_with(index, motor_number)
+        if (frame_class, frame_type) == (1, 1):
+            assert view.motor_buttons == original_buttons
+            assert view.motor_status_labels[0].cget("text") == "Running"
+        timer_id = view._timer_id
+        assert timer_id is not None
+        view.on_resume()
+        assert view._timer_id == timer_id
+        fc.test_motor.assert_not_called()
+        fc.stop_all_motors.assert_not_called()
+        fc.set_param.assert_not_called()
+
+    def test_connection_probe_preserves_running_motors(
+        self, motor_view: MotorTestView, fake_model: FakeMotorTestModel
+    ) -> None:
+        """GIVEN a running motor test, WHEN reception is suspended and resumed, THEN motors are not stopped or restarted."""
+        motor_view._test_all_motors()
+        stop_calls, runs = fake_model.stop_calls, fake_model.all_motor_runs
+        editor = SimpleNamespace(current_plugin_view=motor_view, root=motor_view.root_window)
+        resume = ParameterEditorWindow._pause_plugin_receiver(editor, reason=PluginPauseReason.CONNECTION_RECOVERY)
+        assert motor_view._timer_id is None
+        resume()
+        assert motor_view._timer_id is not None
+        assert fake_model.stop_calls == stop_calls
+        assert fake_model.all_motor_runs == runs
+
+    def test_exclusive_fc_operation_stops_motors_before_disabling_stop_shortcuts(
+        self, motor_view: MotorTestView, fake_model: FakeMotorTestModel
+    ) -> None:
+        """GIVEN Test All is running, WHEN an FC tool takes reception, THEN motors stop and never restart on resume."""
+        motor_view._test_all_motors()
+        stop_calls, runs = fake_model.stop_calls, fake_model.all_motor_runs
+        editor = SimpleNamespace(current_plugin_view=motor_view, root=motor_view.root_window)
+
+        resume = ParameterEditorWindow._pause_plugin_receiver(editor)
+
+        assert fake_model.stop_calls == stop_calls + 1
+        assert motor_view._suspended
+        assert motor_view._timer_id is None
+        resume()
+        assert not motor_view._suspended
+        assert motor_view._timer_id is not None
+        assert fake_model.all_motor_runs == runs
+
+    @pytest.mark.parametrize("suspended", [False, True])
+    def test_shortcuts_cannot_send_commands_while_connection_is_owned(
+        self, motor_view: MotorTestView, fake_model: FakeMotorTestModel, suspended: bool
+    ) -> None:
+        """GIVEN recovery or diagnostics owns the link, WHEN a stop shortcut fires, THEN it sends no motor commands."""
+        owner = object()
+        if suspended:
+            motor_view.on_suspend()
+        else:
+            motor_view.base_window.navigation_lock.acquire(owner)
+        before = fake_model.emergency_runs
+        assert motor_view._handle_keyboard_shortcut(motor_view._stop_all_motors) == "break"
+        assert fake_model.emergency_runs == before
+        if suspended:
+            motor_view.on_resume()
+        else:
+            motor_view.base_window.navigation_lock.release(owner)
+        motor_view._handle_keyboard_shortcut(motor_view._stop_all_motors)
+        assert fake_model.emergency_runs == before + 1

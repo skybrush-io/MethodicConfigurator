@@ -19,11 +19,15 @@ from platform import system as platform_system
 from sys import exit as sys_exit
 from sys import platform as sys_platform
 from tkinter import ttk
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 from ardupilot_methodic_configurator import _
 from ardupilot_methodic_configurator.data_model_ardupilot_parameter import ArduPilotParameter, BitmaskHelper
 from ardupilot_methodic_configurator.data_model_par_dict import ParDict
+from ardupilot_methodic_configurator.data_model_parameter_compare_and_upload import (
+    selected_external_parameters,
+    unselected_manual_edits,
+)
 from ardupilot_methodic_configurator.data_model_parameter_editor import (
     InvalidParameterNameError,
     OperationNotPossibleError,
@@ -49,9 +53,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_window import 
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_windows import (  # pylint: disable=cyclic-import
     display_bitmask_parameters_editor_usage_popup,
 )
-
-if TYPE_CHECKING:  # pragma: no cover - import for type checking only
-    from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
+from ardupilot_methodic_configurator.macos_utilities import is_macos_sequoia_or_older
 
 NEW_VALUE_WIDGET_WIDTH = 9
 NEW_VALUE_DIFFERENT_STR = "\u2260" if platform_system() == "Windows" else "!="
@@ -85,6 +87,16 @@ class ParameterTableOptions:  # pylint: disable=too-many-instance-attributes
     render_complete_callback: Callable[[], None] | None = None
 
 
+class ParameterEditorTableHost(Protocol):
+    """The parent-window operations used by a parameter table."""
+
+    gui_complexity: str
+
+    def repopulate_parameter_table(self) -> None: ...
+
+    def on_skip_click(self) -> None: ...
+
+
 class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,too-many-instance-attributes
     """
     A class to manage and display the parameter editor table within the GUI.
@@ -98,7 +110,7 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
         self,
         master: tk.Misc,
         parameter_editor: ParameterEditor,
-        parameter_editor_window: "ParameterEditorWindow",
+        parameter_editor_window: ParameterEditorTableHost,
         dialogs: ParameterEditorTableDialogs | None = None,
         options: ParameterTableOptions | None = None,
         parameters: dict[str, ArduPilotParameter] | None = None,
@@ -108,15 +120,18 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
         self.parameter_editor = parameter_editor
         self.parameter_editor_window = parameter_editor_window  # the parent window that contains this table
         self.upload_checkbutton_var: dict[str, tk.BooleanVar] = {}
+        self._bulk_upload_selected: bool | None = None
         self._dialogs = dialogs or ParameterEditorTableDialogs()
         self.options = options or ParameterTableOptions()
         self.parameters = parameters
         self._show_only_differences = False
         self._upload_selection_defaults: dict[str, bool] = {}
+        self._upload_selection_defaults_file: str | None = None
         self._new_value_widgets: dict[str, PairTupleCombobox | ttk.Entry] = {}
         self._value_is_different_labels: dict[str, ttk.Label] = {}
         self._table_render_generation = 0
         self._reserved_table_rows = 0
+        self._open_bitmask_editors = 0
 
         # Track last return values to prevent duplicate event processing
         self._last_return_values: dict[tk.Misc, str] = {}
@@ -124,6 +139,11 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
 
         style = ttk.Style()
         style.configure("narrow.TButton", padding=0, width=4, border=(0, 0, 0, 0))
+
+    @property
+    def bitmask_editor_open(self) -> bool:
+        """Whether a bitmask dialog still holds references to this table's rows."""
+        return self._open_bitmask_editors > 0
 
     def _get_parent_root(self) -> tk.Tk | None:
         """Return the closest tk.Tk ancestor if available."""
@@ -189,7 +209,7 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
 
         base_tooltips.extend(
             [
-                _("Parameter name must be ^[A-Z][A-Z_0-9]* and most 16 characters long"),
+                _("Parameter name must be ^[A-Z][A-Z_0-9]* and at most 16 characters long"),
                 _("Current value on the flight controller"),
                 _("Is the new value different from the current FC value?"),
                 _("New value from the above selected intermediate parameter file")
@@ -215,7 +235,11 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
 
         if show_upload_column:
             base_headers.append(_("Upload"))
-            base_tooltips.append(_("When selected, upload the new value to the flight controller"))
+            base_tooltips.append(
+                _("When selected, upload the new value to the flight controller")
+                + "\n"
+                + _("Click this header to deselect all upload checkboxes; click again to select all.")
+            )
 
         if self.options.show_manual_override_column:
             base_headers.append(_("Manual"))
@@ -235,9 +259,14 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
 
     def repopulate_table(self, show_only_differences: bool, gui_complexity: str) -> None:
         self._show_only_differences = show_only_differences
-        self._upload_selection_defaults.update(
-            {name: variable.get() for name, variable in self.upload_checkbutton_var.items()}
-        )
+        if self.parameter_editor.current_file == self._upload_selection_defaults_file:
+            self._upload_selection_defaults.update(
+                {name: variable.get() for name, variable in self.upload_checkbutton_var.items()}
+            )
+        else:
+            self._upload_selection_defaults.clear()
+            self._bulk_upload_selected = None
+        self._upload_selection_defaults_file = self.parameter_editor.current_file
         for widget in self.view_port.winfo_children():
             widget.destroy()
         for row in range(1, self._reserved_table_rows + 1):
@@ -256,6 +285,15 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
 
         for i, header in enumerate(headers):
             label = ttk.Label(self.view_port, text=header)
+            if show_upload_column and i == 5 + int(self.options.show_parameter_actions):
+                label.configure(cursor="hand2", takefocus=True)
+                label.bind(
+                    "<ButtonPress>",
+                    lambda event: self._toggle_all_upload_checkbuttons(event) if event.num == 1 else None,
+                    add="+",
+                )
+                label.bind("<Return>", self._toggle_all_upload_checkbuttons)
+                label.bind("<space>", self._toggle_all_upload_checkbuttons)
             label.grid(row=0, column=i, sticky="ew")  # Use sticky="ew" to make the label stretch horizontally
             self._show_tooltip(label, tooltips[i])
 
@@ -300,9 +338,21 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
 
     def _apply_scroll_position(self, scroll_to_bottom: bool) -> None:
         """Apply the requested scroll position to the canvas."""
-        self.update_idletasks()
         position = 1.0 if scroll_to_bottom else 0.0
-        self.canvas.yview_moveto(position)
+
+        def scroll() -> None:
+            self.canvas.yview_moveto(position)
+
+        if is_macos_sequoia_or_older():
+            # Row geometry and the canvas scroll region settle in successive
+            # idle passes. Cancel deferred scrolling if the table is closed.
+            BaseWindow._run_when_idle(  # noqa: SLF001 # pylint: disable=protected-access
+                self,
+                lambda: BaseWindow._run_when_idle(self, scroll),  # noqa: SLF001 # pylint: disable=protected-access
+            )
+        else:
+            self.update_idletasks()
+            scroll()
 
     def _update_table(self, params: dict[str, ArduPilotParameter], gui_complexity: str) -> None:
         """Update the parameter table with the given parameters."""
@@ -323,8 +373,8 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
                 if should_display_bitmask_usage:
                     should_try_to_display_bitmask_parameter_editor_usage = True
                 self._grid_column_widgets(row_widgets, i, show_upload_column)
-                if i % 20 == 0:
-                    self.view_port.update_idletasks()  # yield to the event loop periodically to keep the UI responsive
+                if i % 20 == 0 and not is_macos_sequoia_or_older():
+                    self.view_port.update_idletasks()
 
             if self.options.show_parameter_actions:
                 # Add the "Add" button at the bottom of the table
@@ -372,7 +422,8 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
         for row in range(1, len(parameter_items) + 1):
             self.view_port.grid_rowconfigure(row, minsize=20)
         self._reserved_table_rows = len(parameter_items)
-        self.view_port.update_idletasks()
+        if not is_macos_sequoia_or_older():
+            self.view_port.update_idletasks()
 
         def render_batch(start: int) -> None:
             nonlocal should_try_to_display_bitmask_parameter_editor_usage
@@ -608,7 +659,7 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
             return False
         return False
 
-    def _update_combobox_style_on_selection(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def _update_combobox_style_on_selection(
         self,
         combobox_widget: PairTupleCombobox,
         param: ArduPilotParameter,
@@ -841,35 +892,42 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
             bitmask_value = BitmaskHelper.get_value_from_keys(checked_keys)
             valid = self._handle_parameter_value_update(param, str(bitmask_value), include_range_check=True)
 
-            if valid and change_reason_widget is not None:
+            # Recovery can repaint rows while this dialog's nested event loop runs.
+            value_widget = self._new_value_widgets.get(param.name, event.widget)
+            difference_label = self._value_is_different_labels.get(param.name, value_is_different_label)
+            if valid and change_reason_widget is not None and change_reason_widget.winfo_exists():
                 show_tooltip(change_reason_widget, param.tooltip_change_reason)
-            if valid:
-                value_is_different_label.config(text=NEW_VALUE_DIFFERENT_STR if param.is_different_from_fc else " ")
+            if valid and difference_label.winfo_exists():
+                difference_label.config(text=NEW_VALUE_DIFFERENT_STR if param.is_different_from_fc else " ")
 
             # Update new_value_entry with the new decimal value
             # For bitmask windows, event.widget should always be ttk.Entry (not PairTupleCombobox)
             # since bitmasks are only created for Entry widgets, not Comboboxes
-            if isinstance(event.widget, ttk.Entry):
-                self._update_new_value_entry_text(event.widget, param)
+            if isinstance(value_widget, ttk.Entry) and value_widget.winfo_exists():
+                self._update_new_value_entry_text(value_widget, param)
 
             # Release the modal grab and destroy the window
             if sys_platform != "darwin":
                 window.grab_release()
             window.destroy()
+            if not self.main_frame.winfo_exists():
+                return
             # Issue a FocusIn event on something else than new_value_entry to prevent endless looping
             self.main_frame.focus_set()
             # Run the Tk event loop once to process the event
-            self.main_frame.update_idletasks()
+            if not is_macos_sequoia_or_older():
+                self.main_frame.update_idletasks()
             # Re-bind the FocusIn event to new_value_entry
-            event.widget.bind(
-                "<Double-Button-1>",
-                lambda event: self._open_bitmask_selection_if_editable(
-                    event,
-                    param,
-                    change_reason_widget,
-                    value_is_different_label,
-                ),
-            )
+            if event.widget.winfo_exists():
+                event.widget.bind(
+                    "<Double-Button-1>",
+                    lambda event: self._open_bitmask_selection_if_editable(
+                        event,
+                        param,
+                        change_reason_widget,
+                        value_is_different_label,
+                    ),
+                )
 
         def is_widget_visible(widget: tk.Misc | None) -> bool:
             return bool(widget and widget.winfo_ismapped())
@@ -935,9 +993,12 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
         window.transient(self._get_parent_toplevel())
         window.deiconify()
 
-        self._center_and_focus_window(window)
-
-        window.wait_window()  # Wait for the window to be closed
+        self._open_bitmask_editors += 1
+        try:
+            self._center_and_focus_window(window)
+            window.wait_window()
+        finally:
+            self._open_bitmask_editors -= 1
 
     def _create_unit_label(self, param: ArduPilotParameter) -> ttk.Label:
         """Create a label displaying the parameter unit."""
@@ -946,6 +1007,23 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
         if unit_tooltip:
             self._show_tooltip(unit_label, unit_tooltip)
         return unit_label
+
+    def _toggle_all_upload_checkbuttons(self, _event: tk.Event | None = None) -> None:
+        """Alternate between clearing and selecting every uploadable row in the table."""
+        if not self.parameter_editor.is_fc_connected:
+            return
+        self._bulk_upload_selected = False if self._bulk_upload_selected is None else not self._bulk_upload_selected
+        # Save the choice for rows that have not rendered yet, including across filter changes.
+        parameters = self.parameters if self.parameters is not None else self.parameter_editor.current_step_parameters
+        self._upload_selection_defaults.update(
+            {
+                name: self._bulk_upload_selected and (self.parameters is None or not param.is_readonly)
+                for name, param in parameters.items()
+            }
+        )
+        for param_name, variable in self.upload_checkbutton_var.items():
+            if self.parameters is None or not self.parameters[param_name].is_readonly:
+                variable.set(self._bulk_upload_selected)
 
     def _create_upload_checkbutton(self, param_name: str) -> ttk.Checkbutton:
         """Create a checkbutton for upload selection."""
@@ -957,6 +1035,8 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
         else:
             is_uploadable = True
             initially_selected = fc_connected
+        if self._bulk_upload_selected is not None:
+            initially_selected = self._bulk_upload_selected and fc_connected
         selected = self._upload_selection_defaults.get(param_name, initially_selected) if is_uploadable else False
         self.upload_checkbutton_var[param_name] = tk.BooleanVar(value=selected)
         upload_checkbutton = ttk.Checkbutton(self.view_port, variable=self.upload_checkbutton_var[param_name])
@@ -1225,7 +1305,6 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
                     return
             self._bulk_add_parameters_and_show_feedback(selected, add_parameter_window)
 
-        # pylint: disable=line-too-long
         # Bind events
         search_var.trace_add("write", refresh_list)
         search_entry.bind(
@@ -1252,7 +1331,6 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
         listbox.bind("<Control-A>", lambda _: (listbox.selection_set(0, tk.END), update_selection_info(), "break")[2])  # type: ignore[func-returns-value]
         listbox.bind("<Control-d>", lambda _: (listbox.selection_clear(0, tk.END), update_selection_info(), "break")[2])  # type: ignore[func-returns-value]
         listbox.bind("<Control-D>", lambda _: (listbox.selection_clear(0, tk.END), update_selection_info(), "break")[2])  # type: ignore[func-returns-value]
-        # pylint: enable=line-too-long
         add_parameter_window.root.bind("<Return>", lambda _: add_selected())
 
         def on_escape(_event: tk.Event) -> None:
@@ -1273,7 +1351,8 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
     def _center_and_focus_window(self, window: tk.Toplevel | tk.Tk) -> None:
         BaseWindow.center_window(window, self._get_parent_toplevel())
         window.lift()
-        window.update()  # Ensure the window is fully rendered before setting focus
+        if not is_macos_sequoia_or_older():
+            window.update_idletasks()
 
         # On macOS, grab_set() causes UI freeze (issue #1264), so skip it
         if sys_platform != "darwin":
@@ -1306,24 +1385,12 @@ class ParameterEditorTable(ScrollFrame):  # pylint: disable=too-many-ancestors,t
         # Get only selected parameters
         selected_names = [name for name, checkbutton_state in self.upload_checkbutton_var.items() if checkbutton_state.get()]
         if self.parameters is not None:
-            return self.parameter_editor.parameters_as_par_dict(
-                {
-                    name: self.parameters[name]
-                    for name in selected_names
-                    if name in self.parameters and not self.parameters[name].is_readonly
-                }
-            )
+            return self.parameter_editor.parameters_as_par_dict(selected_external_parameters(self.parameters, selected_names))
         return self.parameter_editor.get_parameters_as_par_dict(selected_names)
 
     def get_unselected_manually_edited_different_parameter_names(self) -> list[str]:
         """Return temporary manual edits that differ from the FC but are not selected for upload."""
         if self.parameters is None:
             return []
-        return [
-            name
-            for name in sorted(self.options.manually_editable_parameters)
-            if name in self.parameters
-            and self.parameters[name].is_dirty
-            and self.parameters[name].is_different_from_fc
-            and (name not in self.upload_checkbutton_var or not self.upload_checkbutton_var[name].get())
-        ]
+        selected_names = {name for name, state in self.upload_checkbutton_var.items() if state.get()}
+        return unselected_manual_edits(self.parameters, self.options.manually_editable_parameters, selected_names)

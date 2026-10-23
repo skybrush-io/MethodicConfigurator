@@ -14,28 +14,128 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 from __future__ import annotations
 
+import re
+import threading
 import tkinter as tk
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import partial
+from sys import platform as sys_platform
+from threading import Event, get_ident
+from tkinter import font as tkfont
+from tkinter import ttk
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import call as mock_call
 
 import pytest
 
-from ardupilot_methodic_configurator.data_model_parameter_editor import LogAnalysisInputs
+import ardupilot_methodic_configurator.frontend_tkinter_parameter_editor as parameter_editor_module
+from ardupilot_methodic_configurator.backend_filesystem import Par
+from ardupilot_methodic_configurator.backend_flightcontroller_reconnect import FlightControllerReconnect
+from ardupilot_methodic_configurator.data_model_ardupilot_parameter import ArduPilotParameter
+from ardupilot_methodic_configurator.data_model_parameter_editor import LogAnalysisInputs, ParameterEditor
 from ardupilot_methodic_configurator.frontend_tkinter_base_window import BaseWindow
+from ardupilot_methodic_configurator.frontend_tkinter_connection_recovery import (
+    ConnectionRecovery,
+    RecoveryCallbacks,
+    RecoveryState,
+)
+from ardupilot_methodic_configurator.frontend_tkinter_navigation_lock import NavigationLock
 from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import (
+    ParameterEditorAction,
     ParameterEditorUiServices,
     ParameterEditorWindow,
 )
+from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor_table import ParameterEditorTable
+from ardupilot_methodic_configurator.frontend_tkinter_scroll_frame import ScrollFrame
+from ardupilot_methodic_configurator.frontend_tkinter_show import MonitorBounds
+from ardupilot_methodic_configurator.frontend_tkinter_stage_progress import StageProgressBar
 from ardupilot_methodic_configurator.log_analysis.data_model_log_data import LogData
+from ardupilot_methodic_configurator.plugins.data_model_accelerometer_calibration import AccelerometerCalibrationDataModel
+from ardupilot_methodic_configurator.plugins.data_model_ahrs_orientation import AhrsOrientationDataModel
+from ardupilot_methodic_configurator.plugins.data_model_autotune_gain_backoff import AutotuneGainBackoffDataModel
+from ardupilot_methodic_configurator.plugins.frontend_tkinter_accelerometer_calibration import AccelerometerCalibrationView
+from ardupilot_methodic_configurator.plugins.frontend_tkinter_ahrs_orientation import AhrsOrientationView
+from ardupilot_methodic_configurator.plugins.frontend_tkinter_autotune_gain_backoff import AutotuneGainBackoffView
+from ardupilot_methodic_configurator.plugins.plugin_constants import (
+    PLUGIN_AHRS_ORIENTATION,
+    PLUGIN_AUTOTUNE_GAIN_BACKOFF,
+    PLUGIN_RC_CALIBRATION,
+)
+from ardupilot_methodic_configurator.plugins.plugin_factory import PluginFactory
+from ardupilot_methodic_configurator.plugins.plugin_protocol import PluginPauseReason
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
-    from pathlib import Path
+    from collections.abc import Callable, Generator, Iterator
+
+    from ardupilot_methodic_configurator.plugins.plugin_protocol import PluginView
 
 # pylint: disable=too-many-lines, redefined-outer-name, protected-access
 
 # ============================== SHARED FIXTURES ==============================
+
+
+def _wait_for_layout(window: tk.Toplevel, ready: Callable[[], bool]) -> None:
+    """Let Windows deliver geometry events, with a deadline so broken layouts still fail."""
+    completed = tk.BooleanVar(master=window, value=False)
+    poll_job: str | None = None
+
+    def check() -> None:
+        nonlocal poll_job
+        if ready():
+            completed.set(True)
+        else:
+            poll_job = window.after(10, check)
+
+    timeout_job = window.after(2000, lambda: completed.set(False))
+    # Always service the event queue before sampling newly mapped child geometry.
+    poll_job = window.after(0, check)
+    try:
+        window.wait_variable(completed)
+        assert completed.get(), "Window geometry did not settle before the layout check"
+    finally:
+        window.after_cancel(timeout_job)
+        if poll_job is not None:
+            window.after_cancel(poll_job)
+
+
+def _set_layout_dpi(root: tk.Tk, dpi: int) -> None:
+    """Set DPI before creating widgets and refresh fonts cached by the shared Tk root."""
+    root.tk.call("tk", "scaling", dpi / 72)
+    for name in tkfont.names(root):
+        if name.startswith("Tk"):
+            tkfont.nametofont(name, root=root).configure(family="Arial", size=10)
+
+
+@contextmanager
+def _layout_display(root: tk.Tk, dpi: int = 96) -> Generator[tk.Tk, None, None]:
+    """Give fixed-pixel scenarios explicit fonts, DPI and theme, without leaking them."""
+    original_scaling = float(root.tk.call("tk", "scaling"))
+    fonts = {name: tkfont.nametofont(name, root=root) for name in tkfont.names(root) if name.startswith("Tk")}
+    original_fonts = {name: font.configure() for name, font in fonts.items()}
+    style = ttk.Style(root)
+    original_theme = style.theme_use()
+    try:
+        style.theme_use("alt")
+        _set_layout_dpi(root, dpi)
+        root.update_idletasks()
+        yield root
+    finally:
+        root.tk.call("tk", "scaling", original_scaling)
+        for name, font in fonts.items():
+            original_font = original_fonts[name]
+            assert original_font is not None
+            font.configure(**original_font)
+        style.theme_use(original_theme)
+        root.update_idletasks()
+
+
+@pytest.fixture
+def layout_root(root: tk.Tk) -> Iterator[tk.Tk]:
+    """Match fixed-pixel windows to 96 DPI; individual scenarios may select another DPI."""
+    with _layout_display(root) as configured_root:
+        yield configured_root
 
 
 def _configure_root_stubs(root: MagicMock) -> None:
@@ -46,6 +146,12 @@ def _configure_root_stubs(root: MagicMock) -> None:
     root.winfo_rooty = MagicMock(return_value=0)
     root.winfo_width = MagicMock(return_value=800)
     root.winfo_height = MagicMock(return_value=600)
+    root.winfo_x = MagicMock(return_value=0)
+    root.winfo_y = MagicMock(return_value=0)
+    root.geometry = MagicMock(return_value="800x600+0+0")
+    root.state = MagicMock(return_value="normal")
+    root.attributes = MagicMock(return_value=0)
+    root.tk.getboolean.side_effect = lambda value: str(value).lower() in ("1", "true")
 
 
 def _build_parameter_area_container() -> MagicMock:
@@ -53,14 +159,28 @@ def _build_parameter_area_container() -> MagicMock:
     container.destroy = MagicMock()
     container.pack = MagicMock()
     container.winfo_children = MagicMock(return_value=[])
+    container.cget.return_value = 0
     return container
+
+
+def _configure_layout_stubs(editor: ParameterEditorWindow) -> None:
+    """Supply numeric widget dimensions when the widget factory is stubbed out."""
+    if not hasattr(editor, "main_frame"):
+        editor.main_frame = MagicMock()
+    main_frame = cast("MagicMock", editor.main_frame)
+    main_frame.winfo_children = MagicMock(return_value=[])
+    main_frame.winfo_height = MagicMock(return_value=600)
+    editor.parameter_area_container = _build_parameter_area_container()
 
 
 def _create_editor(parameter_editor: MagicMock) -> ParameterEditorWindow:  # noqa: PLR0915, RUF100 # pylint: disable=too-many-statements
     editor = ParameterEditorWindow.__new__(ParameterEditorWindow)
+    editor.navigation_lock = NavigationLock()
+    editor._connection_recovery = None
     editor.parameter_editor = parameter_editor
     editor.root = MagicMock()
     _configure_root_stubs(editor.root)
+    editor.dpi_scaling_factor = 1.0
     editor.gui_complexity = "normal"
     editor.stage_progress_bar = MagicMock()
     editor.documentation_frame = MagicMock()
@@ -68,6 +188,7 @@ def _create_editor(parameter_editor: MagicMock) -> ParameterEditorWindow:  # noq
     editor.documentation_frame.refresh_documentation_labels = MagicMock()
     editor.documentation_frame.update_why_why_now_tooltip = MagicMock()
     editor.parameter_editor_table = MagicMock()
+    editor.parameter_editor_table.bitmask_editor_open = False
     editor.parameter_editor_table.repopulate = MagicMock()
     editor.parameter_editor_table.get_upload_selected_params = MagicMock(return_value={})
     editor.parameter_editor_table.view_port = MagicMock()
@@ -116,16 +237,27 @@ def _create_editor(parameter_editor: MagicMock) -> ParameterEditorWindow:  # noq
     editor._param_download_progress_window_upload = None
     editor._reset_progress_window = None
     editor.file_upload_progress_window = None
+    editor._configured_upload_active = False
+    editor._param_file_change_active = False
+    editor._close_after_configured_upload = False
+    editor._close_pending = False
     editor._tempcal_imu_progress_window = None
-    editor.main_frame = MagicMock()
+    _configure_layout_stubs(editor)
     parameter_area_container = _build_parameter_area_container()
     editor.parameter_area_container = parameter_area_container
     editor.parameter_container = parameter_area_container
     editor.parameter_area_paned = None
     editor.inline_component_editor = None
+    editor.inline_component_scroll_frame = None
+    editor._inline_component_chrome_height = 0
+    editor._parameter_area_resize_pending = False
+    editor._parameter_area_resize_running = False
     editor._inline_component_name = None
     editor._updating_inline_editor = False
+    editor._requested_action = ParameterEditorAction.FINISHED
     editor.inline_component_container = MagicMock()
+    editor.inline_component_container.winfo_reqheight.return_value = 74
+    editor.inline_component_container.cget.return_value = 0
     return editor
 
 
@@ -144,11 +276,15 @@ def parameter_editor() -> MagicMock:
     manager.configuration_phases.return_value = True
     manager.handle_param_file_change_workflow.return_value = ("01_initial.param", True)
     manager.get_plugin.return_value = None
+    manager.get_current_component.return_value = None
     manager.handle_write_changes_workflow = MagicMock()
     manager.handle_copy_fc_values_workflow = MagicMock(return_value="close")
     manager.open_documentation_in_browser = MagicMock()
 
-    def _download_fc_parameters(get_progress_callback: Callable | None = None) -> None:
+    def _download_fc_parameters(
+        get_progress_callback: Callable | None = None, *, response_timeout: float | None = None
+    ) -> None:
+        assert response_timeout is None
         if get_progress_callback is not None:
             callback = get_progress_callback()
             if callback is not None:
@@ -156,7 +292,6 @@ def parameter_editor() -> MagicMock:
 
     manager.download_flight_controller_parameters = MagicMock(side_effect=_download_fc_parameters)
     manager.upload_selected_params_workflow = MagicMock()
-    manager.download_last_flight_log_workflow = MagicMock()
     manager.write_summary_files_workflow = MagicMock()
     manager.last_upload_progress_callback = None
     manager.get_log_analysis_context_inputs = MagicMock(
@@ -205,12 +340,17 @@ class _DummyTkRoot:  # pylint: disable=too-many-instance-attributes, too-few-pub
         self._w = "."
         self.title = MagicMock()
         self.geometry = MagicMock()
+        self.geometry.return_value = "990x630+0+0"
+        self.state = MagicMock(return_value="normal")
+        self.attributes = MagicMock(return_value=0)
+        self.tk.getboolean.side_effect = lambda value: str(value).lower() in ("1", "true")
         self.protocol = MagicMock()
         self.withdraw = MagicMock()
         self.destroy = MagicMock()
         self.deiconify = MagicMock()
         self.update_idletasks = MagicMock()
         self.after = MagicMock()
+        self.after_idle = MagicMock()
         self.winfo_fpixels = MagicMock(return_value=96.0)
         self.winfo_reqheight = MagicMock(return_value=630)
         self.winfo_width = MagicMock(return_value=1)
@@ -220,8 +360,19 @@ class _DummyTkRoot:  # pylint: disable=too-many-instance-attributes, too-few-pub
         self.winfo_pointery = MagicMock(return_value=0)
         self.winfo_screenwidth = MagicMock(return_value=1920)
         self.winfo_screenheight = MagicMock(return_value=1080)
+        self.winfo_rootx = MagicMock(return_value=0)
+        self.winfo_rooty = MagicMock(return_value=0)
+        self.winfo_x = MagicMock(return_value=0)
+        self.winfo_y = MagicMock(return_value=0)
         self.update = MagicMock()
         self.bind = MagicMock()
+
+
+@pytest.fixture(autouse=True)
+def monitor_bounds() -> Iterator[MagicMock]:
+    """Keep monitor detection independent of the host display and mocked Tk handles."""
+    with patch.object(parameter_editor_module, "get_monitor_bounds", return_value=MonitorBounds(0, 0, 1920, 1080)) as bounds:
+        yield bounds
 
 
 @pytest.fixture
@@ -260,11 +411,738 @@ class TestParameterEditorUiServices:  # pylint: disable=too-few-public-methods
             "Title",
             "Template",
             only_show_when_update_progress_called=True,
+            auto_close_on_complete=True,
         )
         assert window is progress_window
 
 
 # ============================== PARAMETER FILE FLOW ==============================
+
+
+class TestWindowSizing:
+    """Keep navigation controls visible while respecting the user's window size."""
+
+    @pytest.mark.parametrize("ambient_dpi", [96, 144], ids=["96dpi-desktop", "144dpi-desktop"])
+    @pytest.mark.parametrize("fail", [False, True], ids=["success", "failure"])
+    def test_layout_scenarios_restore_shared_display_settings(self, root: tk.Tk, ambient_dpi: int, fail: bool) -> None:
+        """
+        Fixed-pixel scenarios must not change the display used by later tests.
+
+        GIVEN: A shared Tk root with a desktop DPI and a customized default font
+        WHEN: A 96-DPI layout scenario completes or raises an error
+        THEN: Its scaling, named fonts and theme are restored for the next user scenario
+        """
+        with _layout_display(root, ambient_dpi):
+            tkfont.nametofont("TkDefaultFont", root=root).configure(family="Courier", size=14)
+            style = ttk.Style(root)
+            style.theme_use("clam")
+            original_scaling = float(root.tk.call("tk", "scaling"))
+            original_fonts = {
+                name: tkfont.nametofont(name, root=root).configure() for name in tkfont.names(root) if name.startswith("Tk")
+            }
+            failure_message = "layout scenario failed"
+            with (
+                pytest.raises(RuntimeError, match=failure_message) if fail else nullcontext(),
+                _layout_display(root),
+            ):
+                assert float(root.tk.call("tk", "scaling")) == pytest.approx(96 / 72, rel=0.01)
+                default_font = tkfont.nametofont("TkDefaultFont", root=root)
+                assert default_font.cget("size") == 10
+                assert default_font.metrics("linespace") == tkfont.Font(root=root, family="Arial", size=10).metrics(
+                    "linespace"
+                )
+                assert style.theme_use() == "alt"
+                if fail:
+                    raise RuntimeError(failure_message)
+            assert float(root.tk.call("tk", "scaling")) == pytest.approx(original_scaling, rel=0.01)
+            assert style.theme_use() == "clam"
+            assert {name: tkfont.nametofont(name, root=root).configure() for name in original_fonts} == original_fonts
+
+    @pytest.mark.parametrize("height", [500, 688], ids=["short-window", "768-screen"])
+    @pytest.mark.parametrize("complexity", ["simple", "normal"])
+    def test_user_can_reclaim_table_space_by_collapsing_information_sections(  # noqa: PLR0915 # pylint: disable=too-many-locals,too-many-statements
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        root: tk.Tk,
+        height: int,
+        complexity: str,
+    ) -> None:
+        """
+        Collapsing progress and documentation gives space back to the parameter table.
+
+        GIVEN: The real information sections and parameter table in a short editor window
+        WHEN: The user collapses each section, changes steps and expands them again
+        THEN: Table space grows, edits and section state survive, and navigation stays visible
+        """
+        editor = parameter_editor_window
+        model = cast("MagicMock", editor.parameter_editor)
+        model.get_last_configuration_step_number.return_value = 30
+        model.get_sorted_phases_with_end_and_weight.return_value = {
+            "Hardware setup": {"start": 1, "end": 10, "weight": 9},
+            "Flight tuning": {"start": 10, "end": 30, "weight": 20},
+        }
+        model.get_documentation_frame_title.return_value = "Initial setup Documentation"
+        model.get_documentation_text_and_url.side_effect = lambda key: (
+            ("75", "") if key == "mandatory" else ("Setup guide", "https://ardupilot.org/")
+        )
+        model.parse_mandatory_level_percentage.return_value = (75, "Required setup")
+        model.get_why_why_now_tooltip.return_value = "Configure the vehicle before flying."
+        model.current_step_parameters = {"TEST_GAIN": ArduPilotParameter("TEST_GAIN", Par(0.2, "Gain"))}
+        model.should_display_bitmask_parameter_editor_usage.return_value = False
+        window = tk.Toplevel(root)
+        window.geometry(f"990x{height}+0+0")
+        window.update_idletasks()
+        editor.root = window
+        editor.gui_complexity = complexity
+        editor.main_frame = ttk.Frame(window)
+        editor.main_frame.place(width=990, height=height)
+        header = ttk.Frame(editor.main_frame, height=100)
+        header.pack(side="top", fill="x")
+        header.pack_propagate(flag=False)
+
+        try:
+            with patch.object(
+                parameter_editor_module.ProgramSettings,
+                "get_setting",
+                side_effect=lambda key: complexity if key == "gui_complexity" else False,
+            ):
+                editor._create_progress_and_documentation_widgets()
+            editor.parameter_area_container = ttk.Frame(editor.main_frame)
+            editor.parameter_area_container.pack(side="top", fill="both", expand=True)
+            editor.parameter_container = editor.parameter_area_container
+            table = parameter_editor_module.ParameterEditorTable(editor.parameter_container, model, editor)
+            editor.parameter_editor_table = table
+            table.pack(fill="both", expand=True)
+            table.repopulate_table(show_only_differences=False, gui_complexity=complexity)
+            buttons = ttk.Frame(editor.main_frame)
+            buttons.pack(side="bottom", fill="x", pady=10)
+            ttk.Button(buttons, text="Upload parameters\nand advance").pack()
+            root.update_idletasks()
+            editor._bind_parameter_layout_events()
+            editor._resize_parameter_area_to_fit()
+            root.update_idletasks()
+            initial_table_height = editor.parameter_area_container.winfo_height()
+            value_widget = table._new_value_widgets["TEST_GAIN"]
+            value_widget.delete(0, tk.END)
+            value_widget.insert(0, "0.15")
+            docs = editor.documentation_frame.documentation_frame
+            progress = editor.stage_progress_bar
+            assert docs.expanded
+            assert progress.expanded
+
+            docs.header_label.event_generate("<Button-1>")
+            root.update_idletasks()
+            after_docs_height = editor.parameter_area_container.winfo_height()
+            assert after_docs_height > initial_table_height
+            assert docs.header_label.winfo_ismapped()
+            assert not docs.content_frame.winfo_ismapped()
+
+            progress.header_label.event_generate("<Button-1>")
+            root.update_idletasks()
+            assert editor.parameter_area_container.winfo_height() > after_docs_height
+            assert progress.header_label.winfo_ismapped()
+            assert not progress.content_frame.winfo_ismapped()
+            model.get_documentation_frame_title.return_value = "Flight tuning Documentation"
+            editor.documentation_frame.refresh_documentation_labels()
+            progress.update_progress(15)
+            assert not docs.expanded
+            assert not progress.expanded
+            assert docs.header_label.cget("text") == "▶ Flight tuning Documentation"
+            assert cast("ttk.Progressbar", progress.phase_bars[1]["bar"]).cget("value") == 5
+            assert editor.parameter_editor_table is table
+            assert value_widget.get() == "0.15"
+            assert buttons.winfo_height() == buttons.winfo_reqheight()
+            assert buttons.winfo_y() + buttons.winfo_height() <= height - 10
+
+            for section in (progress, docs):
+                section.header_label.event_generate("<Button-1>")
+            root.update_idletasks()
+
+            assert docs.content_frame.winfo_ismapped()
+            assert progress.content_frame.winfo_ismapped()
+            assert editor.parameter_area_container.winfo_height() == initial_table_height
+            assert table._new_value_widgets["TEST_GAIN"] is value_widget
+            assert value_widget.get() == "0.15"
+            assert buttons.winfo_height() == buttons.winfo_reqheight()
+            assert buttons.winfo_y() + buttons.winfo_height() <= height - 10
+        finally:
+            window.destroy()
+
+    @pytest.mark.parametrize("height_option", [0, "0", pytest.param("pixel", id="truthy-tcl-pixel-zero")])
+    def test_new_parameter_panes_are_measured_for_all_tk_zero_representations(
+        self, parameter_editor_window: ParameterEditorWindow, height_option: int | str
+    ) -> None:
+        """
+        Unset Tk distances must not prevent the new panes from being measured.
+
+        GIVEN: Tk returns zero as an integer, string or truthy Tcl pixel object
+        WHEN: A new parameter area is fitted with a resize callback queued
+        THEN: Idle geometry is flushed before its height is fixed, without re-entry
+        """
+        editor = parameter_editor_window
+        pixel_zero = MagicMock()
+        pixel_zero.__str__.return_value = "0"
+        container = cast("MagicMock", editor.parameter_area_container)
+        container.cget.return_value = pixel_zero if height_option == "pixel" else height_option
+        flushing = False
+
+        def settle_geometry() -> None:
+            nonlocal flushing
+            assert not flushing, "Measuring panes must not recursively flush geometry"
+            flushing = True
+            editor._resize_parameter_area_to_fit()
+            editor._on_main_frame_resize(tk.Event())
+            flushing = False
+
+        container.update_idletasks.side_effect = settle_geometry
+
+        editor._resize_parameter_area_to_fit()
+
+        container.update_idletasks.assert_called_once()
+        container.configure.assert_called_once_with(height=600)
+        cast("MagicMock", editor.root).after_idle.assert_not_called()
+        assert not editor._parameter_area_resize_running
+
+    @pytest.mark.parametrize("padding", [10, (10,), (10, 10), "10", "10 10", (4, 16), "4 16"])
+    def test_bottom_buttons_keep_their_full_height(
+        self, parameter_editor_window: ParameterEditorWindow, padding: int | tuple[int, ...] | str
+    ) -> None:
+        """
+        Symmetric and asymmetric padding reserve space on both sides of the buttons.
+
+        GIVEN: Fixed controls and two-line buttons with 20 pixels of total padding
+        WHEN: The parameter table is fitted to the window
+        THEN: The table leaves enough room for the full button row and all padding
+        """
+        editor = parameter_editor_window
+        controls = []
+        for height, pady in [(600, 2), (100, (2, 2)), (45, padding)]:
+            widget = MagicMock()
+            widget.winfo_manager.return_value = "pack"
+            widget.winfo_reqheight.return_value = height
+            widget.pack_info.return_value = {"pady": pady}
+            widget.winfo_pixels.side_effect = int
+            controls.append(widget)
+        hidden_editor = MagicMock()
+        hidden_editor.winfo_manager.return_value = ""
+        editor.root.tk.splitlist.side_effect = lambda value: tuple(value.split())
+        editor.main_frame.winfo_children.return_value = [*controls, editor.parameter_area_container, hidden_editor]
+        editor.main_frame.winfo_height.return_value = 854
+
+        editor._resize_parameter_area_to_fit()
+
+        editor.parameter_area_container.configure.assert_called_once_with(height=81)
+
+    @pytest.mark.parametrize(
+        ("screen_height", "root_y", "requested_height", "scaling", "expected_height", "expected_y"),
+        [
+            (768, 69, 854, 1.0, 688, 40),
+            (900, 121, 817, 1.0, 820, 40),
+            (1080, 193, 931, 1.0, 931, 109),
+            (1080, 193, 931, 1.5, 960, 60),
+        ],
+    )
+    # pylint: disable-next=too-many-arguments, too-many-positional-arguments
+    def test_startup_keeps_bottom_controls_on_screen(
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        monitor_bounds: MagicMock,
+        screen_height: int,
+        root_y: int,
+        requested_height: int,
+        scaling: float,
+        expected_height: int,
+        expected_y: int,
+    ) -> None:
+        """
+        Startup accounts for the window's position as well as the monitor height.
+
+        GIVEN: The initial smaller window has already been centered
+        WHEN: The final startup size is applied
+        THEN: Its bottom remains within the monitor with room for desktop panels
+        """
+        editor = parameter_editor_window
+        editor.dpi_scaling_factor = scaling
+        monitor_bounds.return_value = MonitorBounds(0, 0, 1920, screen_height)
+        editor.root.winfo_reqheight.return_value = requested_height
+        editor.root.winfo_rooty.return_value = root_y
+        editor.root.winfo_y.return_value = root_y
+        editor.root.geometry.return_value = f"800x600+0+{root_y}"
+
+        editor._fit_window_to_screen_height(initialize=True)
+
+        editor.root.geometry.assert_any_call(f"{round(990 * scaling)}x{expected_height}+0+{expected_y}")
+        assert expected_y + expected_height <= screen_height - round(40 * scaling)
+
+    @pytest.mark.parametrize("component_name", [None, "Battery", "Motor"])
+    def test_changing_steps_preserves_user_window_size(
+        self, parameter_editor_window: ParameterEditorWindow, component_name: str | None
+    ) -> None:
+        """
+        Repeated step changes preserve a manually resized window.
+
+        GIVEN: A user resized the window to 1400 by 700 pixels
+        WHEN: Several steps rebuild or hide the inline component editor
+        THEN: The window retains its size even when widgets request more height
+        """
+        editor = parameter_editor_window
+        editor.root.winfo_width.return_value = 1400
+        editor.root.winfo_height.return_value = 700
+        editor.root.winfo_rooty.return_value = 100
+        editor.root.winfo_y.return_value = 100
+        editor.root.winfo_reqheight.return_value = 1200
+
+        with (
+            patch.object(parameter_editor_module, "ComponentEditorWindow"),
+            patch.object(parameter_editor_module, "ScrollFrame") as scroll_frame,
+        ):
+            scroll_frame.return_value.winfo_reqheight.return_value = 50
+            scroll_frame.return_value.winfo_height.return_value = 1
+            scroll_frame.return_value.view_port.winfo_reqheight.return_value = 272
+            for _ in range(5):
+                editor._update_inline_component_editor(component_name)
+
+        editor.root.geometry.assert_not_called()
+
+    def test_oversized_window_is_clamped_on_an_offset_monitor(
+        self, parameter_editor_window: ParameterEditorWindow, monitor_bounds: MagicMock
+    ) -> None:
+        """
+        Later sizing uses the active monitor, including negative desktop coordinates.
+
+        GIVEN: An oversized user window on a monitor above and right of the primary one
+        WHEN: A step changes
+        THEN: Only the height and vertical position are clamped, preserving width
+        """
+        editor = parameter_editor_window
+        monitor_bounds.return_value = MonitorBounds(1920, -900, 3520, 0)
+        editor.root.winfo_width.return_value = 1400
+        editor.root.winfo_height.return_value = 1200
+        editor.root.winfo_rooty.return_value = -400
+        editor.root.winfo_y.return_value = -400
+        editor.root.winfo_x.return_value = 2000
+        editor.root.geometry.return_value = "1400x1200+2000+-400"
+
+        editor._fit_window_to_screen_height()
+
+        editor.root.geometry.assert_any_call("1400x820+2000+-860")
+
+    @pytest.mark.parametrize("screen_height", [768, 900])
+    def test_decorated_window_settles_after_startup(
+        self, parameter_editor_window: ParameterEditorWindow, monitor_bounds: MagicMock, screen_height: int
+    ) -> None:
+        """
+        Repeated fits keep decorated X11 windows in the same place.
+
+        GIVEN: Client coordinates include a five-pixel border and 23-pixel title bar
+        WHEN: Startup sizes the editor and eight subsequent steps fit it again
+        THEN: Neither axis drifts and the client bottom respects the panel margin
+        """
+        editor = parameter_editor_window
+        monitor_bounds.return_value = MonitorBounds(0, 0, 1600, screen_height)
+        frame = [167, 100, 990, 630]
+        positions = []
+
+        def geometry(value: str | None = None) -> str:
+            if value is not None:
+                match = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", value)
+                assert match is not None
+                width, height, x_pos, y_pos = map(int, match.groups())
+                frame[:] = [x_pos, y_pos, width, height]
+                positions.append(tuple(frame))
+            return f"{frame[2]}x{frame[3]}+{frame[0]}+{frame[1]}"
+
+        editor.root.geometry.side_effect = geometry
+        editor.root.winfo_rootx.side_effect = editor.root.winfo_x.side_effect = lambda: frame[0] + 5
+        editor.root.winfo_rooty.side_effect = editor.root.winfo_y.side_effect = lambda: frame[1] + 23
+        editor.root.winfo_width.side_effect = lambda: frame[2]
+        editor.root.winfo_height.side_effect = lambda: frame[3]
+        editor.root.winfo_reqheight.return_value = 900
+
+        editor._fit_window_to_screen_height(initialize=True)
+        for _ in range(8):
+            editor._fit_window_to_screen_height()
+
+        assert positions == [(167, 17, 990, screen_height - 80)]
+        assert editor.root.winfo_rooty() == 40
+        assert editor.root.winfo_rooty() + editor.root.winfo_height() == screen_height - 40
+
+    @pytest.mark.parametrize("height", [600, 730])
+    def test_visible_window_at_top_edge_keeps_user_position(
+        self, parameter_editor_window: ParameterEditorWindow, monitor_bounds: MagicMock, height: int
+    ) -> None:
+        """
+        User positions inside the monitor need no correction.
+
+        GIVEN: A decorated window at frame +100+0, entirely visible on a 768-pixel monitor
+        WHEN: A step changes, even with less than the preferred margin
+        THEN: Its size and position remain unchanged
+        """
+        editor = parameter_editor_window
+        monitor_bounds.return_value = MonitorBounds(0, 0, 1366, 768)
+        editor.root.winfo_rooty.return_value = 23
+        editor.root.winfo_height.return_value = height
+
+        editor._fit_window_to_screen_height()
+
+        editor.root.geometry.assert_not_called()
+
+    @pytest.mark.parametrize("mode", ["state", "-zoomed", "-fullscreen"])
+    def test_step_changes_preserve_window_manager_mode(
+        self, parameter_editor_window: ParameterEditorWindow, mode: str
+    ) -> None:
+        """
+        The window manager retains control of maximised and full-screen windows.
+
+        GIVEN: A window maximised by state, by X11 attributes, or in full screen
+        WHEN: A step changes while its height exceeds the normal sizing limit
+        THEN: Geometry is untouched and the table still fits the available space
+        """
+        editor = parameter_editor_window
+        editor.root.winfo_height.return_value = 1200
+        if mode == "state":
+            editor.root.state.return_value = "zoomed"
+        else:
+            editor.root.attributes.side_effect = lambda attribute: "1" if attribute == mode else "0"
+
+        editor._fit_window_to_screen_height()
+
+        editor.root.geometry.assert_not_called()
+        editor.parameter_area_container.configure.assert_called_once_with(height=600)
+
+    def test_unsupported_zoom_attribute_still_allows_normal_window_fitting(
+        self, parameter_editor_window: ParameterEditorWindow
+    ) -> None:
+        """
+        Windows and macOS can omit the X11 zoom attribute.
+
+        GIVEN: Querying -zoomed raises TclError but full screen is false
+        WHEN: An oversized normal window is fitted
+        THEN: Its height is reduced without an unsupported-attribute error
+        """
+        editor = parameter_editor_window
+        editor.root.attributes.side_effect = [tk.TclError("unsupported attribute"), 0]
+        editor.root.winfo_height.return_value = 1200
+
+        editor._fit_window_to_screen_height()
+
+        editor.root.geometry.assert_any_call("800x1000+0+40")
+
+    def test_clamping_preserves_right_and_bottom_geometry_anchors(
+        self, parameter_editor_window: ParameterEditorWindow
+    ) -> None:
+        """
+        Negative WM geometry offsets retain their screen-edge anchor semantics.
+
+        GIVEN: An oversized decorated window anchored 77 pixels right and 100 pixels bottom
+        WHEN: Its client height and top are clamped to the monitor
+        THEN: The right anchor stays unchanged and the bottom anchor accounts for resizing
+        """
+        editor = parameter_editor_window
+        editor.root.geometry.return_value = "1400x1200-77-100"
+        editor.root.winfo_width.return_value = 1400
+        editor.root.winfo_height.return_value = 1200
+        editor.root.winfo_rooty.return_value = -225
+
+        editor._fit_window_to_screen_height()
+
+        editor.root.geometry.assert_any_call("1400x1000-77-35")
+
+    def test_wrapped_controls_refit_the_table_after_idle(self, parameter_editor_window: ParameterEditorWindow) -> None:
+        """
+        Narrowing the window leaves the full button row visible after labels wrap.
+
+        GIVEN: The header initially requests 100 pixels and wraps after Configure
+        WHEN: Several resize events arrive before idle layout completes
+        THEN: A single deferred fit accounts for the new 115-pixel header height
+        """
+        editor = parameter_editor_window
+        header = MagicMock()
+        header.winfo_manager.return_value = "pack"
+        header.winfo_reqheight.return_value = 100
+        header.pack_info.return_value = {"pady": 0}
+        header.winfo_pixels.side_effect = int
+        editor.main_frame.winfo_children.return_value = [header, editor.parameter_area_container]
+
+        editor._on_main_frame_resize(MagicMock())
+        editor._on_main_frame_resize(MagicMock())
+        editor.parameter_area_container.configure.assert_not_called()
+        header.winfo_reqheight.return_value = 115
+        editor.root.after_idle.call_args.args[0]()
+
+        editor.root.after_idle.assert_called_once()
+        editor.parameter_area_container.configure.assert_called_once_with(height=485)
+        assert not editor._parameter_area_resize_pending
+
+    @pytest.mark.parametrize(
+        ("frame_height", "component_height", "table_height", "plugin_height"),
+        [(600, 172, 120, None), (854, 304, 242, None), (600, 92, 200, 200)],
+    )
+    def test_component_fields_scroll_to_preserve_the_parameter_area(
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        frame_height: int,
+        component_height: int,
+        table_height: int,
+        plugin_height: int | None,
+    ) -> None:
+        """
+        Component-heavy steps preserve useful table and plugin space on short screens.
+
+        GIVEN: Fixed controls consume 300 pixels beside a 272-pixel component editor
+        WHEN: The remaining space is allocated on small or large windows
+        THEN: The table or left plugin gets usable height and component fields can scroll
+        """
+        editor = parameter_editor_window
+        if plugin_height is not None:
+            editor.current_plugin = {"placement": "left"}
+            plugin_view = MagicMock()
+            plugin_view.winfo_reqheight.return_value = plugin_height
+            editor.current_plugin_view = plugin_view
+        fixed_controls = MagicMock()
+        fixed_controls.winfo_manager.return_value = "pack"
+        fixed_controls.winfo_reqheight.return_value = 300
+        fixed_controls.pack_info.return_value = {"pady": 0}
+        fixed_controls.winfo_pixels.side_effect = int
+        editor.inline_component_container.winfo_manager.return_value = "pack"
+        editor.inline_component_container.pack_info.return_value = {"pady": 4}
+        editor.inline_component_container.winfo_pixels.side_effect = int
+        editor.inline_component_scroll_frame = MagicMock()
+        editor.inline_component_scroll_frame.view_port.winfo_reqheight.return_value = 272
+        editor.inline_component_scroll_frame.winfo_height.return_value = 100
+        editor.inline_component_container.winfo_height.return_value = 124
+        editor._inline_component_chrome_height = 0
+        editor.main_frame.winfo_height.return_value = frame_height
+        editor.main_frame.winfo_children.return_value = [
+            fixed_controls,
+            editor.inline_component_container,
+            editor.parameter_area_container,
+        ]
+
+        editor._resize_parameter_area_to_fit()
+
+        editor.inline_component_container.configure.assert_called_once_with(height=component_height)
+        editor.inline_component_scroll_frame.canvas.configure.assert_called_once_with(height=280)
+        editor.parameter_area_container.configure.assert_called_once_with(height=table_height)
+
+    @pytest.mark.parametrize("scaling", [1.0, 1.5], ids=["96dpi", "144dpi"])
+    def test_growing_window_never_shrinks_either_scrollable_panel(
+        self, parameter_editor_window: ParameterEditorWindow, scaling: float
+    ) -> None:
+        """
+        Each extra pixel of window height preserves both panels' visible content.
+
+        GIVEN: Component fields overflow the space beside a scrollable parameter table
+        WHEN: The user grows the window through the two panels' minimum-height boundary
+        THEN: Neither panel shrinks or jumps, and together they use the available height
+        """
+        editor = parameter_editor_window
+        editor.dpi_scaling_factor = scaling
+        fixed_controls = MagicMock()
+        fixed_controls.winfo_manager.return_value = "pack"
+        fixed_controls.winfo_reqheight.return_value = 300
+        fixed_controls.pack_info.return_value = {"pady": 0}
+        fixed_controls.winfo_pixels.side_effect = int
+        editor.inline_component_container.winfo_manager.return_value = "pack"
+        editor.inline_component_container.pack_info.return_value = {"pady": 0}
+        editor.inline_component_container.winfo_pixels.side_effect = int
+        editor.inline_component_scroll_frame = MagicMock()
+        editor.inline_component_scroll_frame.view_port.winfo_reqheight.return_value = 600
+        editor.inline_component_scroll_frame.winfo_height.return_value = 100
+        editor.inline_component_container.winfo_height.return_value = 100 + round(28 * scaling)
+        editor._inline_component_chrome_height = 0
+        editor.main_frame.winfo_children.return_value = [
+            fixed_controls,
+            editor.inline_component_container,
+            editor.parameter_area_container,
+        ]
+
+        boundary = round(80 * scaling) + round(120 * scaling)
+        previous_heights: tuple[int, int] | None = None
+        for available_height in range(boundary - 5, boundary + 6):
+            editor.main_frame.winfo_height.return_value = 300 + available_height
+            editor._resize_parameter_area_to_fit()
+            component_height = editor.inline_component_container.configure.call_args.kwargs["height"]
+            table_height = editor.parameter_area_container.configure.call_args.kwargs["height"]
+            assert component_height + table_height == available_height
+            if previous_heights is not None:
+                assert 0 <= component_height - previous_heights[0] <= 1
+                assert 0 <= table_height - previous_heights[1] <= 1
+            previous_heights = (component_height, table_height)
+
+    def test_fixed_widget_growth_keeps_real_buttons_visible(
+        self, parameter_editor_window: ParameterEditorWindow, layout_root: tk.Tk
+    ) -> None:
+        """
+        Real Tk layout settles after the stage bar wraps at a narrower width.
+
+        GIVEN: Normal mode displays eight labelled phases above the table and buttons
+        WHEN: The window is narrowed in single jumps and Tk processes idle layout
+        THEN: The button row stays fully visible and the table gives space to wrapping
+        """
+        root = layout_root
+        editor = parameter_editor_window
+        editor.root = root
+        editor.main_frame = ttk.Frame(root)
+        editor.main_frame.place(width=1031, height=600)
+        phases = {f"Configuration phase {number}": {"start": number, "end": number + 1} for number in range(8)}
+        stage_bar = StageProgressBar(editor.main_frame, phases, 9, "normal")
+        stage_bar.pack(side="top", fill="x")
+        editor.parameter_area_container = ttk.Frame(editor.main_frame, height=500)
+        editor.parameter_area_container.pack(side="top", fill="both", expand=True)
+        buttons = ttk.Frame(editor.main_frame)
+        buttons.pack(side="bottom", fill="x", pady=10)
+        ttk.Button(buttons, text="Upload parameters\nand advance").pack()
+        editor._bind_parameter_layout_events()
+
+        try:
+            root.update_idletasks()
+            initial_header_height = stage_bar.winfo_reqheight()
+            for width in (950, 800, 400):
+                editor.main_frame.place_configure(width=width)
+                root.update_idletasks()
+                assert buttons.winfo_height() == buttons.winfo_reqheight()
+                assert buttons.winfo_y() + buttons.winfo_height() <= editor.main_frame.winfo_height() - 10
+                assert editor.parameter_area_container.winfo_height() + stage_bar.winfo_reqheight() == (
+                    editor.main_frame.winfo_height() - buttons.winfo_reqheight() - 20
+                )
+            assert stage_bar.winfo_reqheight() > initial_header_height
+        finally:
+            editor.main_frame.destroy()
+
+    @staticmethod
+    def _assert_real_component_fields_visible(editor: ParameterEditorWindow, field_count: int) -> int:
+        """Check settled panel geometry and reach the last field through its real canvas."""
+        scroll_frame = editor.inline_component_scroll_frame
+        assert scroll_frame is not None
+        assert editor._inline_component_chrome_height > 0
+        panel_height = editor.inline_component_container.winfo_height()
+        assert panel_height == int(editor.inline_component_container.cget("height"))
+        assert panel_height == editor.inline_component_container.winfo_reqheight()
+        last_field = scroll_frame.view_port.winfo_children()[-1]
+        assert scroll_frame.canvas.winfo_height() >= last_field.winfo_height() + 8
+        assert editor.parameter_area_container.winfo_height() >= last_field.winfo_height() + 8
+        if field_count == 3:
+            assert panel_height == scroll_frame.view_port.winfo_reqheight() + 8 + editor._inline_component_chrome_height
+            assert scroll_frame.canvas.winfo_height() >= scroll_frame.view_port.winfo_reqheight() + 8
+        else:
+            assert scroll_frame.view_port.winfo_reqheight() > scroll_frame.canvas.winfo_height()
+            scroll_frame.canvas.yview_moveto(1)
+            assert scroll_frame.canvas.yview()[0] > 0
+        field_bottom = (
+            scroll_frame.canvas.coords(scroll_frame.canvas_window)[1] + last_field.winfo_y() + last_field.winfo_height()
+        )
+        assert field_bottom <= scroll_frame.canvas.canvasy(scroll_frame.canvas.winfo_height()) + 1
+        return panel_height
+
+    @staticmethod
+    def _assert_real_panels_grow_continuously(editor: ParameterEditorWindow, root: tk.Tk, fixed_height: int) -> None:
+        """Exercise the actual Configure bindings across the allocation boundary."""
+        boundary = round(80 * editor.dpi_scaling_factor) + round(120 * editor.dpi_scaling_factor)
+        previous_heights: tuple[int, int] | None = None
+        for available_height in range(boundary - 5, boundary + 6):
+            editor.main_frame.place_configure(height=fixed_height + available_height)
+            root.update_idletasks()
+            panel_heights = (
+                editor.inline_component_container.winfo_height(),
+                editor.parameter_area_container.winfo_height(),
+            )
+            assert sum(panel_heights) == available_height
+            if previous_heights is not None:
+                assert all(
+                    0 <= current - previous <= 1 for current, previous in zip(panel_heights, previous_heights, strict=True)
+                )
+            previous_heights = panel_heights
+
+    @pytest.mark.parametrize("defer_geometry", [False, True], ids=["immediate", "sequoia"])
+    @pytest.mark.parametrize("field_count", [3, 40], ids=["fitting-fields", "scrolling-fields"])
+    @pytest.mark.parametrize(
+        ("width", "height", "dpi"),
+        [
+            pytest.param(1920, 1000, 96, id="1920x1080"),
+            pytest.param(1366, 688, 96, id="1366x768"),
+            pytest.param(1600, 820, 96, id="1600x900"),
+            pytest.param(1920, 960, 144, id="1920x1080-144dpi"),
+            pytest.param(1100, 500, 96, id="1100x500-window"),
+            pytest.param(1024, 516, 96, id="1024x600"),
+            pytest.param(1280, 636, 96, id="1280x720"),
+        ],
+    )
+    def test_real_component_fields_remain_accessible_after_rebuilding(  # noqa: PLR0915 # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        layout_root: tk.Tk,
+        width: int,
+        height: int,
+        dpi: int,
+        field_count: int,
+        defer_geometry: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A scrolling component editor keeps both fields and parameter rows accessible.
+
+        GIVEN: Real Tk widgets at the reported display widths, client heights and DPI
+        WHEN: Equal-height editors are rebuilt consecutively and across a component-less step
+        THEN: Fitting fields stay fully visible, overflowing fields scroll, and buttons remain visible
+        """
+        root = layout_root
+        monkeypatch.setattr(parameter_editor_module, "is_macos_sequoia_or_older", lambda: defer_geometry)
+        editor = parameter_editor_window
+        _set_layout_dpi(root, dpi)
+        field_font = tkfont.Font(root=root, family="Arial", size=10)
+        assert float(root.tk.call("tk", "scaling")) == pytest.approx(dpi / 72, rel=0.01)
+        editor.dpi_scaling_factor = dpi / 96
+        editor.root = root
+        editor.main_frame = ttk.Frame(root)
+        editor.main_frame.place(width=width, height=height)
+        header = ttk.Frame(editor.main_frame, height=round((200 if field_count == 3 else 300) * editor.dpi_scaling_factor))
+        header.pack(side="top", fill="x")
+        header.pack_propagate(flag=False)
+        editor.inline_component_container = ttk.LabelFrame(editor.main_frame)
+        editor.parameter_area_container = ttk.Frame(editor.main_frame, height=500)
+        editor.parameter_area_container.pack(side="top", fill="both", expand=True)
+        buttons = ttk.Frame(editor.main_frame)
+        buttons.pack(side="bottom", fill="x", pady=10)
+        ttk.Button(buttons, text="Upload parameters\nand advance").pack()
+        editor._bind_parameter_layout_events()
+
+        def create_component_editor(*_args: object, embedded_parent_frame: tk.Widget, **_kwargs: object) -> MagicMock:
+            def populate(_name: str) -> None:
+                for _ in range(field_count):
+                    ttk.Entry(embedded_parent_frame, font=field_font).pack(side="top", fill="x")
+                if not defer_geometry:
+                    embedded_parent_frame.update_idletasks()
+
+            return MagicMock(populate_single_component=MagicMock(side_effect=populate))
+
+        try:
+            initial_panel_height: int | None = None
+            with patch.object(parameter_editor_module, "ComponentEditorWindow", side_effect=create_component_editor):
+                for name in ("Battery", "Motor", "Battery", None, "Motor", "Battery"):
+                    editor._update_inline_component_editor(name)
+                    root.update_idletasks()
+                    assert editor.main_frame.winfo_width() == width
+                    assert editor.main_frame.winfo_height() == height
+                    assert buttons.winfo_height() == buttons.winfo_reqheight()
+                    assert buttons.winfo_y() + buttons.winfo_height() <= height - 10
+                    if name is None:
+                        assert editor.inline_component_scroll_frame is None
+                        assert editor.inline_component_container.winfo_manager() == ""
+                        assert editor.parameter_area_container.winfo_height() == (
+                            height - header.winfo_reqheight() - buttons.winfo_reqheight() - 20
+                        )
+                        continue
+                    panel_height = self._assert_real_component_fields_visible(editor, field_count)
+                    if initial_panel_height is None:
+                        initial_panel_height = panel_height
+                    assert panel_height == initial_panel_height
+                if field_count == 40:
+                    fixed_height = header.winfo_reqheight() + buttons.winfo_reqheight() + 20
+                    self._assert_real_panels_grow_continuously(editor, root, fixed_height)
+        finally:
+            editor.main_frame.destroy()
+            root.update_idletasks()
 
 
 class TestParameterFileSelection:
@@ -280,7 +1158,9 @@ class TestParameterFileSelection:
         with (
             patch("tkinter.Tk", _DummyTkRoot),
             patch.object(ParameterEditorWindow, "_create_conf_widgets"),
-            patch.object(ParameterEditorWindow, "_create_parameter_area_widgets"),
+            patch.object(
+                ParameterEditorWindow, "_create_parameter_area_widgets", autospec=True, side_effect=_configure_layout_stubs
+            ),
             patch(
                 "ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.DocumentationFrame",
                 return_value=MagicMock(documentation_frame=MagicMock()),
@@ -314,7 +1194,9 @@ class TestParameterFileSelection:
         with (
             patch("tkinter.Tk", _DummyTkRoot),
             patch.object(ParameterEditorWindow, "_create_conf_widgets"),
-            patch.object(ParameterEditorWindow, "_create_parameter_area_widgets"),
+            patch.object(
+                ParameterEditorWindow, "_create_parameter_area_widgets", autospec=True, side_effect=_configure_layout_stubs
+            ),
             patch(
                 "ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.DocumentationFrame",
                 return_value=MagicMock(documentation_frame=MagicMock()),
@@ -355,7 +1237,9 @@ class TestParameterFileSelection:
         with (
             patch("tkinter.Tk", _DummyTkRoot),
             patch.object(ParameterEditorWindow, "_create_conf_widgets"),
-            patch.object(ParameterEditorWindow, "_create_parameter_area_widgets"),
+            patch.object(
+                ParameterEditorWindow, "_create_parameter_area_widgets", autospec=True, side_effect=_configure_layout_stubs
+            ),
             patch(
                 "ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.DocumentationFrame",
                 return_value=MagicMock(documentation_frame=MagicMock()),
@@ -400,7 +1284,7 @@ class TestUsagePopupScheduling:
         parameter_editor: MagicMock,
         *,
         should_display: bool,
-    ) -> Iterator[tuple[ParameterEditorWindow, MagicMock]]:
+    ) -> Generator[tuple[ParameterEditorWindow, MagicMock], None, None]:
         parameter_editor.get_last_configuration_step_number.return_value = None
 
         def fake_get_setting(key: str) -> object:
@@ -409,7 +1293,9 @@ class TestUsagePopupScheduling:
         with (
             patch("tkinter.Tk", _DummyTkRoot),
             patch.object(ParameterEditorWindow, "_create_conf_widgets"),
-            patch.object(ParameterEditorWindow, "_create_parameter_area_widgets"),
+            patch.object(
+                ParameterEditorWindow, "_create_parameter_area_widgets", autospec=True, side_effect=_configure_layout_stubs
+            ),
             patch(
                 "ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.DocumentationFrame",
                 return_value=MagicMock(documentation_frame=MagicMock()),
@@ -453,15 +1339,52 @@ class TestUsagePopupScheduling:
             mock_display.assert_not_called()
 
 
-class TestRunLoop:  # pylint: disable=too-few-public-methods
+class TestRunLoop:
     """Ensure the run helper starts Tk's event loop."""
 
     def test_run_enters_mainloop(self, parameter_editor_window: ParameterEditorWindow) -> None:
         parameter_editor_window.root.mainloop = MagicMock()
 
-        parameter_editor_window.run()
+        result = parameter_editor_window.run()
 
         parameter_editor_window.root.mainloop.assert_called_once_with()
+        assert result is ParameterEditorAction.FINISHED
+
+    def test_standalone_harness_handles_edit_components_action(self) -> None:
+        """The standalone module reopens the component editor and rebuilds its parameter model."""
+        events: list[str] = []
+        models = [MagicMock(current_file="04_board_orientation.param"), MagicMock(current_file="12_battery.param")]
+        model_iterator = iter(models)
+        windows = [MagicMock(), MagicMock()]
+        windows[0].run.side_effect = lambda: (
+            setattr(models[0], "current_file", "12_battery.param") or ParameterEditorAction.EDIT_COMPONENTS
+        )
+        windows[1].run.return_value = ParameterEditorAction.FINISHED
+        component_window = MagicMock()
+        component_window.root.mainloop.side_effect = lambda: events.append("component editor")
+        flight_controller = MagicMock()
+        filesystem = MagicMock(vehicle_type="ArduCopter")
+
+        with (
+            patch.object(
+                parameter_editor_module,
+                "ParameterEditor",
+                side_effect=lambda *_args: next(model_iterator),
+            ) as make_model,
+            patch.object(parameter_editor_module, "ParameterEditorWindow", side_effect=windows),
+            patch.object(parameter_editor_module, "ComponentEditorWindow", return_value=component_window),
+        ):
+            parameter_editor_module.run_standalone_parameter_editor(flight_controller, filesystem)
+
+        assert [call.args[0] for call in make_model.call_args_list] == [
+            "04_board_orientation.param",
+            "12_battery.param",
+        ]
+        component_window.set_vehicle_type_and_version.assert_called_once_with(
+            "ArduCopter", flight_controller.info.flight_sw_version_and_type
+        )
+        component_window.populate_frames.assert_called_once_with()
+        assert events == ["component editor"]
 
 
 class TestWidgetFactoryMethods:
@@ -491,11 +1414,21 @@ class TestWidgetFactoryMethods:
         parameter_editor.get_vehicle_directory.return_value = "vehicle_dir"
 
         directory_widget = MagicMock()
-        button_widgets = [MagicMock(), MagicMock()]
+        button_widgets: dict[Callable[..., None], MagicMock] = {}
+
+        def create_button(_parent: object, *, command: Callable[..., None], **_kwargs: object) -> MagicMock:
+            button = MagicMock()
+            button_widgets[command] = button
+            return button
 
         with (
             patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.ttk.Frame", return_value=MagicMock()),
             patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.ttk.Label", return_value=MagicMock()),
+            patch(
+                "ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.get_widget_font_family_and_size",
+                return_value=("TkDefaultFont", 10),
+            ),
+            patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.ttk.Style"),
             patch(
                 "ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.VehicleDirectorySelectionWidgets",
                 return_value=directory_widget,
@@ -506,7 +1439,7 @@ class TestWidgetFactoryMethods:
             ),
             patch(
                 "ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.ttk.Button",
-                side_effect=button_widgets,
+                side_effect=create_button,
             ),
             patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.show_tooltip"),
             patch.object(
@@ -517,9 +1450,8 @@ class TestWidgetFactoryMethods:
         ):
             editor._create_conf_widgets("__VERSION__")
 
-        button_widgets[1].configure.assert_called_once_with(state=expected_state)
-        button_widgets[0].grid.assert_called_once_with(row=0, column=0, padx=(6, 2), sticky=tk.NW)
-        button_widgets[1].grid.assert_called_once_with(row=1, column=0, padx=(8, 8), pady=(4, 0), sticky=tk.NW)
+        button_widgets[editor.on_fc_banner_click].configure.assert_called_once_with(state=expected_state)
+        button_widgets[editor.on_zip_vehicle_for_forum_help_click].configure.assert_called_once_with(state="normal")
 
     def test_user_can_open_the_flight_controller_banner(self, parameter_editor_window: ParameterEditorWindow) -> None:
         """
@@ -537,7 +1469,186 @@ class TestWidgetFactoryMethods:
         ) as banner_window:
             parameter_editor_window.on_fc_banner_click()
 
-        banner_window.assert_called_once_with(parameter_editor_window.root, banner_text)
+        banner_window.assert_called_once_with(
+            parameter_editor_window.root,
+            banner_text,
+            parameter_editor_window.parameter_editor.get_fc_status_text.return_value,
+            parameter_editor_window.parameter_editor.fc_parameters,
+            status_text_provider=parameter_editor_window.parameter_editor.poll_fc_status_text,
+            navigation_lock=parameter_editor_window.navigation_lock,
+        )
+
+    @pytest.mark.parametrize("parent_exists", [True, False])
+    def test_diagnostics_pauses_plugin_receivers_until_closed(
+        self, parameter_editor_window: ParameterEditorWindow, parent_exists: bool
+    ) -> None:
+        """GIVEN a polling plugin, WHEN diagnostics opens, THEN polling stops and resumes only after closing."""
+        editor = parameter_editor_window
+        plugin = MagicMock(spec=["on_deactivate", "on_activate"])
+        editor.current_plugin_view = plugin
+        editor.root.winfo_exists.return_value = parent_exists
+        popup = MagicMock()
+
+        def create_banner(*_args: object, **_kwargs: object) -> MagicMock:
+            plugin.on_deactivate.assert_called_once_with()
+            return popup
+
+        def wait_for_close(_root: object) -> None:
+            plugin.on_deactivate.assert_called_once_with()
+            plugin.on_activate.assert_not_called()
+
+        editor.root.wait_window.side_effect = wait_for_close
+        with patch.object(parameter_editor_module, "FlightControllerBannerWindow", side_effect=create_banner):
+            editor.on_fc_banner_click()
+
+        editor.root.wait_window.assert_called_once_with(popup.root)
+        if parent_exists:
+            plugin.on_activate.assert_called_once_with()
+        else:
+            plugin.on_activate.assert_not_called()
+
+    def test_plugin_receiver_resumes_when_diagnostics_cannot_open(
+        self, parameter_editor_window: ParameterEditorWindow
+    ) -> None:
+        """GIVEN a polling plugin, WHEN popup creation fails, THEN plugin monitoring can continue."""
+        editor = parameter_editor_window
+        plugin = MagicMock(spec=["on_deactivate", "on_activate"])
+        editor.current_plugin_view = plugin
+        editor.root.winfo_exists.return_value = True
+        with (
+            patch.object(parameter_editor_module, "FlightControllerBannerWindow", side_effect=tk.TclError("closed")),
+            pytest.raises(tk.TclError, match="closed"),
+        ):
+            editor.on_fc_banner_click()
+
+        plugin.on_deactivate.assert_called_once_with()
+        plugin.on_activate.assert_called_once_with()
+
+    @pytest.mark.parametrize("partial_hook", ["on_suspend", "on_resume"])
+    def test_incomplete_suspend_interface_keeps_legacy_plugin_safety_cleanup(
+        self, parameter_editor_window: ParameterEditorWindow, partial_hook: str
+    ) -> None:
+        """
+        Incomplete optional hooks must not bypass existing safety cleanup.
+
+        GIVEN: A plugin with only one of the optional suspend/resume hooks
+        WHEN: Diagnostics opens and closes
+        THEN: Both legacy lifecycle hooks run and the incomplete optional hook is ignored
+        """
+        editor = parameter_editor_window
+        plugin = MagicMock(spec=["on_deactivate", "on_activate", partial_hook])
+        editor.current_plugin_view = plugin
+        editor.root.winfo_exists.return_value = True
+        with patch.object(parameter_editor_module, "FlightControllerBannerWindow"):
+            editor.on_fc_banner_click()
+        plugin.on_deactivate.assert_called_once_with()
+        plugin.on_activate.assert_called_once_with()
+        getattr(plugin, partial_hook).assert_not_called()
+
+    @pytest.mark.parametrize("plugin_replaced", [False, True])
+    def test_suspended_plugin_does_not_resume_after_parent_or_plugin_is_removed(
+        self, parameter_editor_window: ParameterEditorWindow, plugin_replaced: bool
+    ) -> None:
+        """
+        Diagnostics must not restart receivers for a removed view.
+
+        GIVEN: A plugin offering state-preserving suspend/resume hooks
+        WHEN: The parent closes or the plugin is replaced while diagnostics is open
+        THEN: The old view remains suspended and legacy lifecycle hooks do not run
+        """
+        editor = parameter_editor_window
+        plugin = MagicMock(spec=["on_suspend", "on_resume", "on_deactivate", "on_activate"])
+        editor.current_plugin_view = plugin
+        editor.root.winfo_exists.return_value = plugin_replaced
+
+        def remove_owner(_root: object) -> None:
+            if plugin_replaced:
+                editor.current_plugin_view = None
+
+        editor.root.wait_window.side_effect = remove_owner
+        with patch.object(parameter_editor_module, "FlightControllerBannerWindow"):
+            editor.on_fc_banner_click()
+        plugin.on_suspend.assert_called_once_with(PluginPauseReason.EXCLUSIVE_OPERATION)
+        plugin.on_resume.assert_not_called()
+        plugin.on_deactivate.assert_not_called()
+        plugin.on_activate.assert_not_called()
+
+    def test_busy_controller_does_not_pause_plugin_or_open_diagnostics(
+        self, parameter_editor_window: ParameterEditorWindow
+    ) -> None:
+        """GIVEN an FC operation in progress, WHEN diagnostics is requested, THEN the existing owner continues."""
+        editor = parameter_editor_window
+        plugin = MagicMock(spec=["on_deactivate", "on_activate"])
+        editor.current_plugin_view = plugin
+        editor.navigation_lock.acquire(plugin)
+        with patch.object(parameter_editor_module, "FlightControllerBannerWindow") as banner_window:
+            editor.on_fc_banner_click()
+
+        banner_window.assert_not_called()
+        plugin.on_deactivate.assert_not_called()
+        plugin.on_activate.assert_not_called()
+
+    @pytest.mark.parametrize("plugin_hooks", [("on_suspend", "on_resume"), ("on_deactivate", "on_activate")])
+    def test_diagnostics_is_refused_while_file_browser_is_open(
+        self, parameter_editor_window: ParameterEditorWindow, plugin_hooks: tuple[str, str]
+    ) -> None:
+        """
+        Keep diagnostics from consuming replies intended for the flight-controller file browser.
+
+        GIVEN: The file browser is open without holding the navigation lock, as on macOS
+        WHEN: The user requests diagnostics
+        THEN: The browser stays open, no diagnostics reader starts, and the plugin keeps running
+        """
+        editor = parameter_editor_window
+        browser = MagicMock()
+        browser.root.winfo_exists.return_value = True
+        editor._file_browser_window = browser
+        plugin = MagicMock(spec=plugin_hooks)
+        editor.current_plugin_view = plugin
+        assert not editor.navigation_lock.locked
+
+        with patch.object(parameter_editor_module, "FlightControllerBannerWindow") as banner_window:
+            editor.on_fc_banner_click()
+
+        banner_window.assert_not_called()
+        editor.root.wait_window.assert_not_called()
+        editor.parameter_editor.get_fc_banner_text.assert_not_called()
+        editor.parameter_editor.poll_fc_status_text.assert_not_called()
+        editor.ui.show_error.assert_called_once_with(
+            "File browser is open",
+            "Close the flight-controller file browser before opening diagnostics.",
+        )
+        browser.root.destroy.assert_not_called()
+        assert editor._file_browser_window is browser
+        assert not plugin.mock_calls
+        assert not editor.navigation_lock.locked
+
+    @pytest.mark.parametrize("browser_destroyed", [False, True])
+    def test_user_can_open_diagnostics_after_file_browser_is_destroyed(
+        self, parameter_editor_window: ParameterEditorWindow, browser_destroyed: bool
+    ) -> None:
+        """
+        A stale browser reference must not prevent diagnostics from opening.
+
+        GIVEN: The file browser has closed but the editor still references its window
+        WHEN: The user requests diagnostics and Tk reports a missing window or interpreter
+        THEN: Diagnostics opens without reporting that the file browser is open
+        """
+        editor = parameter_editor_window
+        browser = MagicMock()
+        browser.root.winfo_exists.return_value = False
+        if browser_destroyed:
+            browser.root.winfo_exists.side_effect = tk.TclError("application has been destroyed")
+        editor._file_browser_window = browser
+
+        with patch.object(parameter_editor_module, "FlightControllerBannerWindow") as banner_window:
+            editor.on_fc_banner_click()
+
+        banner_window.assert_called_once()
+        editor.root.wait_window.assert_called_once_with(banner_window.return_value.root)
+        editor.ui.show_error.assert_not_called()
+        if browser_destroyed:
+            assert editor._file_browser_window is None
 
     def test_create_conf_widgets_configures_combobox(self, parameter_editor: MagicMock) -> None:
         editor = _create_editor(parameter_editor)
@@ -1012,7 +2123,7 @@ class TestTemperatureCalibrationWorkflows:
             assert ask_user_confirmation is parameter_editor_window.ui.ask_yesno
             assert callable(select_file)
             assert show_warning is parameter_editor_window.ui.show_warning
-            assert show_error is parameter_editor_window.ui.show_error
+            assert callable(show_error)
             callback = get_progress_callback()
             assert callback is progress_window.update_progress_bar_300_pct
             assert callback is not None
@@ -1048,7 +2159,7 @@ class TestTemperatureCalibrationWorkflows:
             assert ask_user_confirmation is parameter_editor_window.ui.ask_yesno
             assert callable(select_file)
             assert show_warning is parameter_editor_window.ui.show_warning
-            assert show_error is parameter_editor_window.ui.show_error
+            assert callable(show_error)
             callback = get_progress_callback()
             assert callback is progress_window.update_progress_bar_300_pct
             assert callback is not None
@@ -1083,15 +2194,19 @@ class TestFileUploadHelpers:
             show_error: Callable[[str, str], None],
             show_warning: Callable[[str, str], None],
             get_progress_callback: Callable[[], Callable | None],
+            **_execution: object,
         ) -> bool:
             assert selected_file == "01_initial.param"
-            assert ask_confirmation is parameter_editor_window.ui.ask_yesno
-            assert show_error is parameter_editor_window.ui.show_error
+            assert callable(ask_confirmation)
+            assert callable(show_error)
             assert show_warning is parameter_editor_window.ui.show_warning
             callback = get_progress_callback()
-            assert callback is progress_window.update_progress_bar
             assert callback is not None
             callback(5, 10)
+            snapshot = progress_window.update_transfer_progress.call_args.args[0]
+            assert snapshot.transferred_bytes == 5
+            assert snapshot.total_bytes == 10
+            assert snapshot.direction.name == "UPLOAD"
             return True
 
         parameter_editor.should_upload_file_to_fc_workflow.side_effect = fake_upload
@@ -1118,13 +2233,13 @@ class TestFileUploadHelpers:
             show_error: Callable[[str, str], None],
             show_warning: Callable[[str, str], None],
             get_progress_callback: Callable[[], Callable | None],
+            **_execution: object,
         ) -> None:
             assert selected_file == "01_initial.param"
-            assert ask_confirmation is parameter_editor_window.ui.ask_yesno
-            assert show_error is parameter_editor_window.ui.show_error
+            assert callable(ask_confirmation)
+            assert callable(show_error)
             assert show_warning is parameter_editor_window.ui.show_warning
             callback = get_progress_callback()
-            assert callback is progress_window.update_progress_bar
             assert callback is not None
             callback(1, 2)
             msg = "boom"
@@ -1186,6 +2301,147 @@ class TestProgressBarUpdates:
 class TestParameterDownloads:
     """Exercise FC parameter download flows."""
 
+    @pytest.mark.parametrize("worker_download", [False, True], ids=["synchronous", "sequoia-worker"])
+    @pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+    def test_calibration_readback_keeps_controls_locked_until_completion(
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        root: tk.Tk,
+        monkeypatch: pytest.MonkeyPatch,
+        worker_download: bool,
+        fails: bool,
+    ) -> None:
+        """
+        Calibration readback yields telemetry without releasing calibration ownership.
+
+        GIVEN: Full accelerometer calibration has completed with navigation locked
+        WHEN: Its parameter readback reports progress and succeeds or raises
+        THEN: Calibration and upload remain blocked until readback and result handling finish
+        """
+        editor = parameter_editor_window
+        editor.root = root
+        model = MagicMock(spec=AccelerometerCalibrationDataModel)
+        model.start_full_calibration.return_value = (True, "Started")
+        view = AccelerometerCalibrationView(ttk.Frame(root), model, editor)
+        editor.current_plugin_view = view
+        backend = cast("MagicMock", editor.parameter_editor)
+        backend.fc_parameters = {}
+        progress_window = MagicMock()
+        editor.ui.create_progress_window = MagicMock(return_value=progress_window)
+        monkeypatch.setattr(parameter_editor_module, "is_macos_sequoia_or_older", lambda: worker_download)
+        monkeypatch.setattr(tk.Misc, "update", lambda _self: None)
+        monkeypatch.setattr(tk.Misc, "update_idletasks", lambda _self: None)
+
+        def check_locked(*_args: object) -> None:
+            assert editor.navigation_lock.locked
+            assert view._simple_btn.instate(["disabled"])
+            assert view._full_btn.instate(["disabled"])
+            assert editor.upload_selected_params({"TEST": 1.0}) is False
+
+        def check_paused(*args: object) -> None:
+            check_locked(*args)
+            assert view._imu_poll_job is None
+
+        progress_window.update_progress_bar.side_effect = check_paused
+        progress_window.destroy.side_effect = check_paused
+
+        def download(get_progress: Callable[[], Callable], *, response_timeout: float | None) -> tuple[dict, dict]:
+            assert response_timeout is None
+            get_progress()(1, 2)
+            if fails:
+                message = "Calibration readback failed"
+                raise OSError(message)
+            return {"TEST": 1.0}, {}
+
+        backend.download_flight_controller_parameters.side_effect = download
+        try:
+            view._on_start_full_calibration()
+            with (
+                pytest.raises(OSError, match="Calibration readback failed") if fails else nullcontext(),
+                patch(
+                    "ardupilot_methodic_configurator.plugins.frontend_tkinter_accelerometer_calibration.showinfo",
+                    side_effect=check_locked,
+                ) as show_result,
+            ):
+                view._end_full_calibration(success=True)
+
+            assert show_result.call_count == (0 if fails else 1)
+            progress_window.update_progress_bar.assert_called_once_with(1, 2)
+            progress_window.destroy.assert_called_once()
+            backend.upload_selected_params_workflow.assert_not_called()
+            assert not editor.navigation_lock.locked
+            assert view._simple_btn.instate(["!disabled"])
+            assert view._full_btn.instate(["!disabled"])
+            assert view._imu_poll_job is not None
+        finally:
+            view.master.destroy()
+
+    @pytest.mark.parametrize("worker_download", [False, True], ids=["synchronous", "sequoia-worker"])
+    @pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+    def test_parameter_download_pauses_plugin_reception_until_cleanup(
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        root: tk.Tk,
+        monkeypatch: pytest.MonkeyPatch,
+        worker_download: bool,
+        fails: bool,
+    ) -> None:
+        """
+        Preserve parameter replies while downloading with a telemetry plugin active.
+
+        GIVEN: A plugin owns MAVLink reception and a parameter download is requested
+        WHEN: The download reports progress, then succeeds or fails
+        THEN: Plugin reception stays paused through progress cleanup and resumes on Tk
+        """
+        editor = parameter_editor_window
+        editor.root = root
+        ui_thread = get_ident()
+        paused = Event()
+        plugin = MagicMock(spec=["on_suspend", "on_resume"])
+
+        def suspend(reason: PluginPauseReason) -> None:
+            assert get_ident() == ui_thread
+            assert reason is PluginPauseReason.EXCLUSIVE_OPERATION
+            paused.set()
+
+        def resume() -> None:
+            assert get_ident() == ui_thread
+            paused.clear()
+
+        plugin.on_suspend.side_effect = suspend
+        plugin.on_resume.side_effect = resume
+        editor.current_plugin_view = plugin
+        progress_window = MagicMock()
+        progress_window.destroy.side_effect = lambda: paused.is_set() or pytest.fail("Plugin resumed before cleanup")
+        editor.ui.create_progress_window = MagicMock(return_value=progress_window)
+        monkeypatch.setattr(parameter_editor_module, "is_macos_sequoia_or_older", lambda: worker_download)
+        monkeypatch.setattr(tk.Misc, "update", lambda _self: None)
+        monkeypatch.setattr(tk.Misc, "update_idletasks", lambda _self: None)
+
+        def download(get_progress: Callable[[], Callable], *, response_timeout: float | None) -> tuple[dict, dict]:
+            assert paused.is_set(), "Plugin reception would consume parameter replies"
+            assert (get_ident() != ui_thread) == worker_download
+            assert response_timeout == 5.0
+            get_progress()(1, 2)
+            if fails:
+                message = "Parameter download failed"
+                raise RuntimeError(message)
+            return {"TEST": 1.0}, {}
+
+        cast("MagicMock", editor.parameter_editor).download_flight_controller_parameters.side_effect = download
+
+        if fails:
+            with pytest.raises(RuntimeError, match="Parameter download failed"):
+                editor.download_flight_controller_parameters(redownload=True, response_timeout=5.0)
+        else:
+            assert editor.download_flight_controller_parameters(redownload=True, response_timeout=5.0) == ({"TEST": 1.0}, {})
+
+        plugin.on_suspend.assert_called_once()
+        plugin.on_resume.assert_called_once()
+        assert not paused.is_set()
+        progress_window.destroy.assert_called_once()
+        assert editor._param_download_progress_window is None
+
     def test_user_downloads_parameters_with_progress_window(self, parameter_editor_window: ParameterEditorWindow) -> None:
         progress_window = MagicMock()
         progress_window.update_progress_bar = MagicMock()
@@ -1215,18 +2471,25 @@ class TestUploadSelectedParameters:
     def test_user_sees_progress_while_resetting_all_parameters_to_defaults(
         self, parameter_editor_window: ParameterEditorWindow
     ) -> None:
-        reset_progress_window = MagicMock()
-        connection_progress_window = MagicMock()
+        reset_reconnect_progress_window = MagicMock()
+        reset_reconnect_progress_window.update_progress_bar_with_message = MagicMock()
         download_progress_window = MagicMock()
         parameter_editor_window.ui.create_progress_window = MagicMock(
-            side_effect=[reset_progress_window, connection_progress_window, download_progress_window]
+            side_effect=[reset_reconnect_progress_window, download_progress_window]
         )
         download_callback: Callable[[], Callable | None] | None = None
 
         def reset_and_download(*args: object) -> bool:
             nonlocal download_callback
-            download_callback = cast("Callable[[], Callable | None]", args[3])
-            assert download_callback() == download_progress_window.update_progress_bar
+            progress_callback = cast("Callable[[int, int], None]", args[1])
+            download_callback = cast("Callable[[], Callable | None]", args[2])
+            download_progress = download_callback()
+            assert download_progress is not None
+            download_progress(3, 4)
+            progress_callback(10, 100)
+            progress_callback(30, 100)
+            progress_callback(90, 100)
+            progress_callback(100, 100)
             return True
 
         parameter_editor_window.parameter_editor.reset_all_parameters_to_default.side_effect = reset_and_download
@@ -1237,15 +2500,10 @@ class TestUploadSelectedParameters:
         assert result is True
         parameter_editor_window.ui.create_progress_window.assert_any_call(
             parameter_editor_window.root,
-            "Resetting Flight Controller",
-            "Waiting for {} of {} seconds",
+            "Restarting Flight Controller",
+            "Reset command sent",
             True,  # noqa: FBT003
-        )
-        parameter_editor_window.ui.create_progress_window.assert_any_call(
-            parameter_editor_window.root,
-            "Reconnecting to Flight Controller",
-            "{} of {} percent",
-            True,  # noqa: FBT003
+            auto_close_on_complete=False,
         )
         parameter_editor_window.ui.create_progress_window.assert_any_call(
             parameter_editor_window.root,
@@ -1253,25 +2511,26 @@ class TestUploadSelectedParameters:
             "Downloaded {} of {} parameters",
             False,  # noqa: FBT003
         )
-        reset_progress_window.destroy.assert_called_once_with()
-        connection_progress_window.destroy.assert_called_once_with()
+        reset_reconnect_progress_window.update_progress_bar_with_message.assert_has_calls(
+            [
+                mock_call(10, 100, "Reset command sent"),
+                mock_call(30, 100, "Reconnecting to flight controller"),
+                mock_call(90, 100, "Retrieving flight controller information"),
+                mock_call(100, 100, "Flight Controller connected"),
+            ]
+        )
+        reset_reconnect_progress_window.destroy.assert_called_once_with()
         download_progress_window.destroy.assert_called_once_with()
         reset_call = parameter_editor_window.parameter_editor.reset_all_parameters_to_default.call_args
-        assert reset_call.args[:3] == (
-            parameter_editor_window.ui.show_error,
-            reset_progress_window.update_progress_bar,
-            connection_progress_window.update_progress_bar,
-        )
-        assert reset_call.args[3] is download_callback
+        assert callable(reset_call.args[0])
+        assert callable(reset_call.args[1])
+        assert reset_call.args[2] is download_callback
         parameter_editor_window.repopulate_parameter_table.assert_called_once_with()
 
     def test_user_sees_reset_and_download_progress_windows(self, parameter_editor_window: ParameterEditorWindow) -> None:
-        reset_window = MagicMock()
-        reset_window.update_progress_bar = MagicMock()
-        reset_window.destroy = MagicMock()
-        connection_window = MagicMock()
-        connection_window.update_progress_bar = MagicMock()
-        connection_window.destroy = MagicMock()
+        reset_reconnect_window = MagicMock()
+        reset_reconnect_window.update_progress_bar_with_message = MagicMock()
+        reset_reconnect_window.destroy = MagicMock()
         download_window = MagicMock()
         download_window.update_progress_bar = MagicMock()
         download_window.destroy = MagicMock()
@@ -1280,10 +2539,8 @@ class TestUploadSelectedParameters:
         upload_window.destroy = MagicMock()
 
         def fake_progress_window(_parent: object, title: str, *_args: object, **_kwargs: object) -> MagicMock:
-            if "Resetting" in title:
-                return reset_window
-            if "Reconnecting" in title:
-                return connection_window
+            if "Restarting" in title:
+                return reset_reconnect_window
             if "Uploading" in title:
                 return upload_window
             return download_window
@@ -1299,29 +2556,26 @@ class TestUploadSelectedParameters:
             ask_retry_cancel: Callable[[str, str], bool],
             show_error: Callable[[str, str], None],
             get_upload_progress_callback: Callable[[], Callable | None],
-            get_reset_progress_callback: Callable[[], Callable | None],
             get_connection_progress_callback: Callable[[], Callable | None],
             get_download_progress_callback: Callable[[], Callable | None],
         ) -> None:
             assert selected_params == {"ROLL_P": 0.12}
-            assert ask_confirmation is parameter_editor_window.ui.ask_yesno
-            assert ask_retry_cancel is parameter_editor_window.ui.ask_retry_cancel
-            assert show_error is parameter_editor_window.ui.show_error
+            assert callable(ask_confirmation)
+            assert callable(ask_retry_cancel)
+            assert callable(show_error)
             upload_cb = get_upload_progress_callback()
-            reset_cb = get_reset_progress_callback()
             connection_cb = get_connection_progress_callback()
             download_cb = get_download_progress_callback()
-            assert upload_cb is upload_window.update_progress_bar
-            assert reset_cb is reset_window.update_progress_bar
-            assert connection_cb is connection_window.update_progress_bar
-            assert download_cb is download_window.update_progress_bar
             assert upload_cb is not None
-            assert reset_cb is not None
             assert connection_cb is not None
             assert download_cb is not None
             upload_cb(0, 1)
-            reset_cb(1, 2)
-            connection_cb(2, 3)
+            connection_cb(10, 100)
+            connection_cb(30, 100)
+            connection_cb(50, 100)
+            connection_cb(70, 100)
+            connection_cb(90, 100)
+            connection_cb(100, 100)
             download_cb(3, 4)
 
         param_editor_mock.upload_selected_params_workflow.side_effect = fake_upload_workflow
@@ -1329,8 +2583,17 @@ class TestUploadSelectedParameters:
         parameter_editor_window.upload_selected_params({"ROLL_P": 0.12})
 
         upload_window.destroy.assert_called_once()
-        reset_window.destroy.assert_called_once()
-        connection_window.destroy.assert_called_once()
+        reset_reconnect_window.update_progress_bar_with_message.assert_has_calls(
+            [
+                mock_call(10, 100, "Reset command sent"),
+                mock_call(30, 100, "Reconnecting to flight controller"),
+                mock_call(50, 100, "Reconnecting to flight controller"),
+                mock_call(70, 100, "Reconnecting to flight controller"),
+                mock_call(90, 100, "Retrieving flight controller information"),
+                mock_call(100, 100, "Flight Controller connected"),
+            ]
+        )
+        reset_reconnect_window.destroy.assert_called_once()
         download_window.destroy.assert_called_once()
         assert parameter_editor_window._reset_progress_window is None
         assert parameter_editor_window._param_download_progress_window_upload is None
@@ -1339,18 +2602,15 @@ class TestUploadSelectedParameters:
         upload_window = MagicMock()
         upload_window.update_progress_bar = MagicMock()
         upload_window.destroy = MagicMock()
-        reset_window = MagicMock()
-        reset_window.update_progress_bar = MagicMock()
-        reset_window.destroy = MagicMock()
-        connection_window = MagicMock()
-        connection_window.update_progress_bar = MagicMock()
-        connection_window.destroy = MagicMock()
+        reset_reconnect_window = MagicMock()
+        reset_reconnect_window.update_progress_bar_with_message = MagicMock()
+        reset_reconnect_window.destroy = MagicMock()
         download_window = MagicMock()
         download_window.update_progress_bar = MagicMock()
         download_window.destroy = MagicMock()
 
         parameter_editor_window.ui.create_progress_window = MagicMock(
-            side_effect=[upload_window, reset_window, connection_window, download_window]
+            side_effect=[upload_window, reset_reconnect_window, download_window]
         )
         param_editor_mock = cast("MagicMock", parameter_editor_window.parameter_editor)
 
@@ -1361,29 +2621,22 @@ class TestUploadSelectedParameters:
             ask_retry_cancel: Callable[[str, str], bool],
             show_error: Callable[[str, str], None],
             get_upload_progress_callback: Callable[[], Callable | None],
-            get_reset_progress_callback: Callable[[], Callable | None],
             get_connection_progress_callback: Callable[[], Callable | None],
             get_download_progress_callback: Callable[[], Callable | None],
         ) -> None:
             assert selected_params == {}
-            assert ask_confirmation is parameter_editor_window.ui.ask_yesno
-            assert ask_retry_cancel is parameter_editor_window.ui.ask_retry_cancel
-            assert show_error is parameter_editor_window.ui.show_error
+            assert callable(ask_confirmation)
+            assert callable(ask_retry_cancel)
+            assert callable(show_error)
             upload_cb = get_upload_progress_callback()
-            reset_cb = get_reset_progress_callback()
             connection_cb = get_connection_progress_callback()
             download_cb = get_download_progress_callback()
-            assert upload_cb is upload_window.update_progress_bar
-            assert reset_cb is reset_window.update_progress_bar
-            assert connection_cb is connection_window.update_progress_bar
-            assert download_cb is download_window.update_progress_bar
             assert upload_cb is not None
-            assert reset_cb is not None
             assert connection_cb is not None
             assert download_cb is not None
             upload_cb(0, 0)
-            reset_cb(1, 1)
-            connection_cb(2, 2)
+            connection_cb(10, 100)
+            connection_cb(30, 100)
             download_cb(3, 3)
             msg = "boom"
             raise RuntimeError(msg)
@@ -1394,8 +2647,7 @@ class TestUploadSelectedParameters:
 
         parameter_editor_window.ui.show_error.assert_called_once()
         upload_window.destroy.assert_called_once()
-        reset_window.destroy.assert_called_once()
-        connection_window.destroy.assert_called_once()
+        reset_reconnect_window.destroy.assert_called_once()
         download_window.destroy.assert_called_once()
         assert parameter_editor_window._reset_progress_window is None
         assert parameter_editor_window._param_download_progress_window_upload is None
@@ -1404,8 +2656,73 @@ class TestUploadSelectedParameters:
 class TestPluginLayoutLifecycle:
     """Exercise plugin layout decisions and cleanup flows."""
 
+    @pytest.mark.parametrize("dialog", ["step_info", "copy_fc_values", "upload_confirmation"])
+    @pytest.mark.parametrize("fail", [False, True])
+    def test_step_dialog_component_sync_defers_plugin_until_workflow_finishes(
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        parameter_editor: MagicMock,
+        dialog: str,
+        fail: bool,
+    ) -> None:
+        """
+        Inline editor callbacks cannot restore a plugin during step dialogs or upload.
+
+        GIVEN: A new step has a different plugin and an outgoing component editor still exists.
+        WHEN: A workflow dialog syncs that editor before the configured upload starts.
+        THEN: Component changes are synced but the plugin loads only after completion or failure.
+        """
+        editor = parameter_editor_window
+        editor.current_plugin = {"name": "old_plugin", "placement": "left"}
+        editor.current_plugin_view = MagicMock()
+        new_plugin = {"name": "new_plugin", "placement": "left"}
+        parameter_editor.get_plugin.return_value = new_plugin
+        parameter_editor.get_instructions_popup.return_value = None
+        parameter_editor._handle_file_jump_workflow.return_value = "01_initial.param"
+        parameter_editor._repopulate_configuration_step_parameters.return_value = ([], [("Step", "Information")])
+        parameter_editor.handle_param_file_change_workflow.side_effect = partial(
+            ParameterEditor.handle_param_file_change_workflow, parameter_editor
+        )
+        components = {"Battery": {"Specifications": {"Volt per cell max": 4.2}}}
+        editor.inline_component_editor = MagicMock()
+        editor.inline_component_editor.get_component_data.return_value = {"Components": components}
+
+        with (
+            patch.object(editor, "_update_plugin_layout") as load_plugin,
+            patch.object(editor, "_do_tempcal_imu"),
+            patch.object(editor, "_should_copy_fc_values_to_file", return_value=False) as copy_values,
+            patch.object(editor, "_should_upload_file_to_fc", return_value=True) as upload,
+        ):
+
+            def sync_during_dialog(*_args: object) -> bool:
+                assert parameter_editor.current_file == "01_initial.param"
+                assert not editor._configured_upload_active
+                editor._on_component_data_changed()
+                parameter_editor.update_vehicle_components.assert_called_once_with(components)
+                parameter_editor.refresh_current_step_computed_parameters.assert_called_once_with()
+                load_plugin.assert_not_called()
+                assert editor.current_plugin_view is None
+                if fail:
+                    message = "dialog failed"
+                    raise RuntimeError(message)
+                return False
+
+            callbacks = {"step_info": editor.ui.show_info, "copy_fc_values": copy_values, "upload_confirmation": upload}
+            cast("MagicMock", callbacks[dialog]).side_effect = sync_during_dialog
+            if fail:
+                with pytest.raises(RuntimeError, match="dialog failed"):
+                    editor.on_param_file_combobox_change(None)
+            else:
+                editor.on_param_file_combobox_change(None)
+                upload.assert_called_once_with("01_initial.param")
+
+        load_plugin.assert_called_once_with(new_plugin, force_reload=True)
+        assert not editor._param_file_change_active
+        assert not editor._configured_upload_active
+
     def test_user_refreshes_same_plugin_without_layout_changes(self, parameter_editor_window: ParameterEditorWindow) -> None:
         parameter_editor_window.current_plugin = {"name": "alpha", "placement": "left"}
+        parameter_editor_window.current_plugin_view = MagicMock()
 
         with (
             patch.object(parameter_editor_window, "_swap_plugin_in_place") as mock_swap,
@@ -1415,6 +2732,70 @@ class TestPluginLayoutLifecycle:
 
         mock_swap.assert_not_called()
         mock_rebuild.assert_not_called()
+
+    @pytest.mark.parametrize("forced", [False, True])
+    @pytest.mark.parametrize("final_file", ["00_previous.param", "01_initial.param"])
+    def test_step_workflow_removes_outgoing_plugin_before_any_dialog(
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        parameter_editor: MagicMock,
+        forced: bool,
+        final_file: str,
+    ) -> None:
+        """
+        Step changes and forced refreshes release all outgoing plugin functionality.
+
+        GIVEN: A plugin with controls and polling is active in the current step.
+        WHEN: A transition runs, possibly returning to the original step.
+        THEN: Its safety cleanup finishes before workflow dialogs and the final plugin is loaded.
+        """
+        editor = parameter_editor_window
+        plugin = MagicMock()
+        editor.current_plugin_view = plugin
+        parameter_editor.current_file = "01_initial.param" if forced else "00_previous.param"
+
+        def destroy() -> None:
+            plugin.on_deactivate.assert_called_once_with()
+
+        plugin.destroy.side_effect = destroy
+
+        def workflow(*_args, **_kwargs) -> tuple[str, bool]:
+            plugin.destroy.assert_called_once_with()
+            assert editor.current_plugin_view is None
+            parameter_editor.current_file = final_file
+            return final_file, True
+
+        parameter_editor.handle_param_file_change_workflow.side_effect = workflow
+        with patch.object(editor, "_update_plugin_layout") as refresh:
+            editor.on_param_file_combobox_change(None, forced=forced)
+
+        parameter_editor.get_plugin.assert_called_once_with(final_file)
+        refresh.assert_called_once_with(parameter_editor.get_plugin.return_value, force_reload=True)
+        plugin.on_activate.assert_not_called()
+        plugin.on_suspend.assert_not_called()
+
+    def test_failed_plugin_safety_cleanup_prevents_step_workflow(
+        self, parameter_editor_window: ParameterEditorWindow, parameter_editor: MagicMock
+    ) -> None:
+        """
+        A failed safety stop prevents a configuration step transition.
+
+        GIVEN: An outgoing plugin cannot complete its safety stop.
+        WHEN: The user attempts to leave the step.
+        THEN: No transfer or other step workflow starts and the error propagates.
+        """
+        editor = parameter_editor_window
+        plugin = MagicMock()
+        editor.current_plugin_view = plugin
+        plugin.on_deactivate.side_effect = RuntimeError("motor stop failed")
+        parameter_editor.current_file = "00_previous.param"
+
+        with pytest.raises(RuntimeError, match="motor stop failed"):
+            editor.on_param_file_combobox_change(None)
+
+        parameter_editor.handle_param_file_change_workflow.assert_not_called()
+        plugin.destroy.assert_not_called()
+        assert editor.current_plugin_view is plugin
 
     def test_user_swaps_plugin_with_matching_placement(self, parameter_editor_window: ParameterEditorWindow) -> None:
         parameter_editor_window.current_plugin = {"name": "alpha", "placement": "left"}
@@ -1499,14 +2880,16 @@ class TestPluginLayoutLifecycle:
         class DummyFrame:  # pylint: disable=too-few-public-methods
             """Minimal container that mimics ttk.Frame for plugin layout tests."""
 
-            def __init__(self) -> None:
+            def __init__(self, master: DummyFrame | None = None) -> None:
                 self._children: list[object] = []
+                self.master = master
+                self.rowconfigure = MagicMock()
 
             def winfo_children(self) -> list[object]:
                 return self._children
 
         top_container = DummyFrame()
-        plugin_holder = DummyFrame()
+        plugin_holder = DummyFrame(top_container)
         child = MagicMock()
         plugin_holder._children = [child]
         top_container._children = [plugin_holder]
@@ -1526,6 +2909,307 @@ class TestPluginLayoutLifecycle:
 
 class TestPluginLayoutRebuild:
     """Cover the layout rebuild logic for each placement."""
+
+    @pytest.mark.parametrize(
+        "result_step",
+        [("27_autotune_pitch_RatePD_results.param", "PIT"), ("36_autotune_roll_results.param", "RLL")],
+        ids=["heli", "copter"],
+    )
+    @pytest.mark.parametrize(
+        "window_size", [(990, 688), (990, 520), (1100, 500)], ids=["768-screen", "600-screen", "short-window"]
+    )
+    def test_user_can_apply_gain_backoff_and_read_feedback_on_short_screens(  # noqa: PLR0915 # pylint: disable=too-many-statements,too-many-locals
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        layout_root: tk.Tk,
+        window_size: tuple[int, int],
+        result_step: tuple[str, str],
+    ) -> None:
+        """
+        Non-scrollable top controls stay usable without sacrificing scrollable assistants.
+
+        GIVEN: AutoTune results below a fixed header on a short screen
+        WHEN: The user resizes, applies back-off and switches between top plugins in place
+        THEN: All back-off controls and feedback remain visible, and orientation still scrolls
+        """
+        root = layout_root
+        editor = parameter_editor_window
+        parameter_editor = cast("MagicMock", editor.parameter_editor)
+        width, height = window_size
+        filename, axis = result_step
+        window = tk.Toplevel(root)
+        window.geometry(f"{width}x{height}+0+0")
+        editor.root = window
+        editor.main_frame = ttk.Frame(window)
+        editor.main_frame.place(width=width, height=height)
+        header = ttk.Frame(editor.main_frame, height=300)
+        header.pack(side="top", fill="x")
+        header.pack_propagate(flag=False)
+        editor.parameter_area_container = ttk.Frame(editor.main_frame)
+        editor.parameter_area_container.pack(side="top", fill="both", expand=True)
+        buttons = ttk.Frame(editor.main_frame)
+        buttons.pack(side="bottom", fill="x")
+        ttk.Button(buttons, text="Upload parameters\nand advance").pack()
+        parameter_editor.current_file = filename
+        parameter_editor.current_step_parameters = {
+            f"ATC_RAT_{axis}_{term}": ArduPilotParameter(f"ATC_RAT_{axis}_{term}", Par(0.2, "AutoTune result"))
+            for term in ("P", "I", "D")
+        }
+        parameter_editor.should_display_bitmask_parameter_editor_usage.return_value = False
+        backoff_model = AutotuneGainBackoffDataModel(parameter_editor)
+        orientation_model = MagicMock(spec=AhrsOrientationDataModel)
+        orientation_model.get_required_steps.return_value = ("LEVEL", "NOSE DOWN", "RIGHT")
+        orientation_model.validate_detection_prerequisites.return_value = (True, "")
+        parameter_editor.create_plugin_data_model.side_effect = lambda name: (
+            orientation_model if name == PLUGIN_AHRS_ORIENTATION else backoff_model
+        )
+        registry = PluginFactory()
+        registry.register(
+            PLUGIN_AUTOTUNE_GAIN_BACKOFF,
+            lambda parent, model, window: AutotuneGainBackoffView(
+                parent, cast("AutotuneGainBackoffDataModel", model), cast("BaseWindow", window)
+            ),
+        )
+        registry.register(
+            PLUGIN_AHRS_ORIENTATION,
+            lambda parent, model, window: AhrsOrientationView(
+                parent, cast("AhrsOrientationDataModel", model), cast("BaseWindow", window)
+            ),
+        )
+
+        try:
+            root.update_idletasks()
+            editor._bind_parameter_layout_events()
+            with (
+                patch.object(parameter_editor_module, "plugin_factory", registry),
+                patch.object(AhrsOrientationView, "_start_imu_polling"),
+            ):
+                for name in (
+                    PLUGIN_AUTOTUNE_GAIN_BACKOFF,
+                    PLUGIN_AHRS_ORIENTATION,
+                    PLUGIN_AUTOTUNE_GAIN_BACKOFF,
+                    PLUGIN_AHRS_ORIENTATION,
+                ):
+                    previous_container = editor.parameter_area_container
+                    previous_table = editor.parameter_editor_table
+                    previous_plugin = editor.current_plugin
+                    editor._update_plugin_layout({"name": name, "placement": "top"})
+                    if previous_plugin is not None:
+                        assert editor.parameter_area_container is previous_container
+                        assert editor.parameter_editor_table is previous_table
+                    editor.parameter_editor_table.repopulate_table(show_only_differences=False, gui_complexity="normal")
+                    for client_height in (height, height - 40, height):
+                        editor.main_frame.place_configure(height=client_height)
+                        root.update_idletasks()
+                        editor._resize_parameter_area_to_fit()
+                        root.update_idletasks()
+
+                        if name == PLUGIN_AUTOTUNE_GAIN_BACKOFF:
+                            view = cast("AutotuneGainBackoffView", editor.current_plugin_view)
+                            assert view.winfo_height() >= view.winfo_reqheight()
+                            gain = parameter_editor.current_step_parameters[f"ATC_RAT_{axis}_P"]
+                            previous_gain = gain.get_new_value()
+                            view.apply_button.invoke()
+                            root.update_idletasks()
+                            assert gain.get_new_value() == pytest.approx(previous_gain * 0.75)
+                            assert "Updated gains:" in view.status.get()
+                            assert view.winfo_height() >= view.winfo_reqheight()
+                            for widget in (*view.winfo_children(), view.entry, view.apply_button):
+                                assert widget.winfo_ismapped()
+                                assert view.winfo_rooty() <= widget.winfo_rooty()
+                                assert widget.winfo_rooty() + widget.winfo_height() <= (
+                                    view.winfo_rooty() + view.winfo_height()
+                                )
+                            assert editor.parameter_container.winfo_height() > 1
+                        else:
+                            assert editor.parameter_container.winfo_height() >= 120
+                            orientation_view = cast("AhrsOrientationView", editor.current_plugin_view)
+                            canvas = orientation_view._scroll_frame.canvas
+                            canvas.yview_moveto(1)
+                            root.update_idletasks()
+                            assert canvas.yview()[0] > 0
+                            assert canvas.yview()[1] == pytest.approx(1)
+                        assert buttons.winfo_height() == buttons.winfo_reqheight()
+                        assert buttons.winfo_y() + buttons.winfo_height() <= client_height
+        finally:
+            window.destroy()
+
+    @pytest.mark.parametrize("queued_refit", [False, True], ids=["no-refit", "queued-refit"])
+    def test_user_can_read_parameters_after_a_plugin_activation_dialog(  # noqa: PLR0915
+        self, parameter_editor_window: ParameterEditorWindow, layout_root: tk.Tk, queued_refit: bool
+    ) -> None:
+        """
+        A modal prerequisite warning must not collapse the adjacent parameter pane.
+
+        GIVEN: A left AHRS assistant whose prerequisites fail during activation
+        WHEN: Its real modal Tk warning runs a nested event loop while layout is rebuilt
+        THEN: Both panes and the navigation remain usable, including on a revisit
+        """
+        root = layout_root
+        editor = parameter_editor_window
+        window = tk.Toplevel(root)
+        window.geometry("990x600+0+0")
+        editor.root = window
+        editor.main_frame = ttk.Frame(window)
+        editor.main_frame.place(width=990, height=600)
+        editor.parameter_area_container = ttk.Frame(editor.main_frame)
+        editor.parameter_area_container.pack(fill="both", expand=True)
+        buttons = ttk.Frame(editor.main_frame)
+        buttons.pack(side="bottom", fill="x")
+        ttk.Button(buttons, text="Skip").pack()
+        cast("MagicMock", editor.parameter_editor).current_step_parameters = {}
+        model = MagicMock(spec=AhrsOrientationDataModel)
+        model.get_required_steps.return_value = ("LEVEL", "NOSE DOWN", "RIGHT")
+        model.is_connected.return_value = True
+        model.validate_detection_prerequisites.return_value = (False, "IMU data unavailable")
+        cast("MagicMock", editor.parameter_editor).create_plugin_data_model.return_value = model
+        registry = PluginFactory()
+        registry.register(
+            PLUGIN_AHRS_ORIENTATION,
+            lambda parent, model, window: AhrsOrientationView(
+                parent, cast("AhrsOrientationDataModel", model), cast("BaseWindow", window)
+            ),
+        )
+
+        def show_modal_warning(title: str, message: str) -> None:
+            # A Tk modal dialog is portable; Windows' native messagebox cannot
+            # be dismissed through Tk. This still runs a real nested wait loop.
+            dialog = tk.Toplevel(window)
+            dialog.title(title)
+            dialog.transient(window)
+            ttk.Label(dialog, text=message).pack()
+            ttk.Button(dialog, text="OK", command=dialog.destroy).pack()
+            dialog.grab_set()
+            dialog.after(20, dialog.destroy)
+            dialog.wait_window()
+
+        try:
+            root.update_idletasks()
+            editor._bind_parameter_layout_events()
+            with (
+                patch.object(parameter_editor_module, "plugin_factory", registry),
+                patch.object(AhrsOrientationView, "_start_imu_polling"),
+                patch(
+                    "ardupilot_methodic_configurator.plugins.frontend_tkinter_ahrs_orientation.showerror",
+                    side_effect=show_modal_warning,
+                ) as warning,
+            ):
+                for _ in range(2):
+                    if queued_refit:
+                        editor._on_main_frame_resize(tk.Event())
+                    editor._rebuild_plugin_layout({"name": PLUGIN_AHRS_ORIENTATION, "placement": "left"})
+                    editor.parameter_editor_table.repopulate_table(show_only_differences=False, gui_complexity="normal")
+                    editor._resize_parameter_area_to_fit()
+                    root.update_idletasks()
+
+                    assert editor.parameter_container.winfo_width() > 100
+                    assert editor.parameter_editor_table.winfo_width() > 100
+                    assert editor.current_plugin_view is not None
+                    assert cast("tk.Widget", editor.current_plugin_view).winfo_width() >= 500
+                    assert buttons.winfo_height() == buttons.winfo_reqheight()
+                    assert buttons.winfo_y() + buttons.winfo_height() <= 600
+                    editor._rebuild_plugin_layout(None)
+                    root.update_idletasks()
+                assert warning.call_count == 2
+                assert "Not Ready" in warning.call_args.args[0]
+        finally:
+            window.destroy()
+
+    @pytest.mark.parametrize("component_visible", [True, False], ids=["with-component", "without-component"])
+    @pytest.mark.parametrize("height", [688, 820], ids=["768-screen", "1080-screen"])
+    def test_user_can_edit_parameters_below_the_top_orientation_assistant(  # noqa: PLR0915 # pylint: disable=too-many-statements,too-many-locals
+        self, parameter_editor_window: ParameterEditorWindow, layout_root: tk.Tk, height: int, component_visible: bool
+    ) -> None:
+        """
+        Manual orientation remains usable alongside the scrollable assistant.
+
+        GIVEN: A top orientation assistant and optionally a tall Frame component editor
+        WHEN: The user opens, resizes and revisits the board-orientation step
+        THEN: Parameter rows and navigation stay visible and the assistant can scroll
+        """
+        root = layout_root
+        editor = parameter_editor_window
+        window = tk.Toplevel(root)
+        window.geometry(f"990x{height}+0+0")
+        editor.root = window
+        editor.main_frame = ttk.Frame(window)
+        editor.main_frame.place(width=990, height=height)
+        header = ttk.Frame(editor.main_frame, height=300)
+        header.pack(side="top", fill="x")
+        header.pack_propagate(flag=False)
+        editor.inline_component_container = ttk.LabelFrame(editor.main_frame)
+        editor.parameter_area_container = ttk.Frame(editor.main_frame)
+        editor.parameter_area_container.pack(side="top", fill="both", expand=True)
+        if component_visible:
+            editor.inline_component_container.pack(side="top", before=editor.parameter_area_container, fill="x")
+            scroll_frame = ScrollFrame(editor.inline_component_container)
+            scroll_frame.pack(fill="both", expand=True)
+            for _ in range(20):
+                ttk.Entry(scroll_frame.view_port).pack(fill="x")
+            editor.inline_component_scroll_frame = scroll_frame
+        buttons = ttk.Frame(editor.main_frame)
+        buttons.pack(side="bottom", fill="x")
+        ttk.Button(buttons, text="Upload parameters\nand advance").pack()
+        cast("MagicMock", editor.parameter_editor).current_step_parameters = {
+            "AHRS_ORIENTATION": ArduPilotParameter("AHRS_ORIENTATION", Par(0, "Board orientation"))
+        }
+        cast("MagicMock", editor.parameter_editor).should_display_bitmask_parameter_editor_usage.return_value = False
+        model = MagicMock(spec=AhrsOrientationDataModel)
+        model.get_required_steps.return_value = ("LEVEL", "NOSE DOWN", "RIGHT")
+        model.validate_detection_prerequisites.return_value = (True, "")
+        cast("MagicMock", editor.parameter_editor).create_plugin_data_model.return_value = model
+        registry = PluginFactory()
+        registry.register(
+            PLUGIN_AHRS_ORIENTATION,
+            lambda parent, model, window: AhrsOrientationView(
+                parent, cast("AhrsOrientationDataModel", model), cast("BaseWindow", window)
+            ),
+        )
+
+        try:
+            root.update_idletasks()
+            if editor.inline_component_scroll_frame is not None:
+                editor._inline_component_chrome_height = (
+                    editor.inline_component_container.winfo_reqheight()
+                    - editor.inline_component_scroll_frame.winfo_reqheight()
+                )
+            editor._bind_parameter_layout_events()
+            with (
+                patch.object(parameter_editor_module, "plugin_factory", registry),
+                patch.object(AhrsOrientationView, "_start_imu_polling"),
+            ):
+                for _ in range(2):
+                    editor._rebuild_plugin_layout({"name": PLUGIN_AHRS_ORIENTATION, "placement": "top"})
+                    editor.parameter_editor_table.repopulate_table(show_only_differences=False, gui_complexity="normal")
+                    for client_height in (height, height - 40, height):
+                        editor.main_frame.place_configure(height=client_height)
+                        root.update_idletasks()
+                        editor._resize_parameter_area_to_fit()
+                        root.update_idletasks()
+
+                        assert editor.parameter_container.winfo_height() >= 120
+                        table = editor.parameter_editor_table
+                        value_widget = table._new_value_widgets["AHRS_ORIENTATION"]
+                        assert not value_widget.instate(["disabled"])
+                        assert table.canvas.winfo_rooty() <= value_widget.winfo_rooty()
+                        assert value_widget.winfo_rooty() + value_widget.winfo_height() <= (
+                            table.canvas.winfo_rooty() + table.canvas.winfo_height()
+                        )
+                        assert buttons.winfo_height() == buttons.winfo_reqheight()
+                        assert buttons.winfo_y() + buttons.winfo_height() <= client_height
+                        view = cast("AhrsOrientationView", editor.current_plugin_view)
+                        canvas = view._scroll_frame.canvas
+                        assert canvas.winfo_height() >= view._continue_btn.winfo_reqheight() + 8
+                        canvas.yview_moveto(1)
+                        root.update_idletasks()
+                        assert canvas.winfo_rooty() <= view._continue_btn.winfo_rooty()
+                        assert view._continue_btn.winfo_rooty() + view._continue_btn.winfo_height() <= (
+                            canvas.winfo_rooty() + canvas.winfo_height()
+                        )
+                    editor._rebuild_plugin_layout(None)
+                    root.update_idletasks()
+        finally:
+            window.destroy()
 
     def test_user_rebuilds_left_layout_with_split_view(self, parameter_editor_window: ParameterEditorWindow) -> None:
         parameter_editor_window.parameter_area_container = _build_parameter_area_container()
@@ -1568,6 +3252,79 @@ class TestPluginLayoutRebuild:
         mock_load.assert_called_once_with(created_frames[1], plugin)
         table.pack.assert_called_once_with(side="top", fill="both", expand=True)
 
+    @pytest.mark.parametrize("defer_geometry", [False, True], ids=["immediate", "sequoia"])
+    @pytest.mark.parametrize(("width", "height"), [(990, 600), (1100, 500), (990, 440)])
+    def test_user_can_read_parameters_after_revisiting_a_left_plugin_step(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        parameter_editor: MagicMock,
+        root: tk.Tk,
+        width: int,
+        height: int,
+        defer_geometry: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Left plugin steps preserve usable parameter table width and visible buttons.
+
+        GIVEN: A registered plugin requires a flight controller that is disconnected
+        WHEN: The user revisits its step with a refit queued before the layout rebuild
+        THEN: The real parameter table remains readable and the Skip button stays visible
+        """
+        editor = parameter_editor_window
+        monkeypatch.setattr(parameter_editor_module, "is_macos_sequoia_or_older", lambda: defer_geometry)
+        window = tk.Toplevel(root)
+        window.geometry(f"{width}x{height}+0+0")
+        editor.root = window
+        editor.main_frame = ttk.Frame(window)
+        editor.main_frame.place(width=width, height=height)
+        editor.parameter_area_container = ttk.Frame(editor.main_frame, height=300)
+        editor.parameter_area_container.pack(side="top", fill="both", expand=True)
+        buttons = ttk.Frame(editor.main_frame)
+        buttons.pack(side="bottom", fill="x")
+        ttk.Button(buttons, text="Skip").pack()
+        parameter_editor.is_fc_connected = False
+        parameter_editor.create_plugin_data_model.return_value = None
+        parameter_editor.current_step_parameters = {}
+        plugin_creator = MagicMock()
+        registry = PluginFactory()
+        registry.register(PLUGIN_RC_CALIBRATION, plugin_creator)
+
+        try:
+            if sys_platform == "win32":
+                window.wait_visibility()
+                _wait_for_layout(
+                    window,
+                    lambda: editor.main_frame.winfo_width() == width,
+                )
+            root.update_idletasks()
+            editor._bind_parameter_layout_events()
+            with patch.object(parameter_editor_module, "plugin_factory", registry):
+                for _ in range(2):
+                    editor._on_main_frame_resize(tk.Event())
+                    editor._rebuild_plugin_layout({"name": PLUGIN_RC_CALIBRATION, "placement": "left"})
+                    editor.parameter_editor_table.repopulate_table(show_only_differences=False, gui_complexity="normal")
+                    root.update_idletasks()
+
+                    if sys_platform == "win32":
+                        _wait_for_layout(
+                            window,
+                            lambda: (
+                                editor.parameter_container.winfo_width() > 1
+                                and editor.parameter_editor_table.winfo_width() > 1
+                            ),
+                        )
+                    assert editor.parameter_container.winfo_width() > 100
+                    assert editor.parameter_editor_table.winfo_width() > 100
+                    assert buttons.winfo_height() == buttons.winfo_reqheight()
+                    assert buttons.winfo_y() + buttons.winfo_height() <= height
+
+                    editor._rebuild_plugin_layout(None)
+                    root.update_idletasks()
+            plugin_creator.assert_not_called()
+        finally:
+            window.destroy()
+
     def test_user_rebuilds_top_layout_with_separator(self, parameter_editor_window: ParameterEditorWindow) -> None:
         parameter_editor_window.parameter_area_container = _build_parameter_area_container()
         parameter_editor_window.main_frame = MagicMock()
@@ -1583,7 +3340,7 @@ class TestPluginLayoutRebuild:
         table = MagicMock()
         table.pack = MagicMock()
         plugin = {"name": "beta", "placement": "top"}
-        separator = MagicMock(pack=MagicMock())
+        separator = MagicMock()
 
         with (
             patch(
@@ -1604,7 +3361,7 @@ class TestPluginLayoutRebuild:
 
         assert parameter_editor_window.parameter_container is created_frames[3]
         mock_load.assert_called_once_with(created_frames[2], plugin)
-        separator.pack.assert_called_once_with(side="top", fill="x", pady=2)
+        separator.grid.assert_called_once_with(row=1, column=0, sticky="ew", pady=2)
 
     def test_user_rebuilds_simple_layout_when_no_plugin(self, parameter_editor_window: ParameterEditorWindow) -> None:
         parameter_editor_window.parameter_area_container = _build_parameter_area_container()
@@ -1780,7 +3537,7 @@ class TestPluginLoading:
         doc_frame = cast("MagicMock", parameter_editor_window.documentation_frame)
         doc_frame.refresh_documentation_labels.assert_called_once()
         doc_frame.update_why_why_now_tooltip.assert_called_once()
-        mock_plugin_layout.assert_called_once_with(parameter_editor.get_plugin.return_value)
+        mock_plugin_layout.assert_called_once_with(parameter_editor.get_plugin.return_value, force_reload=True)
         mock_repopulate.assert_called_once_with()
         mock_skip_state.assert_called_once()
 
@@ -1950,7 +3707,7 @@ class TestProgressIndicators:
 
         editor.download_flight_controller_parameters(redownload=False)
 
-        parameter_editor.download_flight_controller_parameters.assert_called_once()
+        parameter_editor.download_flight_controller_parameters.assert_called_once_with(ANY, response_timeout=None)
         progress_instance.destroy.assert_called_once()
         editor.on_param_file_combobox_change.assert_called_once_with(None, forced=True)
 
@@ -1971,7 +3728,7 @@ class TestProgressIndicators:
 
         editor.download_flight_controller_parameters(redownload=True)
 
-        parameter_editor.download_flight_controller_parameters.assert_called_once()
+        parameter_editor.download_flight_controller_parameters.assert_called_once_with(ANY, response_timeout=None)
         editor.on_param_file_combobox_change.assert_not_called()
         progress_instance.destroy.assert_called_once()
 
@@ -2089,6 +3846,41 @@ class TestParameterUploads:
         mock_upload.assert_called_once_with(selected_params)
         mock_skip.assert_called_once()
 
+    def test_user_uploads_selected_parameters_and_stays_on_current_file(
+        self, parameter_editor_window: ParameterEditorWindow
+    ) -> None:
+        """The stay variant uploads selected values without advancing to another parameter file."""
+        selected_params = {"ROLL_P": 0.2}
+
+        with (
+            patch.object(
+                parameter_editor_window.parameter_editor_table,
+                "get_upload_selected_params",
+                return_value=selected_params,
+            ),
+            patch.object(parameter_editor_window, "write_changes_to_intermediate_parameter_file") as mock_write,
+            patch.object(parameter_editor_window, "upload_selected_params", return_value=True) as mock_upload,
+            patch.object(parameter_editor_window, "_continue_to_analyse") as mock_continue,
+            patch.object(parameter_editor_window, "repopulate_parameter_table") as mock_repopulate,
+            patch.object(
+                parameter_editor_window.parameter_editor,
+                "ensure_upload_preconditions",
+                return_value=True,
+            ) as mock_preconditions,
+            patch.object(parameter_editor_window, "on_skip_click") as mock_skip,
+        ):
+            parameter_editor_window.on_upload_selected_and_stay_click()
+
+        mock_preconditions.assert_called_once_with(
+            selected_params,
+            parameter_editor_window.ui.show_warning,
+        )
+        mock_write.assert_called_once()
+        mock_upload.assert_called_once_with(selected_params)
+        mock_continue.assert_called_once()
+        mock_repopulate.assert_called_once()
+        mock_skip.assert_not_called()
+
     def test_user_receives_warning_when_no_fc_connection(self, parameter_editor_window: ParameterEditorWindow) -> None:
         """
         User receives feedback when attempting an upload without FC data.
@@ -2156,7 +3948,7 @@ class TestParameterUploads:
         """
         User sees progress feedback during parameter uploads and windows are cleaned up.
 
-        GIVEN: The upload workflow requests reset and download callbacks
+        GIVEN: The upload workflow requests restart/reconnect and download callbacks
         WHEN: The callbacks are invoked by the workflow
         THEN: Progress windows expose update callables and are destroyed afterwards
         """
@@ -2175,18 +3967,16 @@ class TestParameterUploads:
             _selected: dict[str, float],
             *,
             get_upload_progress_callback: Callable[[], Callable],
-            get_reset_progress_callback: Callable[[], Callable],
             get_connection_progress_callback: Callable[[], Callable],
             get_download_progress_callback: Callable[[], Callable],
             **_ignored: object,
         ) -> None:
             upload_cb = get_upload_progress_callback()
-            reset_cb = get_reset_progress_callback()
             connection_cb = get_connection_progress_callback()
             download_cb = get_download_progress_callback()
             upload_cb(0, 1)
-            reset_cb(1, 2)
-            connection_cb(2, 3)
+            connection_cb(10, 100)
+            connection_cb(30, 100)
             download_cb(3, 4)
 
         parameter_editor.upload_selected_params_workflow.side_effect = _workflow
@@ -2201,7 +3991,6 @@ class TestParameterUploads:
             ask_retry_cancel=ANY,
             show_error=ANY,
             get_upload_progress_callback=ANY,
-            get_reset_progress_callback=ANY,
             get_connection_progress_callback=ANY,
             get_download_progress_callback=ANY,
         )
@@ -2271,9 +4060,9 @@ class TestParameterUploads:
 
         editor.ui.create_progress_window = MagicMock(side_effect=track_window_creation)
 
-        # Mock workflow that only uses download progress (no reset needed)
+        # Mock workflow that only uses download progress (no restart needed)
         def workflow_without_reset(_params, **kwargs) -> None:
-            # Don't call get_reset_progress_callback
+            # Don't call get_connection_progress_callback
             download_cb = kwargs["get_download_progress_callback"]()
             download_cb(50, 100)
 
@@ -2286,44 +4075,113 @@ class TestParameterUploads:
             {"PARAM1": 1.0},
         )
 
-        # Assert: Only one window created (download, not reset)
+        # Assert: Only one window created (download, not restart/reconnect)
         assert len(created_windows) == 1
 
 
 # ============================== FILE DOWNLOADS ==============================
 
 
+@pytest.mark.parametrize("operation", ["upload", "reset", "download"])
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+def test_sequoia_parameter_workflows_keep_tk_callbacks_on_the_ui_thread(  # pylint: disable=too-many-locals,too-many-statements # noqa: PLR0915
+    parameter_editor_window: ParameterEditorWindow,
+    root: tk.Tk,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    fails: bool,
+) -> None:
+    """
+    Blocking parameter workflows leave Tk free to deliver timers and dialogs.
+
+    GIVEN: Sequoia rendering and a parameter upload, reset or download
+    WHEN: A worker reports progress, opens dialogs, and succeeds or fails
+    THEN: All UI callbacks stay on Tk, windows are cleaned up, and results propagate
+    """
+    editor = parameter_editor_window
+    editor.root = root
+    ui_thread = get_ident()
+    heartbeat = Event()
+    root.after(0, heartbeat.set)
+    monkeypatch.setattr(parameter_editor_module, "is_macos_sequoia_or_older", lambda: True)
+    monkeypatch.setattr(tk.Misc, "update", lambda _self: None)
+    monkeypatch.setattr(tk.Misc, "update_idletasks", lambda _self: None)
+    created: list[MagicMock] = []
+    rendered: list[tuple[int, int]] = []
+
+    def render(current: int, total: int, *_message: str) -> None:
+        assert get_ident() == ui_thread
+        rendered.append((current, total))
+
+    def destroy() -> None:
+        assert get_ident() == ui_thread
+
+    def create_window(*_args: object, **_kwargs: object) -> MagicMock:
+        assert get_ident() == ui_thread
+        window = MagicMock()
+        window.update_progress_bar.side_effect = render
+        window.update_progress_bar_with_message.side_effect = render
+        window.destroy.side_effect = destroy
+        created.append(window)
+        return window
+
+    def show_dialog(*_args: str) -> bool:
+        assert get_ident() == ui_thread
+        assert rendered
+        return True
+
+    editor.ui.create_progress_window = create_window
+    editor.ui.ask_yesno = show_dialog
+    editor.ui.ask_retry_cancel = show_dialog
+    editor.ui.show_error = show_dialog
+
+    def workflow(*args: object, **kwargs: object) -> object:
+        assert get_ident() != ui_thread
+        assert heartbeat.wait(2)
+        if operation == "upload":
+            for name in ("get_upload_progress_callback", "get_connection_progress_callback", "get_download_progress_callback"):
+                report = cast("Callable", kwargs[name])()
+                report(50, 100)
+            assert cast("Callable", kwargs["ask_confirmation"])("Confirm", "Continue?")
+            assert cast("Callable", kwargs["ask_retry_cancel"])("Retry", "Continue?")
+            cast("Callable", kwargs["show_error"])("Error", "Example")
+        elif operation == "reset":
+            cast("Callable", args[1])(50, 100)
+            cast("Callable", args[2])()(50, 100)
+            cast("Callable", args[0])("Error", "Example")
+        else:
+            cast("Callable", args[0])()(50, 100)
+        if fails:
+            message = "transport failed"
+            raise RuntimeError(message)
+        return ({"TEST": 1}, {}) if operation == "download" else True
+
+    def run() -> object:
+        if operation == "upload":
+            return editor.ui.upload_params_with_progress(root, workflow, {"TEST": 1})
+        if operation == "reset":
+            return editor.ui.reset_all_parameters_to_default_with_progress(root, workflow)
+        cast("MagicMock", editor.parameter_editor).download_flight_controller_parameters.side_effect = workflow
+        return editor.download_flight_controller_parameters(redownload=True)
+
+    if fails:
+        with pytest.raises(RuntimeError, match="transport failed"):
+            run()
+    else:
+        assert run() == (({"TEST": 1}, {}) if operation == "download" else True)
+    assert len(rendered) == len(created)
+    assert len(created) == {"upload": 3, "reset": 2, "download": 1}[operation]
+    for window in created:
+        window.destroy.assert_called_once()
+    assert editor._param_download_progress_window is None
+
+
 class TestFlightLogDownloads:  # pylint: disable=too-few-public-methods
-    """Verify downloading flight logs through the GUI helper."""
+    """Keep one file-browser entry point for flight-log downloads."""
 
-    def test_user_downloads_last_flight_log_with_progress(
-        self,
-        editor_factory,
-        parameter_editor: MagicMock,
-        tmp_path: Path,
-    ) -> None:
-        """
-        User downloads the last flight log while monitoring progress.
-
-        GIVEN: The workflow accepts callbacks for progress and saving the file
-        WHEN: The user starts the download
-        THEN: A progress window is shown and destroyed after completion
-        """
-        editor = editor_factory()
-
-        progress_instance = MagicMock()
-        progress_instance.update_progress_bar = MagicMock()
-        editor.ui.create_progress_window = MagicMock(return_value=progress_instance)
-        log_file = tmp_path / "log.bin"
-        editor.ui.asksaveasfilename = MagicMock(return_value=str(log_file))
-
-        editor.on_download_last_flight_log_click()
-
-        parameter_editor.download_last_flight_log_workflow.assert_called_once()
-        workflow_kwargs = parameter_editor.download_last_flight_log_workflow.call_args.kwargs
-        assert workflow_kwargs["ask_saveas_filename"]() == str(log_file)
-        assert workflow_kwargs["progress_callback"] is progress_instance.update_progress_bar
-        progress_instance.destroy.assert_called_once()
+    def test_old_synchronous_log_handler_is_retired(self) -> None:
+        """The legacy handler must not compete with the browser's async action."""
+        assert not hasattr(ParameterEditorWindow, "on_download_last_flight_log_click")
 
 
 # ============================== PERSISTENCE AND EXIT ==============================
@@ -2373,6 +4231,94 @@ class TestPersistenceAndExit:
         mock_write.assert_called_once()
         mock_quit.assert_called_once()
 
+    def test_user_can_close_application_during_other_navigation_locks(
+        self, parameter_editor_window: ParameterEditorWindow
+    ) -> None:
+        """Calibration and diagnostics locks still allow saving and closing the application."""
+        editor = parameter_editor_window
+        editor.navigation_lock.acquire(self)
+        with patch.object(editor, "_commit_focused_edit_and_offer_save") as save:
+            editor.close_connection_and_quit()
+        save.assert_called_once_with()
+        editor.root.quit.assert_called_once_with()
+
+    @pytest.mark.parametrize("save_result", [True, False])
+    def test_user_hands_off_after_being_offered_to_save_changes(
+        self, parameter_editor_window: ParameterEditorWindow, save_result: bool
+    ) -> None:
+        """The handoff proceeds after the user accepts or declines the optional save prompt."""
+        events: list[str] = []
+        focus_widget = MagicMock()
+        focus_widget.event_generate.side_effect = lambda *_args, **_kwargs: events.append("commit focused edit")
+        with (
+            patch.object(parameter_editor_window.parameter_editor_table.view_port, "focus_get", return_value=focus_widget),
+            patch.object(
+                parameter_editor_window.parameter_editor,
+                "handle_write_changes_workflow",
+                side_effect=lambda *_args: (events.append("offer save"), save_result)[1],
+            ),
+            patch.object(parameter_editor_window.root, "destroy", side_effect=lambda: events.append("destroy window")),
+            patch.object(
+                parameter_editor_window.root,
+                "mainloop",
+                side_effect=parameter_editor_window.on_edit_vehicle_components_click,
+            ),
+        ):
+            assert parameter_editor_window.run() is ParameterEditorAction.EDIT_COMPONENTS
+
+        assert events == ["commit focused edit", "offer save", "destroy window"]
+        focus_widget.event_generate.assert_called_once_with("<FocusOut>", when="now")
+
+    def test_component_editor_handoff_is_refused_while_file_browser_is_open(
+        self, parameter_editor_window: ParameterEditorWindow
+    ) -> None:
+        """The parameter editor remains alive while its non-modal browser is displayed."""
+        browser_window = MagicMock()
+        browser_window.root.winfo_exists.return_value = True
+        parameter_editor_window._file_browser_window = browser_window
+
+        parameter_editor_window.on_edit_vehicle_components_click()
+
+        assert parameter_editor_window._requested_action is ParameterEditorAction.FINISHED
+        parameter_editor_window.root.destroy.assert_not_called()
+        parameter_editor_window.ui.show_error.assert_called_once_with(
+            "File browser is open",
+            "Close the flight-controller file browser before editing vehicle components.",
+        )
+        browser_window.root.destroy.assert_not_called()
+
+    def test_component_editor_handoff_is_refused_while_log_analysis_is_running(
+        self, parameter_editor_window: ParameterEditorWindow
+    ) -> None:
+        """Keep the editor open until the pending log analysis can deliver its result."""
+        worker = MagicMock()
+        worker.is_alive.return_value = True
+
+        with patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_parameter_editor.threading.Thread",
+            return_value=worker,
+        ):
+            parameter_editor_window._analyse_log_file("/fake/log.bin")
+
+        parameter_editor_window.on_edit_vehicle_components_click()
+
+        assert parameter_editor_window._requested_action is ParameterEditorAction.FINISHED
+        parameter_editor_window.root.destroy.assert_not_called()
+        parameter_editor_window._test_progress_windows[0].destroy.assert_not_called()  # type: ignore[attr-defined]
+        parameter_editor_window.ui.show_error.assert_called_once_with(
+            "Log analysis is running",
+            "Wait for the flight log analysis to finish before editing vehicle components.",
+        )
+
+        worker.is_alive.return_value = False
+        check_done = parameter_editor_window.root.after.call_args_list[-1].args[1]
+        check_done()
+        parameter_editor_window.on_edit_vehicle_components_click()
+
+        parameter_editor_window._test_progress_windows[0].destroy.assert_called_once()  # type: ignore[attr-defined]
+        assert parameter_editor_window._requested_action is ParameterEditorAction.EDIT_COMPONENTS
+        parameter_editor_window.root.destroy.assert_called_once()
+
     def test_user_triggers_file_upload_helper_with_progress(self, editor_factory, parameter_editor: MagicMock) -> None:
         """
         User can upload the active parameter file directly to the flight controller.
@@ -2394,7 +4340,11 @@ class TestPersistenceAndExit:
         assert callable(kwargs["show_error"])
         assert callable(kwargs["show_warning"])
 
-        assert parameter_editor.last_upload_progress_callback is progress_instance.update_progress_bar
+        progress_instance.enable_transfer_progress.assert_called_once()
+        snapshot = progress_instance.update_transfer_progress.call_args.args[0]
+        assert snapshot.transferred_bytes == 10
+        assert snapshot.total_bytes == 20
+        assert snapshot.direction.name == "UPLOAD"
         progress_instance.destroy.assert_called_once()
 
 
@@ -2685,6 +4635,50 @@ class TestStepInstructionsPopupWorkflows:
 class TestInlineComponentEditorCallbacks:
     """Tests for the inline component editor data-sync and table-refresh callback."""
 
+    @pytest.mark.parametrize("plugin_name", ["rc_calibration", "battery_monitor"])
+    def test_offline_component_edits_preserve_plugin_placeholder(
+        self,
+        parameter_editor_window: ParameterEditorWindow,
+        parameter_editor: MagicMock,
+        root: tk.Tk,
+        caplog: pytest.LogCaptureFixture,
+        plugin_name: str,
+    ) -> None:
+        """
+        Editing components offline keeps the unavailable plugin's existing explanation.
+
+        GIVEN: A plugin cannot load without a flight controller connection.
+        WHEN: The user edits five inline component fields.
+        THEN: The placeholder survives and the connection warning is logged only once.
+        """
+        editor = parameter_editor_window
+        plugin = {"name": plugin_name, "placement": "left"}
+        editor.current_plugin = plugin
+        editor.current_plugin_view = None
+        parameter_editor.get_plugin.return_value = plugin
+        parameter_editor.create_plugin_data_model.return_value = None
+        inline_editor = MagicMock()
+        inline_editor.get_component_data.return_value = {"Components": {"Battery": {}}}
+        editor.inline_component_editor = inline_editor
+        parent = ttk.Frame(root)
+        paned = MagicMock()
+        paned.panes.return_value = ("plugin",)
+        paned.nametowidget.return_value = parent
+        editor.parameter_area_paned = paned
+        try:
+            with patch.object(parameter_editor_module.plugin_factory, "is_registered", return_value=True):
+                editor._load_plugin(parent, plugin)
+                placeholder = parent.winfo_children()[0]
+                for _ in range(5):
+                    editor._on_component_data_changed()
+
+            assert parent.winfo_children() == [placeholder]
+            assert editor.current_plugin_view is None
+            assert sum("Plugin requires flight controller connection" in record.message for record in caplog.records) == 1
+            assert parameter_editor.update_vehicle_components.call_count == 5
+        finally:
+            parent.destroy()
+
     def test_component_data_change_calls_update_and_refresh(self, parameter_editor: MagicMock) -> None:
         """
         Callback delegates sync to update_vehicle_components() and triggers a refresh.
@@ -2777,3 +4771,660 @@ class TestInlineComponentEditorCallbacks:
         parameter_editor.update_vehicle_components.assert_not_called()
         parameter_editor.refresh_current_step_computed_parameters.assert_not_called()
         editor.repopulate_parameter_table.assert_not_called()
+
+
+@pytest.fixture
+def monitored_editor(parameter_editor_window: ParameterEditorWindow) -> ParameterEditorWindow:
+    """Supply an editor with a controllable connection monitor and no live transport."""
+    editor = parameter_editor_window
+    monitor = MagicMock(spec=FlightControllerReconnect)
+    monitor.cancelled = Event()
+    monitor.poll.return_value = True
+    monitor.reconnect.return_value = ""
+    editor._connection_recovery = ConnectionRecovery(
+        editor.root,
+        monitor,
+        RecoveryCallbacks(
+            reader_busy=editor._connection_reader_busy,
+            can_read=lambda: editor.current_plugin_view is None,
+            pause_receiver=editor._pause_connection_plugin,
+            lock_controls=editor._lock_connection_plugin,
+            show_status=editor._show_connection_status,
+            on_recovered=editor._finish_connection_recovery,
+            can_refresh=lambda: not editor.parameter_editor_table.bitmask_editor_open,
+        ),
+    )
+    editor._connection_status = MagicMock()
+    editor._file_browser_window = None
+    editor.root.winfo_children.return_value = []
+    editor.root.tk.call.return_value = ""
+    return editor
+
+
+def test_active_plugin_keeps_sole_receive_ownership(monitored_editor: ParameterEditorWindow) -> None:
+    """GIVEN an active plugin, WHEN the timer runs, THEN the monitor observes without reading."""
+    editor = monitored_editor
+    editor.current_plugin_view = MagicMock()
+    editor._connection_recovery.check()
+    editor._connection_recovery._monitor.poll.assert_called_once_with(read=False)
+    editor.current_plugin_view.on_suspend.assert_not_called()
+
+
+@pytest.mark.parametrize("owner", ["upload", "navigation", "browser", "native_dialog", "bitmask_dialog"])
+def test_other_owners_defer_connection_checks(monitored_editor: ParameterEditorWindow, owner: str) -> None:
+    """GIVEN another receive owner, WHEN the timer fires, THEN no receive or reconnect operation starts."""
+    editor = monitored_editor
+    if owner == "upload":
+        editor._connection_recovery.acquire_operation()
+    elif owner == "navigation":
+        editor.navigation_lock.acquire(object())
+    elif owner == "browser":
+        editor._file_browser_window = MagicMock()
+    elif owner == "bitmask_dialog":
+        cast("MagicMock", editor.parameter_editor_table).bitmask_editor_open = True
+    elif owner == "native_dialog":
+        editor.root.tk.call.return_value = ".__tk__messagebox"
+    editor._connection_recovery.check()
+    editor._connection_recovery._monitor.poll.assert_not_called()
+    editor._connection_recovery._monitor.reconnect.assert_not_called()
+    editor._connection_recovery._monitor.defer.assert_called_once()
+
+
+def test_nested_upload_event_loop_cannot_start_monitor_reads(monitored_editor: ParameterEditorWindow) -> None:
+    """GIVEN an upload pumps Tk events, WHEN its timer fires, THEN upload replies remain exclusively owned."""
+    editor = monitored_editor
+
+    def upload(*_args: object) -> bool:
+        editor._connection_recovery.check()
+        return True
+
+    editor.ui.upload_params_with_progress = upload
+    assert editor.upload_selected_params({})
+    editor._connection_recovery._monitor.poll.assert_not_called()
+    assert not editor._connection_recovery.operation_active
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+def test_reset_prevents_reentry_and_restores_plugin_and_navigation(
+    monitored_editor: ParameterEditorWindow, fails: bool
+) -> None:
+    """
+    Parameter reset retains exclusive ownership while its event loop is running.
+
+    GIVEN: An active plugin and a parameter reset that services Tk events
+    WHEN: Another reset is requested during the reset, which then succeeds or raises
+    THEN: Only one reset runs, and plugin reception and navigation resume afterward.
+    """
+    editor = monitored_editor
+    plugin = MagicMock(spec=["on_suspend", "on_resume"])
+    editor.current_plugin_view = plugin
+
+    def reset(*_args: object) -> bool:
+        assert editor.navigation_lock.locked
+        assert editor._connection_recovery.operation_active
+        plugin.on_suspend.assert_called_once()
+        assert not editor.reset_all_parameters_to_default()
+        editor._connection_recovery.check()
+        if fails:
+            message = "reset failed"
+            raise RuntimeError(message)
+        return True
+
+    editor.ui.reset_all_parameters_to_default_with_progress = MagicMock(side_effect=reset)
+    if fails:
+        with pytest.raises(RuntimeError, match="reset failed"):
+            editor.reset_all_parameters_to_default()
+    else:
+        assert editor.reset_all_parameters_to_default()
+    editor.ui.reset_all_parameters_to_default_with_progress.assert_called_once()
+    editor._connection_recovery._monitor.poll.assert_not_called()
+    assert not editor.navigation_lock.locked
+    assert not editor._connection_recovery.operation_active
+    plugin.on_resume.assert_called_once()
+
+
+def test_paused_plugin_with_buffered_heartbeat_resumes_without_reconnection(monitored_editor: ParameterEditorWindow) -> None:
+    """GIVEN a plugin stopped reading, WHEN a buffered heartbeat proves liveness, THEN its state resumes unchanged."""
+    editor = monitored_editor
+    plugin = MagicMock(spec=["on_suspend", "on_resume"])
+    editor.current_plugin_view = plugin
+    editor._connection_recovery._monitor.poll.side_effect = [False, True]
+    editor._connection_recovery.check()
+    plugin.on_suspend.assert_called_once()
+    plugin.on_resume.assert_called_once()
+    editor._connection_recovery._monitor.reconnect.assert_not_called()
+    assert not editor.navigation_lock.locked
+
+
+@pytest.mark.parametrize("operation", ["inspector", "upload", "banner", "logs"])
+def test_fc_tools_use_safety_pause_before_taking_reception(monitored_editor: ParameterEditorWindow, operation: str) -> None:
+    """GIVEN an actuator plugin, WHEN an FC tool opens, THEN safety cleanup precedes the exclusive operation."""
+    editor = monitored_editor
+    plugin = MagicMock(spec=["on_suspend", "on_resume"])
+    editor.current_plugin_view = plugin
+    popup = MagicMock()
+
+    def open_tool(*_args: object, **_kwargs: object) -> MagicMock:
+        plugin.on_suspend.assert_called_once_with(PluginPauseReason.EXCLUSIVE_OPERATION)
+        plugin.on_resume.assert_not_called()
+        return popup
+
+    with (
+        patch.object(parameter_editor_module, "open_mavlink_inspector_window", side_effect=open_tool),
+        patch.object(parameter_editor_module, "FlightControllerBannerWindow", side_effect=open_tool),
+        patch.object(parameter_editor_module, "FileBrowserWindow", side_effect=open_tool),
+    ):
+        if operation == "inspector":
+            editor.on_mavlink_inspector_click()
+        elif operation == "upload":
+            editor.ui.upload_params_with_progress = open_tool
+            editor.upload_selected_params({})
+        elif operation == "banner":
+            editor.on_fc_banner_click()
+        else:
+            editor.on_download_bin_logs_click()
+            popup.set_closed_callback.call_args.args[0]()
+
+    plugin.on_suspend.assert_called_once_with(PluginPauseReason.EXCLUSIVE_OPERATION)
+    plugin.on_resume.assert_called_once_with()
+
+
+def test_connection_check_uses_passive_pause_when_available(monitored_editor: ParameterEditorWindow) -> None:
+    """GIVEN an actuator plugin, WHEN checking buffered heartbeats, THEN no safety-stop command is requested."""
+    editor = monitored_editor
+    plugin = MagicMock(spec=["on_suspend", "on_resume"])
+    editor.current_plugin_view = plugin
+    editor._connection_recovery._monitor.poll.side_effect = [False, True]
+
+    editor._connection_recovery.check()
+
+    plugin.on_suspend.assert_called_once_with(PluginPauseReason.CONNECTION_RECOVERY)
+    plugin.on_resume.assert_called_once_with()
+
+
+@pytest.mark.parametrize("creation_fails", [False, True])
+def test_log_browser_retains_an_explicit_lease_until_close(
+    monitored_editor: ParameterEditorWindow, creation_fails: bool
+) -> None:
+    """GIVEN asynchronous browsing, WHEN opening returns or fails, THEN ownership follows the tool's actual lifetime."""
+    editor = monitored_editor
+    recovery = editor._connection_recovery
+    popup = MagicMock()
+    error = OSError("Browser unavailable")
+    with patch.object(
+        parameter_editor_module, "FileBrowserWindow", side_effect=error if creation_fails else None, return_value=popup
+    ):
+        if creation_fails:
+            with pytest.raises(OSError, match="Browser unavailable"):
+                editor.on_download_bin_logs_click()
+        else:
+            editor.on_download_bin_logs_click()
+            assert recovery.operation_active
+            popup.set_closed_callback.call_args.args[0]()
+    assert not recovery.operation_active
+
+
+@pytest.mark.parametrize("tool", ["preview", "export"])
+def test_parameter_tool_retains_reception_until_its_root_is_destroyed(
+    monitored_editor: ParameterEditorWindow, root: tk.Tk, tool: str
+) -> None:
+    """
+    Keep asynchronous parameter tools protected independently of window visibility.
+
+    GIVEN: A preview or export tool that does not use a modal grab
+    WHEN: Its opening callback returns, a child closes, and its root is withdrawn
+    THEN: It retains reception until its root closes, after which monitoring resumes
+    """
+    editor = monitored_editor
+    recovery = editor._connection_recovery
+    popup_root = tk.Toplevel(root)
+    popup = SimpleNamespace(root=popup_root)
+    child = ttk.Label(popup_root)
+    editor.ui.askopenfilename = MagicMock(return_value="tune.param")
+    try:
+        with (
+            patch.object(parameter_editor_module, "ParameterFileUploadWindow", return_value=popup),
+            patch.object(parameter_editor_module, "ParameterExportWindow", return_value=popup),
+        ):
+            if tool == "preview":
+                editor.on_compare_and_upload_parameter_file_click()
+            else:
+                editor.on_export_parameters_click()
+        assert recovery.operation_active
+        child.destroy()
+        popup_root.withdraw()
+        recovery.check()
+        assert recovery.operation_active
+        recovery._monitor.poll.assert_not_called()
+    finally:
+        popup_root.destroy()
+    assert not recovery.operation_active
+    recovery.check()
+    recovery._monitor.poll.assert_called_once_with(read=True)
+
+
+def test_overlapping_parameter_tools_release_only_their_own_lease(
+    monitored_editor: ParameterEditorWindow, root: tk.Tk
+) -> None:
+    """GIVEN two tool windows, WHEN one closes twice, THEN the other keeps ownership until it closes."""
+    editor = monitored_editor
+    first, second = tk.Toplevel(root), tk.Toplevel(root)
+    try:
+        editor._retain_fc_operation_until_closed(first)
+        editor._retain_fc_operation_until_closed(second)
+        first.destroy()
+        first.destroy()
+        assert editor._connection_recovery.operation_active
+    finally:
+        if first.winfo_exists():
+            first.destroy()
+        second.destroy()
+    assert not editor._connection_recovery.operation_active
+
+
+def test_parameter_tool_bind_failure_does_not_leak_receive_ownership(monitored_editor: ParameterEditorWindow) -> None:
+    """GIVEN a tool that cannot bind cleanup, WHEN ownership setup fails, THEN the lease is released."""
+    root = MagicMock(spec=tk.Toplevel)
+    root.bind.side_effect = tk.TclError("window destroyed")
+    with pytest.raises(tk.TclError, match="window destroyed"):
+        monitored_editor._retain_fc_operation_until_closed(root)
+    assert not monitored_editor._connection_recovery.operation_active
+
+
+def test_reconnection_retries_off_gui_thread_and_preserves_local_edits(monitored_editor: ParameterEditorWindow) -> None:
+    """GIVEN an outage, WHEN retries eventually succeed, THEN the plugin resumes and pending widget edits are committed."""
+    editor = monitored_editor
+    plugin = MagicMock(spec=["on_suspend", "on_resume"])
+    editor.current_plugin_view = plugin
+    monitor = editor._connection_recovery._monitor
+    monitor.poll.return_value = False
+    attempts = iter(["Unavailable", "Different hardware ID", ""])
+    worker_threads: list[int] = []
+
+    def reconnect() -> str:
+        worker_threads.append(threading.get_ident())
+        return next(attempts)
+
+    monitor.reconnect.side_effect = reconnect
+    editor._connection_recovery.check()
+    for _attempt in range(3):
+        assert editor.navigation_lock.locked
+        assert editor._connection_recovery._worker is not None
+        editor._connection_recovery._worker.join(timeout=1)
+        assert not editor._connection_recovery._worker.is_alive()
+        editor._connection_recovery.check()
+
+    assert len(worker_threads) == 3
+    assert all(thread != threading.get_ident() for thread in worker_threads)
+    assert not editor.navigation_lock.locked
+    plugin.on_suspend.assert_called_once()
+    plugin.on_resume.assert_called_once()
+    editor.parameter_editor_table.view_port.focus_get().event_generate.assert_called_once_with("<FocusOut>", when="now")
+    editor.parameter_editor.handle_write_changes_workflow.assert_not_called()
+    editor.parameter_editor_table.repopulate_table.assert_called_once()
+
+
+def test_editor_shutdown_retains_ownership_until_worker_finishes(monitored_editor: ParameterEditorWindow) -> None:
+    """GIVEN a running reconnect, WHEN the editor closes, THEN the connection cannot leak into the next sub-application."""
+    editor = monitored_editor
+    monitor = editor._connection_recovery._monitor
+    worker = MagicMock()
+    editor._connection_recovery._worker = worker
+    editor._connection_recovery._unlock = editor._lock_connection_plugin(editor._connection_recovery)
+    assert not editor._stop_connection_monitor()
+    assert monitor.cancelled.is_set()
+    worker.join.assert_not_called()
+    monitor.close.assert_not_called()
+    assert editor.navigation_lock.locked
+
+    worker.is_alive.return_value = False
+    assert editor._stop_connection_monitor()
+    monitor.close.assert_called_once()
+    assert editor._connection_recovery is None
+    assert not editor.navigation_lock.locked
+
+
+def test_closing_during_recovery_keeps_tk_responsive_until_worker_yields(monitored_editor: ParameterEditorWindow) -> None:
+    """
+    Close safely while a slow telemetry recovery still owns the connection.
+
+    GIVEN: A recovery worker is waiting for a parameter download
+    WHEN: The user closes the editor and the worker later finishes
+    THEN: Tk schedules another close attempt without joining and quits only after ownership is released
+    """
+    editor = monitored_editor
+    worker = MagicMock()
+    editor._connection_recovery._worker = worker
+    with (
+        patch.object(editor, "_commit_focused_edit_and_offer_save") as save,
+        patch.object(editor, "_show_connection_status") as status,
+    ):
+        editor.close_connection_and_quit()
+        worker.join.assert_not_called()
+        editor.root.after.assert_called_once_with(50, editor._finish_pending_close)
+        status.assert_called_once_with("Closing… Waiting for flight-controller recovery to stop.")
+        editor.root.quit.assert_not_called()
+        save.assert_not_called()
+
+        worker.is_alive.return_value = False
+        editor.root.after.call_args.args[1]()
+        save.assert_called_once()
+        editor.root.quit.assert_called_once()
+        assert editor._connection_recovery is None
+
+
+def test_recovery_locks_plugin_buttons_until_the_connection_owner_releases_them(
+    monitored_editor: ParameterEditorWindow, root: tk.Tk
+) -> None:
+    """GIVEN a paused plugin with clickable controls, WHEN recovery owns reception, THEN the user cannot send commands."""
+    editor = monitored_editor
+    plugin = ttk.Frame(root)
+    button = ttk.Button(plugin, text="Start calibration")
+    disabled_button = ttk.Button(plugin, text="Unavailable", state="disabled")
+    editor.current_plugin_view = cast("PluginView", plugin)
+    try:
+        unlock = editor._lock_connection_plugin(editor._connection_recovery._monitor)
+        assert button.instate(("disabled",))
+        unlock()
+        assert not button.instate(("disabled",))
+        assert disabled_button.instate(("disabled",))
+        editor.navigation_lock.acquire(object())
+        assert not button.instate(("disabled",))
+    finally:
+        plugin.destroy()
+
+
+@pytest.mark.parametrize("visible", [False, True])
+def test_report_visibility_does_not_prevent_idle_connection_monitoring(
+    monitored_editor: ParameterEditorWindow, visible: bool
+) -> None:
+    """GIVEN a report without FC access, WHEN monitoring, THEN visibility does not imply receive ownership."""
+    editor = monitored_editor
+    report = MagicMock(spec=tk.Toplevel)
+    report.winfo_viewable.return_value = visible
+    editor.root.winfo_children.return_value = [report]
+    editor._connection_recovery.check()
+    editor._connection_recovery._monitor.poll.assert_called_once_with(read=True)
+
+
+def test_close_during_configured_upload_keeps_monitor_until_upload_finishes(
+    parameter_editor_window: ParameterEditorWindow,
+) -> None:
+    """GIVEN an active configured upload, WHEN closing, THEN defer shutdown until the upload yields the connection."""
+    editor = parameter_editor_window
+    editor._configured_upload_active = True
+    with (
+        patch.object(editor, "_stop_connection_monitor", return_value=True) as stop_monitor,
+        patch.object(editor, "_commit_focused_edit_and_offer_save") as save,
+    ):
+        editor.close_connection_and_quit()
+        assert editor._close_after_configured_upload
+        stop_monitor.assert_not_called()
+        save.assert_not_called()
+        editor.root.quit.assert_not_called()
+
+        editor._configured_upload_active = False
+        editor.close_connection_and_quit()
+        stop_monitor.assert_called_once()
+        save.assert_called_once()
+        editor.root.quit.assert_called_once()
+
+
+@pytest.mark.parametrize("error", [KeyError("__tk__messagebox"), tk.TclError("bad window path name")])
+def test_closing_still_saves_when_tk_focus_has_no_python_widget(
+    parameter_editor_window: ParameterEditorWindow, error: Exception
+) -> None:
+    """GIVEN a native or destroyed popup owns focus, WHEN closing, THEN saving and quitting still complete."""
+    editor = parameter_editor_window
+    editor.parameter_editor_table.view_port.focus_get.side_effect = error
+    editor.close_connection_and_quit()
+    editor.parameter_editor.handle_write_changes_workflow.assert_called_once()
+    editor.root.quit.assert_called_once()
+
+
+def test_recovery_waits_for_bitmask_edits_before_repainting(monitored_editor: ParameterEditorWindow) -> None:
+    """
+    Recovery preserves rows referenced by an open bitmask dialog without a grab.
+
+    GIVEN: A bitmask editor is open while a reconnect worker succeeds
+    WHEN: The connection timer checks completion before and after the dialog closes
+    THEN: The table is repainted once, only after the dialog releases its rows
+    """
+    editor = monitored_editor
+    recovery = editor._connection_recovery
+    assert recovery is not None
+    table = cast("MagicMock", editor.parameter_editor_table)
+    worker = MagicMock()
+    worker.is_alive.return_value = False
+    recovery._worker = worker
+    recovery._state = RecoveryState.RECOVERING
+    recovery._unlock = editor._lock_connection_plugin(recovery)
+    resume = MagicMock()
+    recovery._resume = resume
+    table.bitmask_editor_open = True
+
+    for _ in range(2):
+        recovery.check()
+        assert recovery.state is RecoveryState.RECOVERING
+        assert editor.navigation_lock.locked
+        table.repopulate_table.assert_not_called()
+        resume.assert_not_called()
+
+    table.bitmask_editor_open = False
+    recovery.check()
+
+    assert recovery.state is RecoveryState.MONITORING
+    assert not editor.navigation_lock.locked
+    table.repopulate_table.assert_called_once()
+    resume.assert_called_once()
+
+
+def test_recovery_resumes_plugin_when_tk_focus_points_to_a_destroyed_popup(monitored_editor: ParameterEditorWindow) -> None:
+    """GIVEN stale focus after recovery, WHEN completion renders, THEN the plugin resumes and navigation unlocks."""
+    editor = monitored_editor
+    editor._connection_recovery._worker = MagicMock()
+    editor._connection_recovery._worker.is_alive.return_value = False
+    editor._connection_recovery._state = RecoveryState.RECOVERING
+    resume_plugin = MagicMock()
+    editor._connection_recovery._resume = resume_plugin
+    editor._connection_recovery._unlock = editor._lock_connection_plugin(editor._connection_recovery)
+    editor.parameter_editor_table.view_port.focus_get.side_effect = KeyError("missing-popup")
+    editor._connection_recovery.check()
+    resume_plugin.assert_called_once()
+    assert not editor.navigation_lock.locked
+    editor.parameter_editor_table.repopulate_table.assert_called_once()
+
+
+@pytest.mark.parametrize("new_value", [1.0, 2.0, 3.0])
+@pytest.mark.parametrize("refreshed_value", [2.0, None])
+def test_recovery_refreshes_fc_cells_without_advancing_or_overwriting_edits(
+    monitored_editor: ParameterEditorWindow, root: tk.Tk, new_value: float, refreshed_value: float | None
+) -> None:
+    """GIVEN edited parameters, WHEN recovery downloads new FC values, THEN repaint preserves the step and local edits."""
+    editor = monitored_editor
+    parameter = ArduPilotParameter("TEST_GAIN", Par(new_value, "Keep this reason"), fc_value=1.0)
+    parameters = {parameter.name: parameter}
+    editor.parameter_editor.current_step_parameters = parameters
+    editor.parameter_editor.flight_controller.fc_parameters = (
+        {parameter.name: refreshed_value} if refreshed_value is not None else {"OTHER_GAIN": 4.0}
+    )
+    editor.show_only_differences.get.return_value = True
+    table = ParameterEditorTable(root, editor.parameter_editor, editor, parameters=parameters)
+    editor.parameter_editor_table = table
+    editor._connection_recovery._worker = MagicMock()
+    editor._connection_recovery._worker.is_alive.return_value = False
+    editor._connection_recovery._state = RecoveryState.RECOVERING
+    with patch.object(editor, "on_skip_click") as skip:
+        try:
+            editor._connection_recovery.check()
+            assert parameter.has_fc_value is (refreshed_value is not None)
+            assert parameter.fc_value_as_string == ("2" if refreshed_value is not None else "N/A")
+            assert parameter.value_as_string == str(int(new_value))
+            assert parameter.change_reason == "Keep this reason"
+            assert table.options.skip_when_no_differences
+            skip.assert_not_called()
+            if new_value != refreshed_value:
+                expected_text = "2" if refreshed_value is not None else "N/A"
+                assert str(table.view_port.grid_slaves(row=1, column=2)[0].cget("text")) == expected_text
+        finally:
+            table.destroy()
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_user_can_close_bitmask_editor_after_recovery_repaints_rows(
+    monitored_editor: ParameterEditorWindow, root: tk.Tk, platform: str
+) -> None:
+    """
+    Checkbox edits remain usable after a recovery repaint.
+
+    GIVEN a bitmask dialog opened during recovery with unsaved checkbox edits
+    WHEN recovery repaints the table before the user closes the dialog
+    THEN the dialog closes and its saved value appears in the replacement row.
+    """
+    editor = monitored_editor
+    parameter = ArduPilotParameter(
+        "TEST_OPTIONS", Par(1, "Keep this reason"), metadata={"Bitmask": {0: "First", 1: "Second"}}, fc_value=1
+    )
+    parameters = {parameter.name: parameter}
+    editor.parameter_editor.current_step_parameters = parameters
+    editor.parameter_editor.flight_controller.fc_parameters = {parameter.name: 3}
+    editor.parameter_editor.update_parameter_object.side_effect = ParameterEditor.update_parameter_object
+    with patch(
+        "ardupilot_methodic_configurator.frontend_tkinter_parameter_editor_table.UsagePopupWindow.should_display",
+        return_value=False,
+    ):
+        table = ParameterEditorTable(root, editor.parameter_editor, editor, parameters=parameters)
+        editor.parameter_editor_table = table
+        table.repopulate_table(show_only_differences=False, gui_complexity=editor.gui_complexity)
+        entry = table._new_value_widgets[parameter.name]
+        difference_label = table._value_is_different_labels[parameter.name]
+        reason_entry = cast("ttk.Entry", table.view_port.grid_slaves(row=1, column=7)[0])
+        event = tk.Event()
+        event.widget = entry
+
+        def recover_and_close(window: tk.Toplevel) -> None:
+            checkbox = cast("ttk.Checkbutton", window.winfo_children()[0].winfo_children()[1])
+            checkbox.invoke()
+            # Exercise stale-row cleanup directly: real recovery defers while this dialog is open.
+            editor._finish_connection_recovery()
+            assert not entry.winfo_exists()
+            assert not reason_entry.winfo_exists()
+            window.tk.call(window.protocol("WM_DELETE_WINDOW"))
+            assert not window.winfo_exists()
+
+        try:
+            with (
+                patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_editor_table.sys_platform", platform),
+                patch.object(table, "_center_and_focus_window"),
+                patch.object(tk.Misc, "update_idletasks"),
+                patch.object(tk.Misc, "wait_window", autospec=True, side_effect=recover_and_close),
+            ):
+                table._open_bitmask_selection_window(event, parameter, reason_entry, difference_label)
+            assert parameter.value_as_string == "3"
+            assert parameter.change_reason == "Keep this reason"
+            assert table._new_value_widgets[parameter.name].get() == "3"
+            assert table._value_is_different_labels[parameter.name].cget("text") == " "
+        finally:
+            table.destroy()
+
+
+def test_recovery_retries_plugin_enabled_by_component_edit(monitored_editor: ParameterEditorWindow, root: tk.Tk) -> None:
+    """
+    Recovery replaces a connection placeholder with the newly enabled plugin.
+
+    GIVEN a component edit enables a plugin while recovery has no FC parameter cache
+    WHEN the connection recovers and its parameter cache is available again
+    THEN the placeholder is replaced by the plugin without navigating to another step.
+    """
+    editor = monitored_editor
+    plugin = {"name": "esc_rpm_scale", "placement": "left"}
+    editor.inline_component_editor = MagicMock()
+    editor.inline_component_editor.get_component_data.return_value = {"Components": {"ESC": {}}}
+    editor.parameter_editor.get_plugin.return_value = plugin
+    editor.parameter_editor.create_plugin_data_model.return_value = None
+    editor.parameter_editor.current_step_parameters = {}
+    editor.parameter_editor.flight_controller.fc_parameters = {}
+    editor.main_frame = ttk.Frame(root)
+    editor.parameter_area_container = ttk.Frame(editor.main_frame)
+    plugin_view = MagicMock()
+    try:
+        with (
+            patch.object(parameter_editor_module.plugin_factory, "is_registered", return_value=True),
+            patch.object(parameter_editor_module.plugin_factory, "create", return_value=plugin_view),
+        ):
+            editor._on_component_data_changed()
+            parent = editor.parameter_area_paned.nametowidget(editor.parameter_area_paned.panes()[0])
+            placeholder = parent.winfo_children()[0]
+            assert editor.current_plugin == plugin
+            assert editor.current_plugin_view is None
+            editor.parameter_editor.create_plugin_data_model.return_value = object()
+            editor.parameter_editor.flight_controller.fc_parameters = {"TEST_OPTIONS": 3}
+            editor._connection_recovery._state = RecoveryState.RECOVERING
+            editor._connection_recovery._worker = MagicMock()
+            editor._connection_recovery._worker.is_alive.return_value = False
+            editor._connection_recovery.check()
+
+        assert not placeholder.winfo_exists()
+        assert editor.current_plugin_view is plugin_view
+        plugin_view.on_activate.assert_called_once()
+    finally:
+        editor.main_frame.destroy()
+
+
+@pytest.mark.parametrize("owner_gone", ["plugin", "window"])
+def test_recovery_does_not_resume_a_replaced_plugin(monitored_editor: ParameterEditorWindow, owner_gone: str) -> None:
+    """GIVEN a paused plugin, WHEN its owner is replaced or destroyed before recovery finishes, THEN it stays stopped."""
+    editor = monitored_editor
+    plugin = MagicMock()
+    editor.current_plugin_view = plugin
+    resume = editor._pause_connection_plugin()
+    assert resume is not None
+    if owner_gone == "plugin":
+        editor.current_plugin_view = MagicMock()
+    else:
+        editor.root.winfo_exists.return_value = False
+    resume()
+    plugin.on_resume.assert_not_called()
+
+
+def test_close_during_recovery_keeps_tk_responsive_until_worker_yields(monitored_editor: ParameterEditorWindow) -> None:
+    """GIVEN a blocked connection attempt, WHEN closing, THEN Tk schedules completion and keeps the FC locked meanwhile."""
+    editor = monitored_editor
+    worker = MagicMock()
+    editor._connection_recovery._worker = worker
+    editor._connection_recovery._unlock = editor._lock_connection_plugin(editor._connection_recovery)
+    editor.close_connection_and_quit()
+    editor.close_connection_and_quit()
+    editor.close_connection_and_quit()
+    editor.root.after.assert_called_once_with(50, editor._finish_pending_close)
+    worker.join.assert_not_called()
+    assert editor.navigation_lock.locked
+    editor.root.quit.assert_not_called()
+    worker.is_alive.return_value = False
+    retry = editor.root.after.call_args.args[1]
+    retry()
+    editor.close_connection_and_quit()
+    assert not editor.navigation_lock.locked
+    editor.root.quit.assert_called_once()
+    editor.parameter_editor.handle_write_changes_workflow.assert_called_once()
+
+
+def test_inspector_disables_plugin_controls_without_a_modal_grab(monitored_editor: ParameterEditorWindow, root: tk.Tk) -> None:
+    """GIVEN macOS permits input outside the inspector, WHEN it opens, THEN plugin controls stay disabled until it closes."""
+    editor = monitored_editor
+    plugin = ttk.Frame(root)
+    button = ttk.Button(plugin, text="Start motor")
+    editor.current_plugin_view = cast("PluginView", plugin)
+
+    def wait(_window: object) -> None:
+        assert button.instate(("disabled",))
+        assert editor.navigation_lock.locked
+
+    editor.root.wait_window.side_effect = wait
+    with patch.object(parameter_editor_module, "open_mavlink_inspector_window"):
+        try:
+            editor.on_mavlink_inspector_click()
+            assert not button.instate(("disabled",))
+            assert not editor.navigation_lock.locked
+        finally:
+            plugin.destroy()

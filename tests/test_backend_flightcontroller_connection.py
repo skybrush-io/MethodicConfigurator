@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from time import time as real_time
 from typing import TYPE_CHECKING, NoReturn, Optional
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import serial.tools.list_ports_common
@@ -41,6 +41,9 @@ from ardupilot_methodic_configurator.backend_flightcontroller_factory_serial imp
 from ardupilot_methodic_configurator.data_model_flightcontroller_info import FlightControllerInfo
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
+
     from ardupilot_methodic_configurator.backend_flightcontroller_protocols import MavlinkConnection
 
 # pylint: disable=protected-access, too-many-lines
@@ -898,7 +901,7 @@ class TestConnectionErrorHandling:
         class ExplodingFactory(SystemMavlinkConnectionFactory):  # pylint: disable=too-few-public-methods
             """MAVLink factory that always raises ConnectionError."""
 
-            def create(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+            def create(
                 self,
                 device: str,
                 baudrate: int,
@@ -1253,6 +1256,51 @@ class TestFlightControllerConnectionLinuxSoftlink:
 class TestFlightControllerConnectionVehicleDetection:
     """Test vehicle detection methods including edge cases."""
 
+    def test_reconnect_heartbeat_detection_stops_after_first_vehicle(self) -> None:
+        """Reset reconnects do not wait out the full detection timeout after a heartbeat arrives."""
+        connection = FlightControllerConnection(info=FlightControllerInfo())
+        heartbeat = Mock()
+        heartbeat.get_srcSystem.return_value = 1
+        heartbeat.get_srcComponent.return_value = 1
+        heartbeat.autopilot = mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA
+        heartbeat.type = mavutil.mavlink.MAV_TYPE_QUADROTOR
+        connection.master = Mock()
+        connection.master.recv_match.return_value = heartbeat
+
+        with patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.time_time",
+            side_effect=[0.0, 0.0],
+        ):
+            detected = connection._detect_vehicles_from_heartbeats(5, return_after_first_heartbeat=True)
+
+        assert detected == {(1, 1): heartbeat}
+        connection.master.recv_match.assert_called_once_with(type="HEARTBEAT", blocking=False)
+
+    def test_reconnect_heartbeat_detection_skips_unsupported_components(self) -> None:
+        """Reconnect keeps polling until it receives an ArduPilot heartbeat."""
+        connection = FlightControllerConnection(info=FlightControllerInfo())
+        unsupported = Mock()
+        unsupported.get_srcSystem.return_value = 1
+        unsupported.get_srcComponent.return_value = 190
+        unsupported.autopilot = mavutil.mavlink.MAV_AUTOPILOT_INVALID
+        unsupported.type = mavutil.mavlink.MAV_TYPE_GIMBAL
+        supported = Mock()
+        supported.get_srcSystem.return_value = 1
+        supported.get_srcComponent.return_value = 1
+        supported.autopilot = mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA
+        supported.type = mavutil.mavlink.MAV_TYPE_QUADROTOR
+        connection.master = Mock()
+        connection.master.recv_match.side_effect = [unsupported, supported]
+
+        with patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.time_time",
+            side_effect=[0.0, 0.0, 0.0],
+        ):
+            detected = connection._detect_vehicles_from_heartbeats(5, return_after_first_heartbeat=True)
+
+        assert detected == {(1, 190): unsupported, (1, 1): supported}
+        assert connection.master.recv_match.call_count == 2
+
     def test_detect_vehicles_handles_type_error_from_pymavlink(self) -> None:
         """
         _detect_vehicles_from_heartbeats continues polling after pymavlink TypeError.
@@ -1376,48 +1424,21 @@ class TestFlightControllerConnectionBannerMethods:
         connection._request_banner()  # Must not raise
 
     def test_receive_banner_text_collects_statustext_messages(self) -> None:
-        """
-        _receive_banner_text collects STATUS_TEXT messages until timeout.
-
-        GIVEN: A connection with a mock master that returns STATUS_TEXT messages
-        WHEN: _receive_banner_text() is called
-        THEN: All returned STATUS_TEXT text values should be collected in a list
-        AND: The list should be returned after timeout
-        """
+        """GIVEN banner packets, WHEN received, THEN complete text appears only in the banner."""
         connection = FlightControllerConnection(info=FlightControllerInfo())
-        mock_master = Mock()
-
-        msg1 = Mock()
-        msg1.text = "ArduCopter V4.5.0"
-        msg2 = Mock()
-        msg2.text = "ChibiOS: abc1234"
-
-        call_count = 0
-
-        def recv_match_side_effect(**_kwargs) -> Mock | None:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return msg1
-            if call_count == 2:
-                return msg2
-            return None
-
-        mock_master.recv_match = recv_match_side_effect
-        connection.master = mock_master
-
-        start = real_time()
+        master = FakeMavlinkConnectionFactory().create("fake", DEFAULT_BAUDRATE)
+        connection.set_master_for_testing(master)
+        for text in ("ArduCopter V4.5.0", "ChibiOS: abc1234"):
+            message = Mock(text=text)
+            message.get_type.return_value = "STATUSTEXT"
+            master.add_message(message)
         with (
-            patch(
-                "ardupilot_methodic_configurator.backend_flightcontroller_connection.time_time",
-                side_effect=[start, start, start, start + 9999],
-            ),
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_time", side_effect=[0, 0, 2]),
             patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_sleep"),
         ):
-            banner_msgs = connection._receive_banner_text()
-
-        assert "ArduCopter V4.5.0" in banner_msgs
-        assert "ChibiOS: abc1234" in banner_msgs
+            banner = connection._receive_banner_text()
+        assert banner == ["ArduCopter V4.5.0", "ChibiOS: abc1234"]
+        assert connection.status_text_buffer == []
 
     def test_receive_banner_text_returns_empty_list_without_master(self) -> None:
         """
@@ -1431,34 +1452,6 @@ class TestFlightControllerConnectionBannerMethods:
         assert connection.master is None
         result = connection._receive_banner_text()
         assert not result
-
-    def test_receive_banner_text_retains_banner_without_reset_capture(self) -> None:
-        """The latest banner is retained even when no reset capture is active."""
-        connection = FlightControllerConnection(info=FlightControllerInfo())
-        mock_master = Mock()
-        msg = Mock()
-        msg.text = "ArduCopter V4.5.0"
-        call_count = 0
-
-        def recv_match_side_effect(**_kwargs) -> Mock | None:
-            nonlocal call_count
-            call_count += 1
-            return msg if call_count == 1 else None
-
-        mock_master.recv_match = recv_match_side_effect
-        connection.master = mock_master
-
-        start = real_time()
-        with (
-            patch(
-                "ardupilot_methodic_configurator.backend_flightcontroller_connection.time_time",
-                side_effect=[start, start, start, start + 9999],
-            ),
-            patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_sleep"),
-        ):
-            connection._receive_banner_text()
-
-        assert connection.banner_text_buffer == ["ArduCopter V4.5.0"]
 
     def test_request_message_calls_command_long_send_when_master_is_set(self) -> None:
         """
@@ -1826,6 +1819,246 @@ class TestFlightControllerConnectionProcessAutopilotVersion:
 class TestFlightControllerConnectionRetry:
     """Test create_connection_with_retry edge cases."""
 
+    def test_create_connection_retries_when_usb_port_is_not_ready_after_reboot(self) -> None:
+        """
+        Reconnection retries a transient serial-port-open failure.
+
+        GIVEN: A USB flight controller whose COM port is not yet available
+        WHEN: The first connection attempt fails and the second succeeds
+        THEN: The connection should succeed without reporting an error
+        """
+        master = Mock()
+
+        class DelayedPortFactory(MavlinkConnectionFactory):  # pylint: disable=too-few-public-methods, missing-class-docstring
+            def __init__(self) -> None:
+                self.calls = 0
+                self.retries: list[int] = []
+
+            def create(self, device, baudrate=115200, timeout=5.0, retries=3, progress_callback=None) -> Mock:  # type: ignore[override]
+                self.calls += 1
+                self.retries.append(retries)
+                if self.calls == 1:
+                    error_message = "COM31 is temporarily unavailable"
+                    raise ConnectionError(error_message)
+                return master
+
+        factory = DelayedPortFactory()
+        connection = FlightControllerConnection(
+            info=FlightControllerInfo(),
+            mavlink_connection_factory=factory,
+        )
+        connection.comport = mavutil.SerialPort(device="COM31", description="ArduPilot MAVLink")
+        reconnect_progress = Mock()
+
+        with (
+            patch.object(connection, "_detect_vehicles_from_heartbeats", return_value={(1, 1): Mock()}),
+            patch.object(connection, "_select_supported_autopilot", return_value=""),
+            patch.object(connection, "_retrieve_autopilot_version_and_banner", return_value=""),
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_sleep") as mock_sleep,
+        ):
+            result = connection.create_connection_with_retry(
+                progress_callback=None,
+                retries=3,
+                timeout=1,
+                reconnect_progress_callback=reconnect_progress,
+            )
+
+        assert result == ""
+        assert factory.calls == 2
+        assert factory.retries == [1, 1]
+        mock_sleep.assert_called_once_with(connection.CONNECTION_RETRY_DELAY)
+        assert connection.master is master
+        assert reconnect_progress.call_args_list == [
+            call(30, 100),
+            call(50, 100),
+            call(90, 100),
+            call(100, 100),
+        ]
+
+    def test_normal_connection_keeps_pymavlink_retry_count_without_outer_retries(self) -> None:
+        """Normal connections make one factory call and leave retry handling to PyMAVLink."""
+        master = Mock()
+        factory = Mock(return_value=master)
+        connection = FlightControllerConnection(info=FlightControllerInfo())
+        connection.comport = mavutil.SerialPort(device="COM31", description="ArduPilot MAVLink")
+        connection._create_mavlink_connection = factory  # type: ignore[method-assign]
+
+        with (
+            patch.object(connection, "_detect_vehicles_from_heartbeats", return_value={(1, 1): Mock()}),
+            patch.object(connection, "_select_supported_autopilot", return_value=""),
+            patch.object(connection, "_retrieve_autopilot_version_and_banner", return_value=""),
+        ):
+            result = connection.create_connection_with_retry(progress_callback=None, retries=3, timeout=1)
+
+        assert result == ""
+        factory.assert_called_once_with(
+            device="COM31",
+            baudrate=115200,
+            timeout=1,
+            retries=3,
+            progress_callback=None,
+        )
+
+    def test_reconnect_retries_only_after_a_missing_heartbeat(self) -> None:
+        """A reset reconnect retries the next port-open attempt when the first heartbeat times out."""
+        first_master = Mock()
+        second_master = Mock()
+        factory = Mock(side_effect=[first_master, second_master])
+        connection = FlightControllerConnection(info=FlightControllerInfo())
+        connection.comport = mavutil.SerialPort(device="COM31", description="ArduPilot MAVLink")
+        connection._create_mavlink_connection = factory  # type: ignore[method-assign]
+
+        with (
+            patch.object(connection, "_detect_vehicles_from_heartbeats", side_effect=[{}, {(1, 1): Mock()}]),
+            patch.object(
+                connection,
+                "_select_supported_autopilot",
+                side_effect=["No MAVLink heartbeat received, connection failed.", ""],
+            ),
+            patch.object(connection, "_retrieve_autopilot_version_and_banner", return_value=""),
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_sleep") as mock_sleep,
+        ):
+            result = connection.create_connection_with_retry(
+                progress_callback=None,
+                retries=3,
+                timeout=1,
+                reconnect_progress_callback=Mock(),
+            )
+
+        assert result == ""
+        assert factory.call_count == 2
+        first_master.close.assert_called_once()
+        mock_sleep.assert_called_once_with(connection.CONNECTION_RETRY_DELAY)
+
+    def test_reconnect_without_progress_callback_retries_transient_port_errors(self) -> None:
+        """Headless reset reconnects retain the same retry behavior as UI reconnects."""
+        master = Mock()
+        factory = Mock(side_effect=[ConnectionError("COM31 is temporarily unavailable"), master])
+        connection = FlightControllerConnection(info=FlightControllerInfo())
+        connection.comport = mavutil.SerialPort(device="COM31", description="ArduPilot MAVLink")
+        connection._create_mavlink_connection = factory  # type: ignore[method-assign]
+
+        with (
+            patch.object(connection, "_detect_vehicles_from_heartbeats", return_value={(1, 1): Mock()}),
+            patch.object(connection, "_select_supported_autopilot", return_value=""),
+            patch.object(connection, "_retrieve_autopilot_version_and_banner", return_value=""),
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_sleep") as mock_sleep,
+        ):
+            result = connection.create_connection_with_retry(
+                progress_callback=None,
+                retries=3,
+                timeout=1,
+                is_reconnect=True,
+            )
+
+        assert result == ""
+        assert factory.call_count == 2
+        assert [call.kwargs["retries"] for call in factory.call_args_list] == [1, 1]
+        mock_sleep.assert_called_once_with(connection.CONNECTION_RETRY_DELAY)
+
+    def test_reconnect_uses_the_new_serial_device_after_usb_reenumeration(self) -> None:
+        """An auto-detected FC reconnects after Windows assigns a new COM port."""
+        old_port = serial.tools.list_ports_common.ListPortInfo("COM31")
+        old_port.serial_number = "FC123"
+        new_port = serial.tools.list_ports_common.ListPortInfo("COM42")
+        new_port.serial_number = "FC123"
+        master = Mock()
+        factory = Mock(return_value=master)
+        discovery = FakeSerialPortDiscovery()
+        discovery._ports = [new_port]  # pylint: disable=protected-access
+        connection = FlightControllerConnection(
+            info=FlightControllerInfo(),
+            serial_port_discovery=discovery,
+        )
+        connection.comport = old_port
+        connection._create_mavlink_connection = factory  # type: ignore[method-assign]
+
+        with (
+            patch.object(connection, "_detect_vehicles_from_heartbeats", side_effect=[{}, {(1, 1): Mock()}]),
+            patch.object(
+                connection,
+                "_select_supported_autopilot",
+                side_effect=["No MAVLink heartbeat received, connection failed.", ""],
+            ),
+            patch.object(connection, "_retrieve_autopilot_version_and_banner", return_value=""),
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_sleep"),
+        ):
+            result = connection.create_connection_with_retry(
+                progress_callback=None,
+                retries=3,
+                timeout=1,
+                reconnect_progress_callback=Mock(),
+            )
+
+        assert result == ""
+        assert [call.kwargs["device"] for call in factory.call_args_list] == ["COM31", "COM42"]
+
+    def test_reconnect_retries_when_heartbeat_has_no_supported_autopilot(self) -> None:
+        """Reconnects retry when a reboot temporarily exposes only an unsupported MAVLink device."""
+        first_master = Mock()
+        second_master = Mock()
+        factory = Mock(side_effect=[first_master, second_master])
+        connection = FlightControllerConnection(info=FlightControllerInfo())
+        connection.comport = mavutil.SerialPort(device="COM31", description="ArduPilot MAVLink")
+        connection._create_mavlink_connection = factory  # type: ignore[method-assign]
+
+        with (
+            patch.object(connection, "_detect_vehicles_from_heartbeats", side_effect=[{(1, 1): Mock()}, {(2, 1): Mock()}]),
+            patch.object(
+                connection,
+                "_select_supported_autopilot",
+                side_effect=["No supported autopilots found", ""],
+            ),
+            patch.object(connection, "_retrieve_autopilot_version_and_banner", return_value=""),
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_sleep") as mock_sleep,
+        ):
+            result = connection.create_connection_with_retry(
+                progress_callback=None,
+                retries=3,
+                timeout=1,
+                reconnect_progress_callback=Mock(),
+            )
+
+        assert result == ""
+        assert factory.call_count == 2
+        mock_sleep.assert_called_once_with(connection.CONNECTION_RETRY_DELAY)
+
+    @pytest.mark.parametrize(
+        ("detected_vehicles", "selection_error", "version_error"),
+        [
+            ({(1, 1): Mock()}, "", "No AUTOPILOT_VERSION MAVLink message received"),
+        ],
+    )
+    def test_reconnect_does_not_retry_after_a_heartbeat(
+        self,
+        detected_vehicles: dict[tuple[int, int], Mock],
+        selection_error: str,
+        version_error: str,
+    ) -> None:
+        """Failed handshakes after a heartbeat are reported without reconnect retries."""
+        master = Mock()
+        factory = Mock(return_value=master)
+        connection = FlightControllerConnection(info=FlightControllerInfo())
+        connection.comport = mavutil.SerialPort(device="COM31", description="ArduPilot MAVLink")
+        connection._create_mavlink_connection = factory  # type: ignore[method-assign]
+
+        with (
+            patch.object(connection, "_detect_vehicles_from_heartbeats", return_value=detected_vehicles),
+            patch.object(connection, "_select_supported_autopilot", return_value=selection_error),
+            patch.object(connection, "_retrieve_autopilot_version_and_banner", return_value=version_error),
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_sleep") as mock_sleep,
+        ):
+            result = connection.create_connection_with_retry(
+                progress_callback=None,
+                retries=3,
+                timeout=1,
+                reconnect_progress_callback=Mock(),
+            )
+
+        assert result == (selection_error or version_error)
+        factory.assert_called_once()
+        mock_sleep.assert_not_called()
+
     def test_create_connection_udp_device_logs_without_baudrate(self) -> None:
         """
         create_connection_with_retry logs UDP/TCP info without baud rate.
@@ -1864,9 +2097,7 @@ class TestFlightControllerConnectionRetry:
         master = Mock()
 
         class MasterFactory(MavlinkConnectionFactory):  # pylint: disable=too-few-public-methods, missing-class-docstring
-            def create(  # pylint: disable=too-many-arguments, too-many-positional-arguments
-                self, device, baudrate=115200, timeout=5.0, retries=3, progress_callback=None
-            ) -> Mock:  # type: ignore[override]
+            def create(self, device, baudrate=115200, timeout=5.0, retries=3, progress_callback=None) -> Mock:  # type: ignore[override]
                 return master
 
         connection = FlightControllerConnection(
@@ -1882,6 +2113,27 @@ class TestFlightControllerConnectionRetry:
         master.close.assert_called_once()
         assert connection.master is None
 
+    def test_create_connection_registers_status_text_capture_hook(self) -> None:
+        """The production connection path installs the STATUSTEXT packet hook."""
+        master = Mock()
+        master.message_hooks = []
+        connection = FlightControllerConnection(
+            info=FlightControllerInfo(),
+            mavlink_connection_factory=FakeMavlinkConnectionFactory(),
+        )
+        connection.comport = mavutil.SerialPort(device="/dev/ttyACM0", description="Test")
+
+        with (
+            patch.object(connection, "_create_mavlink_connection", return_value=master),
+            patch.object(connection, "_detect_vehicles_from_heartbeats", return_value={(1, 1): Mock()}),
+            patch.object(connection, "_select_supported_autopilot", return_value=""),
+            patch.object(connection, "_retrieve_autopilot_version_and_banner", return_value=""),
+        ):
+            result = connection.create_connection_with_retry(progress_callback=None, retries=1, timeout=1)
+
+        assert result == ""
+        assert connection._capture_status_text in master.message_hooks
+
     def test_create_connection_with_retry_raises_connection_error_when_master_is_none(self) -> None:
         """
         create_connection_with_retry raises ConnectionError when factory returns None.
@@ -1892,9 +2144,7 @@ class TestFlightControllerConnectionRetry:
         """
 
         class NullFactory(MavlinkConnectionFactory):  # pylint: disable=too-few-public-methods, missing-class-docstring
-            def create(  # pylint: disable=too-many-arguments, too-many-positional-arguments
-                self, device, baudrate=115200, timeout=5.0, retries=3, progress_callback=None
-            ) -> None:  # type: ignore[override]
+            def create(self, device, baudrate=115200, timeout=5.0, retries=3, progress_callback=None) -> None:  # type: ignore[override]
                 return None
 
         connection = FlightControllerConnection(
@@ -1917,9 +2167,7 @@ class TestFlightControllerConnectionRetry:
         """
 
         class NullFactory(MavlinkConnectionFactory):  # pylint: disable=too-few-public-methods, missing-class-docstring
-            def create(  # pylint: disable=too-many-arguments, too-many-positional-arguments
-                self, device, baudrate=115200, timeout=5.0, retries=3, progress_callback=None
-            ) -> None:  # type: ignore[override]
+            def create(self, device, baudrate=115200, timeout=5.0, retries=3, progress_callback=None) -> None:  # type: ignore[override]
                 return None
 
         connection = FlightControllerConnection(
@@ -1947,9 +2195,7 @@ class TestFlightControllerConnectionRetry:
         """
 
         class PermErrorFactory(MavlinkConnectionFactory):  # pylint: disable=too-few-public-methods, missing-class-docstring
-            def create(  # pylint: disable=too-many-arguments, too-many-positional-arguments
-                self, device, baudrate=115200, timeout=5.0, retries=3, progress_callback=None
-            ) -> NoReturn:
+            def create(self, device, baudrate=115200, timeout=5.0, retries=3, progress_callback=None) -> NoReturn:
                 err_msg = "Permission denied"
                 raise PermissionError(err_msg)
 
@@ -2301,6 +2547,22 @@ class TestFlightControllerConnectionProgressCallbacks:
         # Assert: Serial detection progress received (10%, 25%)
         assert any(current >= 10 for current, _ in progress_updates)
 
+    def test_autodetection_prefers_mavlink_endpoint_then_falls_back(self) -> None:
+        """Prefer the second of two endpoints, then try the first if needed."""
+        connection = FlightControllerConnection(info=FlightControllerInfo(), network_ports=[])
+        endpoints = [
+            mavutil.SerialPort(device="/dev/ttyACM1", description="CubeOrange+"),
+            mavutil.SerialPort(device="/dev/ttyACM2", description="CubeOrange+"),
+        ]
+        with (
+            patch.object(connection, "_auto_detect_serial", return_value=endpoints),
+            patch.object(connection, "_register_and_try_connect", side_effect=["no heartbeat", ""]) as try_connect,
+        ):
+            result = connection.connect(device="")
+
+        assert result == ""
+        assert [call.kwargs["comport"].device for call in try_connect.call_args_list] == ["/dev/ttyACM2", "/dev/ttyACM1"]
+
     def test_connect_reports_progress_during_network_port_attempts(self) -> None:
         """
         Connect reports progress during network port connection attempts.
@@ -2498,16 +2760,17 @@ class TestFlightControllerConnectionRegisterAndTryConnect:  # pylint: disable=to
 class TestFlightControllerConnectionAutoDetectWithMavlink:
     """Tests for _auto_detect_serial when connection tuples have 'mavlink' description."""
 
-    def test_single_mavlink_port_returns_directly(self) -> None:
+    def test_single_mavlink_port_keeps_other_ports_as_fallback(self) -> None:
         """
-        _auto_detect_serial returns single mavlink port without calling auto_detect_serial.
+        A single MAVLink-described connection retains serial fallback candidates.
 
         GIVEN: A connection with exactly one entry having 'mavlink' in description
         WHEN: _auto_detect_serial is called
-        THEN: That single port should be returned directly (not via mavutil.auto_detect_serial)
+        THEN: That connection should be tried first and the other port should remain available
         """
         connection = FlightControllerConnection(
             info=FlightControllerInfo(),
+            serial_port_discovery=FakeSerialPortDiscovery(),
             mavlink_connection_factory=FakeMavlinkConnectionFactory(),
         )
         # Pre-populate with a single mavlink-described port
@@ -2517,26 +2780,24 @@ class TestFlightControllerConnectionAutoDetectWithMavlink:
         ]
 
         with patch(
-            "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial"
-        ) as mock_auto_detect:
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial",
+            return_value=[mavutil.SerialPort(device="COM3", description="Unknown")],
+        ):
             result = connection._auto_detect_serial()
 
-        # auto_detect_serial should NOT have been called
-        mock_auto_detect.assert_not_called()
-        assert result is not None
-        assert len(result) == 1
-        assert result[0].device == "udp:127.0.0.1:14550"
+        assert [port.device for port in reversed(result)] == ["udp:127.0.0.1:14550", "COM3"]
 
-    def test_multiple_mavlink_ports_falls_through_to_autodetect(self) -> None:
+    def test_multiple_mavlink_connections_are_retained_with_discovered_ports(self) -> None:
         """
-        _auto_detect_serial falls through to mavutil.auto_detect_serial when >1 mavlink port.
+        Multiple MAVLink-described connections are retained alongside discovered ports.
 
         GIVEN: A connection with 2+ entries having 'mavlink' in description
         WHEN: _auto_detect_serial is called
-        THEN: mavutil.auto_detect_serial should be called for hardware detection
+        THEN: All known connections and the discovered serial port should remain available
         """
         connection = FlightControllerConnection(
             info=FlightControllerInfo(),
+            serial_port_discovery=FakeSerialPortDiscovery(),
             mavlink_connection_factory=FakeMavlinkConnectionFactory(),
         )
         connection._connection_tuples = [
@@ -2551,11 +2812,480 @@ class TestFlightControllerConnectionAutoDetectWithMavlink:
         with patch(
             "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial",
             return_value=mock_ports,
-        ) as mock_auto_detect:
+        ):
             result = connection._auto_detect_serial()
 
-        mock_auto_detect.assert_called_once()
-        assert result == mock_ports
+        assert {port.device for port in result} == {"udp:127.0.0.1:14550", "tcp:192.168.1.1:5760", "/dev/ttyUSB0"}
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("description", "USB Serial Device CubeOrange+"),
+            ("manufacturer", "CubePilot"),
+            ("product", "CubeOrange+"),
+        ],
+    )
+    def test_known_fc_names_in_pyserial_metadata_are_merged_on_any_platform(self, field: str, value: str) -> None:
+        """Known FC metadata should retain devices omitted by path-only PyMAVLink matching."""
+        discovery = FakeSerialPortDiscovery()
+        fc_port = serial.tools.list_ports_common.ListPortInfo("COM7")
+        fc_port.description = "USB Serial Device"
+        fc_port.manufacturer = "Unknown"
+        fc_port.product = "Unknown"
+        setattr(fc_port, field, value)
+        discovery._ports.append(fc_port)
+        connection = FlightControllerConnection(
+            info=FlightControllerInfo(),
+            serial_port_discovery=discovery,
+            mavlink_connection_factory=FakeMavlinkConnectionFactory(),
+        )
+        pymavlink_port = mavutil.SerialPort(device="COM3", description="USB Serial Device")
+
+        with patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial",
+            return_value=[pymavlink_port],
+        ):
+            result = connection._auto_detect_serial()
+
+        assert {port.device for port in result} == {"COM3", "COM7"}
+
+    def test_by_id_symlink_is_not_duplicated_with_resolved_tty_path(self, tmp_path: Path) -> None:
+        """A PyMAVLink by-id link and its PySerial tty target are one physical port."""
+        tty_path = tmp_path / "ttyACM0"
+        tty_path.touch()
+        by_id_path = tmp_path / "serial" / "by-id" / "flight-controller"
+        by_id_path.parent.mkdir(parents=True)
+        try:
+            by_id_path.symlink_to(tty_path)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                pytest.skip("Creating symbolic links requires Windows Developer Mode or elevated privileges")
+            raise
+
+        discovery = FakeSerialPortDiscovery()
+        fc_port = serial.tools.list_ports_common.ListPortInfo(str(tty_path))
+        fc_port.manufacturer = "CubePilot"
+        discovery._ports.append(fc_port)
+        connection = FlightControllerConnection(
+            info=FlightControllerInfo(),
+            serial_port_discovery=discovery,
+            mavlink_connection_factory=FakeMavlinkConnectionFactory(),
+        )
+        pymavlink_port = mavutil.SerialPort(device=str(by_id_path), description="CubePilot")
+
+        with patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial",
+            return_value=[pymavlink_port],
+        ):
+            result = connection._auto_detect_serial()
+
+        assert [port.device for port in result] == [str(by_id_path)]
+
+    def test_known_vid_pid_is_matched_even_without_recognizable_metadata(self) -> None:
+        """Known USB IDs identify FCs even when the OS supplies generic text fields."""
+        discovery = FakeSerialPortDiscovery()
+        fc_port = serial.tools.list_ports_common.ListPortInfo("COM7")
+        fc_port.vid = 0x2DAE
+        fc_port.pid = 0x1058
+        fc_port.description = "USB Serial Device"
+        fc_port.manufacturer = "Unknown"
+        fc_port.product = "Unknown"
+        discovery._ports.append(fc_port)
+        connection = FlightControllerConnection(
+            info=FlightControllerInfo(),
+            serial_port_discovery=discovery,
+            mavlink_connection_factory=FakeMavlinkConnectionFactory(),
+        )
+
+        with patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial",
+            return_value=[],
+        ):
+            result = connection._auto_detect_serial()
+
+        assert [port.device for port in result] == ["COM7"]
+
+
+@pytest.fixture(name="usb_autodetect_connection")
+def fixture_usb_autodetect_connection() -> Iterator[FlightControllerConnection]:
+    """Supply USB metadata while preventing any real serial-port opening."""
+    discovery = FakeSerialPortDiscovery()
+    port_metadata: list[tuple[str, int | None, int | None, str]] = [
+        ("COM11", None, None, "Unknown device"),
+        ("COM7", 0x0403, 0x6001, "USB Serial Port"),
+        ("COM9", None, None, "MatekH743"),
+        ("COM2", 0x2DAE, 0x1058, "USB Serial Device"),
+        ("COM10", 0x10C4, 0xEA60, "USB Serial Port"),
+    ]
+    for device, vid, pid, description in port_metadata:
+        port = serial.tools.list_ports_common.ListPortInfo(device)
+        port.vid, port.pid, port.description = vid, pid, description
+        discovery._ports.append(port)
+    connection = FlightControllerConnection(info=FlightControllerInfo(), serial_port_discovery=discovery, network_ports=[])
+    with (
+        patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial", return_value=[]
+        ),
+        patch("serial.Serial", side_effect=AssertionError("Enumeration must not open a serial port")),
+        patch("pymavlink.mavutil.mavlink_connection", side_effect=AssertionError("Enumeration must not connect")),
+    ):
+        yield connection
+
+
+@pytest.fixture(name="bluetooth_timeout_connection")
+def fixture_bluetooth_timeout_connection(
+    usb_autodetect_connection: FlightControllerConnection,
+) -> Iterator[FlightControllerConnection]:
+    """Reproduce WinError 121 on COM6 alone, allowing Cube paths to resolve."""
+    discovery = FakeSerialPortDiscovery()
+    discovery.add_port("COM6", "Standard Serial over Bluetooth link (COM6)")
+    discovery.add_port("COM27", "Cube Orange+ SLCAN (COM27)")
+    discovery.add_port("COM28", "Cube Orange+ Mavlink (COM28)")
+    for port in discovery._ports[1:]:
+        port.vid, port.pid = 0x2DAE, 0x1058
+    usb_autodetect_connection._serial_port_discovery = discovery
+    usb_autodetect_connection.discover_connections()
+    cube_ports = [mavutil.SerialPort(device=port.device, description=port.description) for port in discovery._ports[1:]]
+
+    def resolve_device(device: str) -> str:
+        """Only the unrelated Bluetooth endpoint raises the reported Windows error."""
+        if device == "COM6":
+            raise OSError(0, "The semaphore timeout period has expired", r"\\.\COM6", 121)
+        return device
+
+    with (
+        patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.os_name", "nt"),
+        patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.os_path.realpath",
+            side_effect=resolve_device,
+        ),
+        patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial",
+            return_value=cube_ports,
+        ),
+    ):
+        yield usb_autodetect_connection
+
+
+class TestFlightControllerConnectionUsbCandidateRanking:
+    """USB enumeration selects likely FCs before opening any fallback devices."""
+
+    def test_user_can_connect_to_cube_when_only_bluetooth_realpath_times_out(
+        self, bluetooth_timeout_connection: FlightControllerConnection
+    ) -> None:
+        """
+        A timeout on an unrelated Bluetooth port cannot abort automatic connection.
+
+        GIVEN: Only COM6 fails path resolution; Cube COM27 and COM28 resolve successfully
+        WHEN: The user starts automatic connection and COM28 responds
+        THEN: COM28 connects without attempting SLCAN or Bluetooth
+        """
+        # When: The Cube's MAVLink endpoint accepts the connection.
+        with patch.object(bluetooth_timeout_connection, "_register_and_try_connect", return_value="") as try_connect:
+            result = bluetooth_timeout_connection.connect(device="")
+
+        # Then: An unrelated path-resolution error cannot block the Cube.
+        assert result == ""
+        assert [attempt.kwargs["comport"].device for attempt in try_connect.call_args_list] == ["COM28"]
+
+    def test_user_can_reach_network_fallback_when_only_bluetooth_realpath_times_out(
+        self, bluetooth_timeout_connection: FlightControllerConnection
+    ) -> None:
+        """
+        A Bluetooth path-resolution timeout cannot prevent reaching a network FC.
+
+        GIVEN: COM6 would raise WinError 121 and no serial candidate provides a heartbeat
+        WHEN: The user starts automatic connection and the UDP endpoint responds
+        THEN: Serial candidates remain available and the UDP fallback connects
+        """
+        # Given: A reachable network endpoint after all serial candidates fail.
+        network_device = "udp:0.0.0.0:14550"
+        bluetooth_timeout_connection._network_ports = [network_device]
+
+        # When: Serial attempts fail, but the network connection succeeds.
+        with patch.object(
+            bluetooth_timeout_connection, "_register_and_try_connect", side_effect=["No heartbeat"] * 3 + [""]
+        ) as try_connect:
+            result = bluetooth_timeout_connection.connect(device="")
+
+        # Then: The Bluetooth endpoint does not abort serial or network fallback.
+        assert result == ""
+        assert [attempt.kwargs["comport"].device for attempt in try_connect.call_args_list] == [
+            "COM28",
+            "COM27",
+            "COM6",
+            network_device,
+        ]
+
+    @pytest.mark.parametrize("bluetooth_device", ["COM6", r"\\.\COM6"])
+    def test_user_connects_to_cube_without_resolving_bluetooth_ports(
+        self, usb_autodetect_connection: FlightControllerConnection, bluetooth_device: str
+    ) -> None:
+        """
+        A Bluetooth path-resolution timeout cannot prevent connecting to a Cube.
+
+        GIVEN: Bluetooth COM6 and Cube Orange+ SLCAN and MAVLink interfaces
+        WHEN: Windows realpath would raise a semaphore timeout for COM devices
+        THEN: Enumeration retains all ports and connects only to the MAVLink interface
+        """
+        # Given: The user's ports, including the unrelated Bluetooth endpoint.
+        discovery = FakeSerialPortDiscovery()
+        discovery.add_port(bluetooth_device, "Standard Serial over Bluetooth link")
+        discovery.add_port("COM27", "Cube Orange+ SLCAN")
+        discovery.add_port("COM28", "Cube Orange+ Mavlink")
+        for port in discovery._ports[1:]:
+            port.vid, port.pid = 0x2DAE, 0x1058
+        usb_autodetect_connection._serial_port_discovery = discovery
+        usb_autodetect_connection.discover_connections()
+        pymavlink_ports = [mavutil.SerialPort(device=port.device, description=port.description) for port in discovery._ports]
+
+        # When: Resolve no COM paths, even if Windows would fail to resolve them.
+        with (
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.os_name", "nt"),
+            patch(
+                "ardupilot_methodic_configurator.backend_flightcontroller_connection.os_path.realpath",
+                side_effect=OSError(121, "The semaphore timeout period has expired", bluetooth_device),
+            ) as realpath,
+            patch(
+                "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial",
+                return_value=pymavlink_ports,
+            ),
+            patch.object(usb_autodetect_connection, "_register_and_try_connect", return_value="") as try_connect,
+        ):
+            ports = usb_autodetect_connection._auto_detect_serial()
+            result = usb_autodetect_connection.connect(device="")
+
+        # Then: Keep the fallback but never probe it when the Cube responds.
+        assert [port.device for port in reversed(ports)] == ["COM28", "COM27", bluetooth_device]
+        assert result == ""
+        assert [attempt.kwargs["comport"].device for attempt in try_connect.call_args_list] == ["COM28"]
+        realpath.assert_not_called()
+
+    @pytest.mark.parametrize("pymavlink_device", ["com28", r"\\.\COM28", r"\\.\com28"])
+    def test_user_sees_one_candidate_for_windows_com_aliases(
+        self, usb_autodetect_connection: FlightControllerConnection, pymavlink_device: str
+    ) -> None:
+        """
+        Equivalent COM spellings retain the same USB metadata and ranking.
+
+        GIVEN: PyMAVLink and PySerial report different spellings of the same COM port
+        WHEN: The application merges candidates
+        THEN: The known FC is retained once and ranks ahead of a telemetry adapter
+        """
+        # Given: Generic descriptions require USB metadata to recognize the FC.
+        pymavlink_ports = [
+            mavutil.SerialPort(device=pymavlink_device, description="USB Serial Device"),
+            mavutil.SerialPort(device="COM7", description="USB Serial Port"),
+        ]
+        discovery = FakeSerialPortDiscovery()
+        discovery.add_port("COM28", "USB Serial Device")
+        discovery._ports[0].vid, discovery._ports[0].pid = 0x2DAE, 0x1058
+        discovery.add_port("COM7", "USB Serial Port")
+        discovery._ports[1].vid, discovery._ports[1].pid = 0x0403, 0x6001
+        usb_autodetect_connection._serial_port_discovery = discovery
+
+        # When: Merge without accessing the COM devices as filesystem paths.
+        with (
+            patch(
+                "ardupilot_methodic_configurator.backend_flightcontroller_connection.mavutil.auto_detect_serial",
+                return_value=pymavlink_ports,
+            ),
+            patch(
+                "ardupilot_methodic_configurator.backend_flightcontroller_connection.os_path.realpath",
+                side_effect=OSError("COM paths must not be resolved"),
+            ) as realpath,
+            patch(
+                "ardupilot_methodic_configurator.backend_flightcontroller_connection.os_path.islink",
+                side_effect=AssertionError("COM paths must not be checked for symbolic links"),
+            ) as islink,
+        ):
+            ports = usb_autodetect_connection._auto_detect_serial()
+
+        # Then: The alias gets the FC's metadata rather than becoming a duplicate.
+        assert [port.device for port in reversed(ports)] == [pymavlink_device, "COM7"]
+        realpath.assert_not_called()
+        islink.assert_not_called()
+
+    @pytest.mark.parametrize("resolution_error", [OSError("Device unavailable"), PermissionError("Access denied")])
+    def test_user_can_still_try_a_device_when_its_filesystem_path_cannot_be_resolved(
+        self, usb_autodetect_connection: FlightControllerConnection, resolution_error: OSError
+    ) -> None:
+        """
+        Unresolvable filesystem paths remain available for connection attempts.
+
+        GIVEN: A discovered serial device whose path cannot be resolved
+        WHEN: The application enumerates candidates
+        THEN: The original path remains a candidate instead of aborting discovery
+        """
+        # Given: A filesystem-backed serial endpoint with inaccessible metadata.
+        discovery = FakeSerialPortDiscovery()
+        discovery.add_port("/dev/ttyACM0", "CubePilot MAVLink")
+        usb_autodetect_connection._serial_port_discovery = discovery
+        usb_autodetect_connection.discover_connections()
+
+        # When: Path resolution fails.
+        with patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.os_path.realpath",
+            side_effect=resolution_error,
+        ):
+            ports = usb_autodetect_connection._auto_detect_serial()
+
+        # Then: Connection can still attempt the original endpoint.
+        assert [port.device for port in ports] == ["/dev/ttyACM0"]
+
+    @pytest.mark.parametrize("device", ["udp:127.0.0.1:14550", "tcp:127.0.0.1:5760"])
+    def test_user_keeps_network_candidates_without_filesystem_resolution(
+        self, usb_autodetect_connection: FlightControllerConnection, device: str
+    ) -> None:
+        """
+        Network connection strings are identities, not filesystem paths.
+
+        GIVEN: An explicitly described MAVLink network connection
+        WHEN: Serial and network candidates are merged
+        THEN: The network endpoint is preserved without filesystem access
+        """
+        # Given: No serial devices and one explicitly described network endpoint.
+        usb_autodetect_connection._serial_port_discovery = FakeSerialPortDiscovery()
+        usb_autodetect_connection._connection_tuples = [(device, "MAVLink")]
+
+        # When: Enumerate with filesystem resolution unavailable.
+        with patch(
+            "ardupilot_methodic_configurator.backend_flightcontroller_connection.os_path.realpath",
+            side_effect=OSError("Network connections are not filesystem paths"),
+        ) as realpath:
+            ports = usb_autodetect_connection._auto_detect_serial()
+
+        # Then: Keep the exact connection string.
+        assert [port.device for port in ports] == [device]
+        realpath.assert_not_called()
+
+    def test_dual_cdc_dronecan_and_mavlink_interfaces_are_preserved(
+        self, usb_autodetect_connection: FlightControllerConnection
+    ) -> None:
+        """
+        Distinct DroneCAN and MAVLink interfaces remain available as candidates.
+
+        GIVEN: Two sibling by-id endpoints for DroneCAN and MAVLink
+        WHEN: USB serial candidates are enumerated
+        THEN: Both are retained and MAVLink is ranked first for connection attempts
+        """
+        # Given: A device exposing separate DroneCAN and MAVLink interfaces.
+        discovery = FakeSerialPortDiscovery()
+        for device, interface in (
+            ("/dev/serial/by-id/usb-Dual_CDC-if00", "DroneCAN"),
+            ("/dev/serial/by-id/usb-Dual_CDC-if01", "MAVLink"),
+        ):
+            port = serial.tools.list_ports_common.ListPortInfo(device)
+            port.description = "Dual CDC"
+            port.interface = interface
+            discovery._ports.append(port)
+        usb_autodetect_connection._serial_port_discovery = discovery
+
+        # When: Enumerate available serial candidates.
+        ports = usb_autodetect_connection._auto_detect_serial()
+
+        # Then: Preserve both endpoints and prefer the MAVLink interface.
+        assert [port.device for port in reversed(ports)] == [
+            "/dev/serial/by-id/usb-Dual_CDC-if01",
+            "/dev/serial/by-id/usb-Dual_CDC-if00",
+        ]
+
+    def test_user_gets_ranked_candidates_without_opening_ports(
+        self, usb_autodetect_connection: FlightControllerConnection
+    ) -> None:
+        """
+        USB metadata ranks FCs ahead of generic adapters while preserving unknown ports.
+
+        GIVEN: A native FC, an FC description, two telemetry adapters, and an unknown port
+        WHEN: The application enumerates connection candidates
+        THEN: Ports are ranked by confidence without opening any of them
+        """
+        # When: Enumerate and rank without establishing a serial connection.
+        ports = usb_autodetect_connection._auto_detect_serial()
+
+        # Then: A generic adapter never outranks a known FC and unknown ports remain.
+        assert [port.device for port in reversed(ports)] == ["COM2", "COM9", "COM10", "COM7", "COM11"]
+
+    def test_user_connects_without_probing_lower_priority_ports(
+        self, usb_autodetect_connection: FlightControllerConnection
+    ) -> None:
+        """
+        A responding FC prevents unnecessary attempts on unrelated ports.
+
+        GIVEN: USB enumeration finds a known FC and other serial devices
+        WHEN: The first candidate provides a working connection
+        THEN: Only the known FC is tried
+        """
+        # When: The highest-ranked candidate connects successfully.
+        with patch.object(usb_autodetect_connection, "_register_and_try_connect", return_value="") as try_connect:
+            result = usb_autodetect_connection.connect(device="")
+
+        # Then: Lower-priority devices are not probed.
+        assert result == ""
+        assert [attempt.kwargs["comport"].device for attempt in try_connect.call_args_list] == ["COM2"]
+
+    def test_user_can_connect_on_an_unknown_port_after_known_candidates_fail(
+        self, usb_autodetect_connection: FlightControllerConnection
+    ) -> None:
+        """
+        Unknown controllers remain reachable when USB identity hints fail.
+
+        GIVEN: Known candidates do not respond and an unknown port carries MAVLink
+        WHEN: The user starts automatic connection
+        THEN: All ranked candidates are tried until the unknown controller responds
+        """
+        # When: Only the last, unknown candidate successfully connects.
+        with patch.object(
+            usb_autodetect_connection, "_register_and_try_connect", side_effect=["No heartbeat"] * 4 + [""]
+        ) as try_connect:
+            result = usb_autodetect_connection.connect(device="")
+
+        # Then: USB metadata does not filter out an otherwise working connection.
+        assert result == ""
+        assert [attempt.kwargs["comport"].device for attempt in try_connect.call_args_list] == [
+            "COM2",
+            "COM9",
+            "COM10",
+            "COM7",
+            "COM11",
+        ]
+
+    @pytest.mark.parametrize(
+        ("named_mavlink_interface", "expected_order"),
+        [(False, ["COM10", "COM9"]), (True, ["COM9", "COM10"])],
+    )
+    def test_user_can_fall_back_to_another_interface_of_the_same_fc(
+        self,
+        usb_autodetect_connection: FlightControllerConnection,
+        named_mavlink_interface: bool,
+        expected_order: list[str],
+    ) -> None:
+        """
+        Interfaces sharing USB IDs and serial numbers are kept as separate candidates.
+
+        GIVEN: A known FC exposes COM9 and COM10 with the same USB identity
+        WHEN: The preferred interface fails to respond
+        THEN: The other interface is tried, with a named MAVLink interface preferred when present
+        """
+        # Given: Both serial interfaces belong to the same physical FC.
+        discovery = FakeSerialPortDiscovery()
+        for device in ("COM9", "COM10"):
+            port = serial.tools.list_ports_common.ListPortInfo(device)
+            port.vid, port.pid, port.serial_number = 0x2DAE, 0x1058, "same-controller"
+            if named_mavlink_interface:
+                port.interface = "MAVLink" if device == "COM9" else "SLCAN"
+            discovery._ports.append(port)
+        usb_autodetect_connection._serial_port_discovery = discovery
+
+        # When: Only the second attempt returns a working connection.
+        with patch.object(
+            usb_autodetect_connection, "_register_and_try_connect", side_effect=["No heartbeat", ""]
+        ) as try_connect:
+            result = usb_autodetect_connection.connect(device="")
+
+        # Then: Natural port ordering and fallback preserve both interfaces.
+        assert result == ""
+        assert [attempt.kwargs["comport"].device for attempt in try_connect.call_args_list] == expected_order
 
 
 class TestFlightControllerConnectionChibiOSVersionMatch:
@@ -2707,6 +3437,53 @@ class TestFlightControllerConnectionRetrieveAutopilotVersion:  # pylint: disable
         mock_req_msg.assert_called_once()
         mock_process.assert_called_once()
         assert result == ""
+
+
+def test_populate_flight_controller_info_stores_mavlink_uid2() -> None:
+    """Preserve the 18-byte MAVLink hardware UID in a printable form."""
+    info = FlightControllerInfo()
+    connection = FlightControllerConnection(
+        info=info,
+        serial_port_discovery=Mock(get_available_ports=Mock(return_value=[])),
+        network_ports=[],
+    )
+    message = Mock(
+        capabilities=0,
+        flight_sw_version=0,
+        vendor_id=0,
+        product_id=0,
+        board_version=0,
+        flight_custom_version=bytes(8),
+        os_custom_version=bytes(8),
+        uid=0,
+        uid2=bytes((61, 0, 44, 0, 6, 81, 51, 50, 48, 54, 51, 50, 0, 0, 0, 0, 0, 0)),
+    )
+
+    connection._populate_flight_controller_info(message)
+
+    assert info.hw_unique_id == "0x3D002C000651333230363332000000000000"
+
+
+def test_status_text_hook_captures_packets_discarded_by_type_filter_and_keeps_latest_100() -> None:
+    """Capture each parsed STATUSTEXT even while recv_match waits for another type."""
+    connection = FlightControllerConnection(info=FlightControllerInfo())
+    fake_factory = FakeMavlinkConnectionFactory()
+    master = fake_factory.create(device="fake", baudrate=DEFAULT_BAUDRATE)
+    assert master is not None
+    connection.set_master_for_testing(master)
+
+    for index in range(101):
+        status_text = Mock()
+        status_text.get_type.return_value = "STATUSTEXT"
+        status_text.text = f"status {index}".encode() + b"\x00"
+        master.add_message(status_text)
+
+    heartbeat = Mock()
+    heartbeat.get_type.return_value = "HEARTBEAT"
+    master.add_message(heartbeat)
+
+    assert master.recv_match(type="HEARTBEAT", blocking=False) is heartbeat
+    assert connection.status_text_buffer == [f"status {index}" for index in range(1, 101)]
 
 
 if __name__ == "__main__":

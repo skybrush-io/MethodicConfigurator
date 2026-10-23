@@ -14,6 +14,7 @@ from logging import info as logging_info
 from logging import warning as logging_warning
 from os import path as os_path
 from pathlib import Path
+from time import monotonic as time_monotonic
 from time import sleep as time_sleep
 from typing import TYPE_CHECKING, Any, cast
 
@@ -22,6 +23,18 @@ from serial.tools.list_ports_common import ListPortInfo
 
 from ardupilot_methodic_configurator import _
 from ardupilot_methodic_configurator.argparse_check_range import CheckRange
+from ardupilot_methodic_configurator.backend_flightcontroller_bootloader import (
+    CancellationRequested,
+    ConfirmationRequested,
+    FlightControllerBootloaderBackend,
+    ProgressCallback,
+    SerialDeviceIdentity,
+    SerialFactory,
+    capture_serial_device_identity,
+    has_stable_bootloader_device_identity,
+    report_progress_safely,
+    resolve_bootloader_device,
+)
 from ardupilot_methodic_configurator.backend_flightcontroller_commands import (
     CompassCalibrationUpdate,
     FlightControllerCommands,
@@ -32,14 +45,32 @@ from ardupilot_methodic_configurator.backend_flightcontroller_connection import 
     SUPPORTED_BAUDRATES,
     FlightControllerConnection,
 )
-from ardupilot_methodic_configurator.backend_flightcontroller_files import FlightControllerFiles
+from ardupilot_methodic_configurator.backend_flightcontroller_files import (
+    FlightControllerFiles,
+    FlightControllerLogFile,
+    LastLogDownloadResult,
+)
 from ardupilot_methodic_configurator.backend_flightcontroller_params import FlightControllerParams
 from ardupilot_methodic_configurator.backend_flightcontroller_protocols import (
+    FileUploadCheckStatus,
+    FileUploadResult,
     FlightControllerCommandsProtocol,
     FlightControllerConnectionProtocol,
     FlightControllerFilesProtocol,
     FlightControllerParamsProtocol,
     MavlinkConnection,
+)
+from ardupilot_methodic_configurator.data_model_firmware_upload import (
+    BootloaderInfo,
+    FirmwareBootloaderRecoveryError,
+    FirmwareConfirmationError,
+    FirmwareConnectionError,
+    FirmwareIdentityError,
+    FirmwareReconnectError,
+    FirmwareUploadCancelledError,
+    UploadStage,
+    verify_expected_firmware_digest,
+    verify_reconnected_firmware,
 )
 from ardupilot_methodic_configurator.data_model_flightcontroller_info import FlightControllerInfo
 from ardupilot_methodic_configurator.data_model_par_dict import ParDict
@@ -48,6 +79,78 @@ if TYPE_CHECKING:
     from pymavlink.dialects.v20.ardupilotmega import MAVLink_autopilot_version_message
 
 DEFAULT_REBOOT_TIME: int = 8
+FIRMWARE_RECONNECT_RESOLVE_TIMEOUT: float = 15.0
+
+
+class _BootloaderEntryCoordinator:  # pylint: disable=too-few-public-methods
+    """Enter bootloader mode and release the active MAVLink connection."""
+
+    def __init__(
+        self,
+        master_getter: Callable[[], MavlinkConnection | None],
+        reboot: Callable[[], tuple[bool, str]],
+        disconnect: Callable[[], None],
+        sleep: Callable[[float], None],
+    ) -> None:
+        self._master_getter = master_getter
+        self._reboot = reboot
+        self._disconnect = disconnect
+        self._sleep = sleep
+        self.entered = False
+
+    def __call__(self) -> None:
+        if self._master_getter() is None:
+            msg = _("flight-controller connection was lost before bootloader entry")
+            raise FirmwareConnectionError(msg)
+        accepted, error_message = self._reboot()
+        if not accepted:
+            msg = _("flight controller rejected bootloader entry: {error}").format(error=error_message)
+            raise FirmwareConnectionError(msg)
+        self.entered = True
+        self._sleep(0.3)  # Allow the MAVLink frame to leave before releasing the port.
+        self._disconnect()
+
+
+class _BootloaderReconnector:  # pylint: disable=too-few-public-methods
+    """Resolve and reconnect the flight controller after bootloader reboot."""
+
+    def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        device: str,
+        identity: SerialDeviceIdentity | None,
+        active_baudrate: Callable[[], int],
+        resolve_device: Callable[[str, SerialDeviceIdentity | None], str],
+        connect: Callable[[str, int], str],
+        clock: Callable[[], float],
+        sleep: Callable[[float], None],
+    ) -> None:
+        self._device = device
+        self._identity = identity
+        self._active_baudrate = active_baudrate
+        self._resolve_device = resolve_device
+        self._connect = connect
+        self._clock = clock
+        self._sleep = sleep
+
+    def __call__(self) -> str:
+        deadline = self._clock() + FIRMWARE_RECONNECT_RESOLVE_TIMEOUT
+        last_error = ""
+        while self._clock() < deadline:
+            try:
+                reconnect_device = self._resolve_device(self._device, self._identity)
+            except OSError as exc:
+                last_error = str(exc)
+                self._sleep(0.1)
+                continue
+            # ``connect`` reports transient failures as strings rather than
+            # raising, so keep retrying until the deadline is exhausted.
+            connect_error = self._connect(reconnect_device, self._active_baudrate())
+            if not connect_error:
+                return ""
+            last_error = connect_error
+            self._sleep(0.1)
+        return _("cannot resolve the flight-controller serial device: {error}").format(error=last_error)
+
 
 # Re-export constants for backwards compatibility
 __all__ = [
@@ -61,7 +164,7 @@ __all__ = [
 ]
 
 
-class FlightController:  # pylint: disable=too-many-public-methods
+class FlightController:  # pylint: disable=too-many-public-methods,too-many-instance-attributes
     """
     Facade for flight controller operations using delegation pattern.
 
@@ -94,7 +197,7 @@ class FlightController:  # pylint: disable=too-many-public-methods
 
     """
 
-    def __init__(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def __init__(  # noqa: PLR0913, PLR0917 # pylint: disable=too-many-arguments, too-many-positional-arguments
         self,
         reboot_time: int = DEFAULT_REBOOT_TIME,
         baudrate: int = DEFAULT_BAUDRATE,
@@ -105,6 +208,8 @@ class FlightController:  # pylint: disable=too-many-public-methods
         commands_manager: FlightControllerCommandsProtocol | None = None,
         files_manager: FlightControllerFilesProtocol | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        sleep: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         """
         Initialize the FlightController communication object.
@@ -121,6 +226,8 @@ class FlightController:  # pylint: disable=too-many-public-methods
             progress_callback: Optional callback function for displaying initialization progress.
                              If None, no progress updates are shown. Signature: callback(current, total)
                              Used to provide user feedback during component initialization phases
+            sleep: Optional delay function used by reset and firmware-upload recovery workflows.
+            clock: Optional monotonic clock used by firmware-upload reconnection retries.
 
         Note:
             If not provided, managers are created in dependency order:
@@ -136,6 +243,8 @@ class FlightController:  # pylint: disable=too-many-public-methods
             progress_callback(5, 100)
 
         self._reboot_time = reboot_time
+        self._sleep = time_sleep if sleep is None else sleep
+        self._clock = time_monotonic if clock is None else clock
         self._network_ports = network_ports if network_ports is not None else FlightControllerConnection.DEFAULT_NETWORK_PORTS
 
         if progress_callback:
@@ -245,6 +354,11 @@ class FlightController:  # pylint: disable=too-many-public-methods
         return self._connection_manager.baudrate
 
     @property
+    def active_baudrate(self) -> int:
+        """Baud rate used by the current connection, including a user override."""
+        return self._connection_manager.active_baudrate
+
+    @property
     def PARAM_FETCH_POLL_DELAY(self) -> float:  # noqa: N802 # pylint: disable=invalid-name
         """Get parameter fetch poll delay - delegates to params manager."""
         return self._params_manager.PARAM_FETCH_POLL_DELAY
@@ -276,51 +390,49 @@ class FlightController:  # pylint: disable=too-many-public-methods
 
     def reset_and_reconnect(
         self,
-        reset_progress_callback: Callable[[int, int], None] | None = None,
-        connection_progress_callback: Callable[[int, int], None] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
         extra_sleep_time: int | None = None,
     ) -> str:
         """
         Reset the flight controller and reconnect.
 
         Args:
-            reset_progress_callback: reset callback function
-            connection_progress_callback: connection callback function
+            progress_callback: Callback for reset and reconnect progress stages.
             extra_sleep_time (int, optional): The time in seconds to wait before reconnecting.
 
         """
-        if self.master is None:
+        master = self.master
+        if master is None:
             logging_warning(_("Cannot reset flight controller: not connected"))
             return ""
         # Issue a reset
-        self.master.reboot_autopilot()
+        reboot_autopilot = cast("Callable[[], None]", getattr(master, "reboot_autopilot"))  # noqa: B009
+        reboot_autopilot()
         logging_info(_("Reset command sent to ArduPilot."))
-        time_sleep(0.3)  # Short delay for command to be sent
+        self._sleep(0.3)  # Short delay for command to be sent
 
         self.disconnect()
-
-        current_step = 0
 
         if extra_sleep_time is None or extra_sleep_time < 0:
             extra_sleep_time = 0
 
         sleep_time = self._reboot_time + extra_sleep_time
-
-        while current_step != sleep_time:
-            # Call the progress callback with the current progress
-            if reset_progress_callback:
-                reset_progress_callback(current_step, sleep_time)
-
-            # Wait for sleep_time seconds
-            time_sleep(1)
-            current_step += 1
-
-        # Call the progress callback with the current progress
-        if reset_progress_callback:
-            reset_progress_callback(current_step, sleep_time)
+        for elapsed_seconds in range(sleep_time + 1):
+            if progress_callback:
+                # Keep the UI responsive while the controller reboots.  The reset
+                # phase occupies 10-30% of the shared restart progress indicator.
+                reset_progress = 10 + int(20 * elapsed_seconds / max(1, sleep_time))
+                progress_callback(reset_progress, 100)
+            if elapsed_seconds < sleep_time:
+                self._sleep(1)
 
         # Reconnect to the flight controller
-        return self.create_connection_with_retry(connection_progress_callback, baudrate=self.baudrate)
+        return self.create_connection_with_retry(
+            progress_callback=None,
+            baudrate=self.baudrate,
+            reconnect_progress_callback=progress_callback,
+            is_reconnect=True,
+        )
 
     def discover_connections(
         self,
@@ -332,16 +444,179 @@ class FlightController:  # pylint: disable=too-many-public-methods
             progress_callback=progress_callback, preserved_connections=preserved_connections
         )
 
+    def start_gcs_heartbeat(self) -> None:
+        """Enable periodic GCS heartbeats for the remaining lifetime of this connection."""
+        self._connection_manager.start_gcs_heartbeat()
+
     def disconnect(self) -> None:
         """Close the connection to the flight controller - delegates to connection manager."""
         self._connection_manager.disconnect()
         # Clear parameter cache via params manager
         self._params_manager.clear_parameters()
 
+    def upload_apj_firmware(  # pylint: disable=too-many-arguments,too-many-locals
+        self,
+        path: Path,
+        *,
+        bootloader_baudrate: int = 115200,
+        bootloader_timeout: float = 2.0,
+        full_erase: bool = False,
+        expected_firmware_sha256: str | None = None,
+        serial_factory: SerialFactory | None = None,
+        cancellation_requested: CancellationRequested | None = None,
+        confirmation_requested: ConfirmationRequested | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> BootloaderInfo:
+        """
+        Flash an APJ through the active direct serial connection and reconnect.
+
+        This synchronous facade operation is intended for a worker thread.  It is
+        deliberately unavailable without the current MAVLink connection and its
+        directly-addressable serial device, so a UDP/TCP connection cannot be used
+        accidentally for bootloader flashing.
+        """
+        network_prefixes = ("udp:", "udpin:", "udpout:", "tcp:", "tcpin:", "tcpout:", "ws:", "wss:")
+        device = self.comport_device
+        if self.master is None or self.comport is None or not device or device.lower().startswith(network_prefixes):
+            msg = _("firmware upload requires an active direct serial flight-controller connection")
+            raise FirmwareConnectionError(msg)
+        if confirmation_requested is None:
+            msg = _("firmware upload requires explicit confirmation before entering the bootloader")
+            raise FirmwareConfirmationError(msg)
+        try:
+            connected_board_id = int(self.info.apj_board_id)
+            if connected_board_id < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            msg = _("firmware upload requires the connected flight controller APJ board_id")
+            raise FirmwareConnectionError(msg) from None
+        device_identity = capture_serial_device_identity(device)
+        entry = _BootloaderEntryCoordinator(
+            lambda: self.master,
+            self._commands_manager.reboot_to_bootloader,
+            self.disconnect,
+            self._sleep,
+        )
+        reconnector = _BootloaderReconnector(
+            device,
+            device_identity,
+            lambda: getattr(self._connection_manager, "active_baudrate", self.baudrate),
+            resolve_bootloader_device,
+            lambda reconnect_device, baudrate: self.connect(reconnect_device, log_errors=False, baudrate=baudrate),
+            self._clock,
+            self._sleep,
+        )
+
+        backend_kwargs: dict[str, Any] = {
+            "timeout": bootloader_timeout,
+            "enter_bootloader": entry,
+            "device_identity": device_identity,
+            "sleep": self._sleep,
+        }
+        if serial_factory is not None:
+            backend_kwargs["serial_factory"] = serial_factory
+        backend = FlightControllerBootloaderBackend(
+            device,
+            bootloader_baudrate,
+            **backend_kwargs,
+        )
+        image = backend.inspect_firmware(path)
+        if expected_firmware_sha256 is None:
+            msg = _("firmware upload requires a trusted SHA-256 for the selected APJ payload")
+            raise FirmwareConfirmationError(msg)
+        verify_expected_firmware_digest(image, expected_firmware_sha256)
+        if not has_stable_bootloader_device_identity(device, device_identity):
+            msg = _("firmware upload requires a stable USB serial number or USB location")
+            raise FirmwareConnectionError(msg)
+        previous_parameters = self.fc_parameters.copy()
+        report_progress_safely(progress_callback, UploadStage.ENTERING_BOOTLOADER, 0, 1)
+        try:
+            info = backend.upload(
+                image,
+                full_erase=full_erase,
+                cancellation_requested=cancellation_requested,
+                confirmation_requested=confirmation_requested,
+                progress_callback=progress_callback,
+                connected_board_id=connected_board_id,
+            )
+        except Exception as exc:
+            self._recover_after_firmware_upload_abort(
+                exc,
+                bootloader_entered=entry.entered,
+                reconnect=reconnector,
+                connected_board_id=connected_board_id,
+                previous_parameters=previous_parameters,
+            )
+            raise
+        # A flashed image invalidates every cached parameter.  The reconnect is a
+        # required part of success, rather than an optimistic best-effort step.
+        self._params_manager.clear_parameters()
+        report_progress_safely(progress_callback, UploadStage.RECONNECTING, 0, 1)
+        reconnect_error = reconnector()
+        if reconnect_error:
+            msg = _(
+                "firmware was written and verified, but the flight controller could not be reconnected automatically: "
+                "{error}. Reconnect it manually before continuing."
+            ).format(error=reconnect_error)
+            raise FirmwareReconnectError(msg)
+        verify_reconnected_firmware(
+            image,
+            board_id=self.info.apj_board_id,
+        )
+        report_progress_safely(progress_callback, UploadStage.RECONNECTING, 1, 1)
+        return info
+
+    def _recover_after_firmware_upload_abort(
+        self,
+        error: Exception,
+        *,
+        bootloader_entered: bool,
+        reconnect: Callable[[], str],
+        connected_board_id: int,
+        previous_parameters: dict[str, float],
+    ) -> None:
+        """Recover only a safely rebooted board; restore cached parameters only after safe cancellation."""
+        if isinstance(error, FirmwareBootloaderRecoveryError):
+            # A held bootloader without a successful reboot cannot return to MAVLink.
+            return
+        if not bootloader_entered or not getattr(error, "bootloader_rebooted", False):
+            return
+        recovery_error = reconnect()
+        if recovery_error:
+            logging_warning(_("Unable to reconnect after safe firmware-upload abort: %s"), recovery_error)
+            if isinstance(error, FirmwareUploadCancelledError):
+                msg = _("Firmware upload was cancelled, but reconnection failed: {error}. Restart AMC to reconnect.").format(
+                    error=recovery_error
+                )
+                raise FirmwareConnectionError(msg) from error
+            return
+        if not isinstance(error, FirmwareUploadCancelledError):
+            return
+        # No erase occurred. The supplied reconnector is bound to the original
+        # USB identity; the returned board ID must also match before reusing state.
+        if self.info.apj_board_id != str(connected_board_id):
+            msg = _("The reconnected board does not match the controller before cancellation. Restart AMC.")
+            raise FirmwareIdentityError(msg) from error
+        self.fc_parameters.update(previous_parameters)
+
     @property
     def banner_text_buffer(self) -> list[str]:
         """Return the most recently received FC banner text."""
         return self._connection_manager.banner_text_buffer
+
+    @property
+    def status_text_buffer(self) -> list[str]:
+        """Return recent FC STATUSTEXT messages."""
+        return self._connection_manager.status_text_buffer
+
+    @property
+    def status_text_display_buffer(self) -> list[str]:
+        """Return recent FC STATUSTEXT messages newest first with local arrival times."""
+        return self._connection_manager.status_text_display_buffer
+
+    def poll_status_text(self) -> list[str]:
+        """Refresh diagnostics while the caller exclusively owns the idle connection."""
+        return self._connection_manager.poll_status_text()
 
     def add_connection(self, connection_string: str) -> bool:
         """Add a new connection to the list of available connections - delegates to connection manager."""
@@ -412,6 +687,8 @@ class FlightController:  # pylint: disable=too-many-public-methods
         timeout: int = 5,
         baudrate: int = DEFAULT_BAUDRATE,
         log_errors: bool = True,
+        reconnect_progress_callback: Callable[[int, int], None] | None = None,
+        is_reconnect: bool = False,
     ) -> str:
         """
         Attempts to create a connection to the flight controller - delegates to connection manager.
@@ -422,6 +699,8 @@ class FlightController:  # pylint: disable=too-many-public-methods
             timeout: The timeout in seconds for each connection attempt
             baudrate: The baud rate for the connection
             log_errors: Whether to log errors
+            reconnect_progress_callback: Optional callback for reset/reconnect progress stages.
+            is_reconnect: Use reconnect retry behavior even without a UI callback.
 
         Returns:
             str: An error message if connection fails, otherwise empty string
@@ -433,6 +712,8 @@ class FlightController:  # pylint: disable=too-many-public-methods
             timeout=timeout,
             baudrate=baudrate,
             log_errors=log_errors,
+            reconnect_progress_callback=reconnect_progress_callback,
+            is_reconnect=is_reconnect,
         )
 
     @staticmethod
@@ -455,10 +736,17 @@ class FlightController:  # pylint: disable=too-many-public-methods
         progress_callback: Callable[[int, int], None] | None = None,
         parameter_values_filename: Path | None = None,
         parameter_defaults_filename: Path | None = None,
+        *,
+        response_timeout: float | None = None,
+        cancellation_requested: Callable[[], bool] | None = None,
     ) -> tuple[dict[str, float], ParDict]:
         """Download all parameters from flight controller - delegates to params manager."""
         params, defaults = self._params_manager.download_params(
-            progress_callback, parameter_values_filename, parameter_defaults_filename
+            progress_callback,
+            parameter_values_filename,
+            parameter_defaults_filename,
+            response_timeout=response_timeout,
+            cancellation_requested=cancellation_requested,
         )
         # params_manager updates its fc_parameters internally, which we access via property
         return params, defaults
@@ -477,8 +765,7 @@ class FlightController:  # pylint: disable=too-many-public-methods
 
     def reset_all_parameters_to_default_and_reconnect(
         self,
-        reset_progress_callback: Callable[[int, int], None] | None = None,
-        connection_progress_callback: Callable[[int, int], None] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
         extra_sleep_time: int | None = None,
     ) -> tuple[bool, str]:
         """Reset all parameters to defaults, then reboot and reconnect the flight controller."""
@@ -487,15 +774,14 @@ class FlightController:  # pylint: disable=too-many-public-methods
             return False, error_message
 
         reconnect_error = self.reset_and_reconnect(
-            reset_progress_callback,
-            connection_progress_callback,
+            progress_callback,
             extra_sleep_time,
         )
         return (False, reconnect_error) if reconnect_error else (True, "")
 
     # Motor Test Functionality - Delegated to commands manager
 
-    def test_motor(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def test_motor(
         self, test_sequence_nr: int, motor_letters: str, motor_output_nr: int, throttle_percent: int, timeout_seconds: int
     ) -> tuple[bool, str]:
         """Test a specific motor - delegates to commands manager."""
@@ -524,8 +810,16 @@ class FlightController:  # pylint: disable=too-many-public-methods
         return self._commands_manager.start_accel_calibration_simple()
 
     def start_accel_calibration_level(self) -> tuple[bool, str]:
-        """Level-trim the accelerometers (sets AHRS_TRIM_*) - delegates to commands manager."""
+        """Start level-trim calibration (sets AHRS_TRIM_*) without waiting for its ACK."""
         return self._commands_manager.start_accel_calibration_level()
+
+    def poll_accel_calibration_level(self) -> tuple[bool, str] | None:
+        """Poll level-trim calibration; return None while the FC is still working."""
+        return self._commands_manager.poll_accel_calibration_level()
+
+    def abort_accel_calibration_level(self) -> None:
+        """Release a level calibration exchange abandoned by the active view."""
+        self._commands_manager.abort_level_calibration()
 
     def send_accel_calibration_full_start(self) -> tuple[bool, str]:
         """Send the start command for interactive 6-position calibration - delegates to commands manager."""
@@ -539,10 +833,6 @@ class FlightController:  # pylint: disable=too-many-public-methods
         """Confirm calibration position to the FC - delegates to commands manager."""
         return self._commands_manager.confirm_accel_vehicle_pos(position)
 
-    def cancel_accel_calibration(self) -> tuple[bool, str]:
-        """Cancel any ongoing accelerometer calibration - delegates to commands manager."""
-        return self._commands_manager.cancel_accel_calibration()
-
     def poll_scaled_imu(self) -> tuple[float, float, float] | None:
         """Read the latest SCALED_IMU reading - delegates to commands manager."""
         return self._commands_manager.poll_scaled_imu()
@@ -551,13 +841,17 @@ class FlightController:  # pylint: disable=too-many-public-methods
         """Request periodic SCALED_IMU messages - delegates to commands manager."""
         return self._commands_manager.request_scaled_imu_messages(interval_microseconds)
 
+    def request_rc_receiver_messages(self, interval_microseconds: int = 200_000) -> tuple[bool, str]:
+        """Request receiver telemetry intervals - delegates to commands manager."""
+        return self._commands_manager.request_rc_receiver_messages(interval_microseconds)
+
     def request_periodic_battery_status(self, interval_microseconds: int = 1000000) -> tuple[bool, str]:
         """Request periodic BATTERY_STATUS messages - delegates to commands manager."""
         return self._commands_manager.request_periodic_battery_status(interval_microseconds)
 
-    def get_battery_status(self) -> tuple[tuple[float, float] | None, str]:
-        """Get current battery voltage and current - delegates to commands manager."""
-        return self._commands_manager.get_battery_status()
+    def get_battery_statuses(self) -> tuple[dict[int, tuple[float, float]] | None, str]:
+        """Get recent battery voltage and current readings, keyed by MAVLink battery ID."""
+        return self._commands_manager.get_battery_statuses()
 
     def get_voltage_thresholds(self) -> tuple[float, float]:
         """Get battery voltage thresholds - delegates to commands manager."""
@@ -581,9 +875,54 @@ class FlightController:  # pylint: disable=too-many-public-methods
 
     def download_last_flight_log(
         self, local_filename: str, progress_callback: Callable[[int, int], None] | None = None
-    ) -> bool:
-        """Download the last flight log from the flight controller - delegates to files manager."""
+    ) -> LastLogDownloadResult:
+        """Download the last log and retain the reason for failure."""
         return self._files_manager.download_last_flight_log(local_filename, progress_callback)
+
+    def list_remote_files(
+        self,
+        remote_directory: str = "/APM/LOGS/",
+    ) -> list[FlightControllerLogFile] | None:
+        """List files and directories in a remote directory - delegates to files manager."""
+        return self._files_manager.list_remote_files(remote_directory)
+
+    def download_remote_file(
+        self,
+        remote_path: str,
+        local_filename: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """Download one remote file - delegates to files manager."""
+        return self._files_manager.download_remote_file(remote_path, local_filename, progress_callback)
+
+    def verify_remote_file(self, remote_path: str, local_filename: str) -> bool | None:
+        """Compare a transferred local file with the remote file CRC."""
+        return self._files_manager.verify_remote_file(remote_path, local_filename)
+
+    def check_file_upload(self, remote_path: str, local_filename: str) -> FileUploadCheckStatus:
+        """Return an explicit outcome for remote upload preflight."""
+        return self._files_manager.check_file_upload(remote_path, local_filename)
+
+    def upload_file_if_needed(
+        self,
+        local_filename: str,
+        remote_filename: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> FileUploadResult:
+        """Recheck remote state and upload through the files manager."""
+        return self._files_manager.upload_file_if_needed(local_filename, remote_filename, progress_callback)
+
+    def make_remote_directory(self, remote_directory: str) -> bool:
+        """Create a remote directory - delegates to files manager."""
+        return self._files_manager.make_remote_directory(remote_directory)
+
+    def delete_remote_path(self, remote_path: str, is_directory: bool = False) -> bool:
+        """Delete a remote file or directory - delegates to files manager."""
+        return self._files_manager.delete_remote_path(remote_path, is_directory)
+
+    def rename_remote_path(self, remote_path: str, new_remote_path: str) -> bool:
+        """Rename a remote file or directory - delegates to files manager."""
+        return self._files_manager.rename_remote_path(remote_path, new_remote_path)
 
     # Static methods and properties
 

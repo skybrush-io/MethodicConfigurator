@@ -176,7 +176,6 @@
             "auto_changed_by": "",
             "autoimport_nondefault_regexp": ["Q_ENABLE", "Q_FRAME_CLASS"],
             "derived_parameters": {
-                "FRAME_CLASS": { "if": "'FRAME_CLASS' in fc_parameters", "New Value": "vehicle_components['Frame']['Specifications']['Frame class']", "Change Reason": "Selected in the component editor" },
                 "Q_FRAME_CLASS": { "if": "'Q_FRAME_CLASS' in fc_parameters", "New Value": "vehicle_components['Frame']['Specifications']['Frame class']", "Change Reason": "Selected in the component editor" }
             },
             "old_filenames": ["04_board_orientation.param"]
@@ -192,10 +191,23 @@
             "external_tool_url": "https://edgetx.org/getedgetx/",
             "mandatory_text": "100% mandatory (0% optional)",
             "component": "RC Receiver",
+            "plugin": {
+                "name": "rc_receiver",
+                "placement": "left"
+            },
             "auto_changed_by": "",
-            "autoimport_nondefault_regexp": ["FS_THR_VALUE", "RC_.*"],
+            "autoimport_nondefault_regexp": ["THR_FS_VALUE", "RC_.*"],
             "derived_parameters": {
                 "RC_PROTOCOLS": { "New Value": "vehicle_components['RC Receiver']['FC Connection']['Protocol']", "Change Reason": "Selected in the component editor" },
+                "SERIAL1_PROTOCOL": { "if": "vehicle_components['RC Receiver']['FC Connection']['Type'] == 'SERIAL1'", "New Value": "23", "Change Reason": "RC receiver on SERIAL1 requires RCIN" },
+                "SERIAL2_PROTOCOL": { "if": "vehicle_components['RC Receiver']['FC Connection']['Type'] == 'SERIAL2'", "New Value": "23", "Change Reason": "RC receiver on SERIAL2 requires RCIN" },
+                "SERIAL3_PROTOCOL": { "if": "vehicle_components['RC Receiver']['FC Connection']['Type'] == 'SERIAL3'", "New Value": "23", "Change Reason": "RC receiver on SERIAL3 requires RCIN" },
+                "SERIAL4_PROTOCOL": { "if": "vehicle_components['RC Receiver']['FC Connection']['Type'] == 'SERIAL4'", "New Value": "23", "Change Reason": "RC receiver on SERIAL4 requires RCIN" },
+                "SERIAL5_PROTOCOL": { "if": "vehicle_components['RC Receiver']['FC Connection']['Type'] == 'SERIAL5'", "New Value": "23", "Change Reason": "RC receiver on SERIAL5 requires RCIN" },
+                "SERIAL6_PROTOCOL": { "if": "vehicle_components['RC Receiver']['FC Connection']['Type'] == 'SERIAL6'", "New Value": "23", "Change Reason": "RC receiver on SERIAL6 requires RCIN" },
+                "SERIAL7_PROTOCOL": { "if": "vehicle_components['RC Receiver']['FC Connection']['Type'] == 'SERIAL7'", "New Value": "23", "Change Reason": "RC receiver on SERIAL7 requires RCIN" },
+                "SERIAL8_PROTOCOL": { "if": "vehicle_components['RC Receiver']['FC Connection']['Type'] == 'SERIAL8'", "New Value": "23", "Change Reason": "RC receiver on SERIAL8 requires RCIN" },
+                "SERIAL9_PROTOCOL": { "if": "vehicle_components['RC Receiver']['FC Connection']['Type'] == 'SERIAL9'", "New Value": "23", "Change Reason": "RC receiver on SERIAL9 requires RCIN" },
                 "FLTMODE_CH": { "if": "vehicle_components['RC Receiver']['FC Connection']['Protocol'] == 'ExpressLRS'", "New Value": "6", "Change Reason": "ExpressLRS requires FLTMODE_CH != 5" }
             },
             "rename_connection": "vehicle_components['RC Receiver']['FC Connection']['Type']",
@@ -219,6 +231,10 @@
             "old_filenames": []
         },
         "08_telemetry.param": {
+            "plugin": {
+                "name": "data_telemetry",
+                "placement": "top"
+            },
             "why": "Telemetry allows the ground control station to monitor the vehicle's status in real-time, providing flight information for safe and efficient operation.",
             "why_now": "Sometimes it depends on the remote controller. Configuring telemetry early allows vehicle configuration and sensor calibration in later steps without requiring a USB cable connection to the autopilot",
             "blog_text": "Configure telemetry connection, data protocol and settings between the autopilot and the ground control station(s)",
@@ -230,6 +246,17 @@
             "mandatory_text": "100% mandatory (0% optional)",
             "component": "Telemetry",
             "auto_changed_by": "",
+            "derived_parameters": {
+                "SERIAL1_PROTOCOL": { "if": "vehicle_components['Telemetry']['FC Connection']['Type'] == 'SERIAL1'", "New Value": "vehicle_components['Telemetry']['FC Connection']['Protocol']", "Change Reason": "Telemetry on SERIAL1 protocol defined in component editor" },
+                "SERIAL2_PROTOCOL": { "if": "vehicle_components['Telemetry']['FC Connection']['Type'] == 'SERIAL2'", "New Value": "vehicle_components['Telemetry']['FC Connection']['Protocol']", "Change Reason": "Telemetry on SERIAL2 protocol defined in component editor" },
+                "SERIAL3_PROTOCOL": { "if": "vehicle_components['Telemetry']['FC Connection']['Type'] == 'SERIAL3'", "New Value": "vehicle_components['Telemetry']['FC Connection']['Protocol']", "Change Reason": "Telemetry on SERIAL3 protocol defined in component editor" },
+                "SERIAL4_PROTOCOL": { "if": "vehicle_components['Telemetry']['FC Connection']['Type'] == 'SERIAL4'", "New Value": "vehicle_components['Telemetry']['FC Connection']['Protocol']", "Change Reason": "Telemetry on SERIAL4 protocol defined in component editor" },
+                "SERIAL5_PROTOCOL": { "if": "vehicle_components['Telemetry']['FC Connection']['Type'] == 'SERIAL5'", "New Value": "vehicle_components['Telemetry']['FC Connection']['Protocol']", "Change Reason": "Telemetry on SERIAL5 protocol defined in component editor" },
+                "SERIAL6_PROTOCOL": { "if": "vehicle_components['Telemetry']['FC Connection']['Type'] == 'SERIAL6'", "New Value": "vehicle_components['Telemetry']['FC Connection']['Protocol']", "Change Reason": "Telemetry on SERIAL6 protocol defined in component editor" },
+                "SERIAL7_PROTOCOL": { "if": "vehicle_components['Telemetry']['FC Connection']['Type'] == 'SERIAL7'", "New Value": "vehicle_components['Telemetry']['FC Connection']['Protocol']", "Change Reason": "Telemetry on SERIAL7 protocol defined in component editor" },
+                "SERIAL8_PROTOCOL": { "if": "vehicle_components['Telemetry']['FC Connection']['Type'] == 'SERIAL8'", "New Value": "vehicle_components['Telemetry']['FC Connection']['Protocol']", "Change Reason": "Telemetry on SERIAL8 protocol defined in component editor" },
+                "SERIAL9_PROTOCOL": { "if": "vehicle_components['Telemetry']['FC Connection']['Type'] == 'SERIAL9'", "New Value": "vehicle_components['Telemetry']['FC Connection']['Protocol']", "Change Reason": "Telemetry on SERIAL9 protocol defined in component editor" }
+            },
             "rename_connection": "vehicle_components['Telemetry']['FC Connection']['Type']",
             "old_filenames": ["06_telemetry.param"]
         },
@@ -248,7 +275,7 @@
             "autoimport_nondefault_regexp": ["SERVO_BLH_TRATE"],
             "derived_parameters": {
                 "SCR_ENABLE": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol'] == 'Scripting'", "New Value": "1", "Change Reason": "ESC RPM telemetry requires lua scripting" },
-                "MOT_PWM_TYPE": { "New Value": "vehicle_components['ESC']['FC->ESC Connection']['Protocol']", "Change Reason": "Specified in component editor window" },
+                "Q_M_PWM_TYPE": { "New Value": "vehicle_components['ESC']['FC->ESC Connection']['Protocol']", "Change Reason": "Specified in component editor window" },
                 "SERIAL1_PROTOCOL": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Type'] == 'SERIAL1'", "New Value": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol']", "Change Reason": "Defined in ESC specifications above" },
                 "SERIAL2_PROTOCOL": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Type'] == 'SERIAL2'", "New Value": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol']", "Change Reason": "Defined in ESC specifications above" },
                 "SERIAL3_PROTOCOL": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Type'] == 'SERIAL3'", "New Value": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol']", "Change Reason": "Defined in ESC specifications above" },
@@ -332,9 +359,7 @@
                 "BATT_ARM_VOLT": { "New Value": "vehicle_components['Battery']['Specifications']['Volt per cell arm']*vehicle_components['Battery']['Specifications']['Number of cells']", "Change Reason": "Only arm above this voltage, to avoid taking off with insufficient battery capacity" },
                 "BATT_CAPACITY": { "New Value": "vehicle_components['Battery']['Specifications']['Capacity mAh']", "Change Reason": "Total battery capacity specified in the component editor" },
                 "BATT_CRT_VOLT": { "New Value": "vehicle_components['Battery']['Specifications']['Volt per cell crit']*vehicle_components['Battery']['Specifications']['Number of cells']", "Change Reason": "Critical failsafe voltage x nr. of cells" },
-                "BATT_LOW_VOLT": { "New Value": "vehicle_components['Battery']['Specifications']['Volt per cell low']*vehicle_components['Battery']['Specifications']['Number of cells']", "Change Reason": "Low failsafe voltage x nr. of cells" },
-                "MOT_BAT_VOLT_MAX": { "New Value": "vehicle_components['Battery']['Specifications']['Volt per cell max']*vehicle_components['Battery']['Specifications']['Number of cells']", "Change Reason": "Scale the PIDs up when battery voltage is below this threshold" },
-                "MOT_BAT_VOLT_MIN": { "New Value": "vehicle_components['Battery']['Specifications']['Volt per cell min']*vehicle_components['Battery']['Specifications']['Number of cells']", "Change Reason": "Scale the PIDs up when battery voltage is above this threshold" }
+                "BATT_LOW_VOLT": { "New Value": "vehicle_components['Battery']['Specifications']['Volt per cell low']*vehicle_components['Battery']['Specifications']['Number of cells']", "Change Reason": "Low failsafe voltage x nr. of cells" }
             },
             "delete_parameters": {
                 "BATT_AMP_OFFSET": {},
@@ -392,30 +417,31 @@
             "mandatory_text": "100% mandatory (0% optional)",
             "component": "Propellers",
             "auto_changed_by": "",
+            "autoimport_nondefault_regexp": ["Q_A_ACC(EL)?_[PRY]_MAX$", "Q_A_ANG_YAW_P$", "Q_A_RAT_(PIT|RLL|YAW)_FLT[DET]$", "INS_ACCEL_FILTER$", "Q_M_THST_(EXPO|HOVER)$"],
             "forced_parameters": {
-                "ATC_RAT_PIT_FLTE": { "New Value": "0", "Change Reason": "Initial value, will be improved at a later step" },
-                "ATC_RAT_RLL_FLTE": { "New Value": "0", "Change Reason": "Initial value, will be improved at a later step" },
-                "ATC_RAT_YAW_FLTD": { "New Value": "0", "Change Reason": "Initial value, will be improved at a later step" },
-                "ATC_RAT_YAW_FLTE": { "New Value": "2", "Change Reason": "Initial value, will be improved at a later step" },
-                "ATC_THR_MIX_MAN":  { "New Value": "0.1", "Change Reason": "Value for the first couple of flights will be changed later once MOT_THST_HOVER is learned" },
+                "Q_A_RAT_PIT_FLTE": { "New Value": "0", "Change Reason": "Initial value, will be improved at a later step" },
+                "Q_A_RAT_RLL_FLTE": { "New Value": "0", "Change Reason": "Initial value, will be improved at a later step" },
+                "Q_A_RAT_YAW_FLTD": { "New Value": "0", "Change Reason": "Initial value, will be improved at a later step" },
+                "Q_A_RAT_YAW_FLTE": { "New Value": "2", "Change Reason": "Initial value, will be improved at a later step" },
+                "Q_A_THR_MIX_MAN":  { "New Value": "0.1", "Change Reason": "Value for the first couple of flights will be changed later once Q_M_THST_HOVER is learned" },
                 "INS_ACCEL_FILTER": { "New Value": "10", "Change Reason": "The default is 20Hz but that is too high in most situations" },
-                "MOT_THST_HOVER":   { "New Value": "0.2", "Change Reason": "Hover learn will improve this initial guess" }
+                "Q_M_THST_HOVER":   { "New Value": "0.2", "Change Reason": "Hover learn will improve this initial guess" }
             },
             "derived_parameters": {
-                "ATC_ANG_YAW_P":    { "New Value": "round(0.5*max(8000, round(-900*vehicle_components['Propellers']['Specifications']['Diameter_inches']+36000, -2))/3000, 1)", "Change Reason": "Derived from vehicle component editor propeller size" },
-                "ATC_ACCEL_P_MAX":  { "if": "'ATC_ACCEL_P_MAX' in fc_parameters", "New Value": "max(10000,(round(-2.613267*vehicle_components['Propellers']['Specifications']['Diameter_inches']**3+343.39216*vehicle_components['Propellers']['Specifications']['Diameter_inches']**2-15083.7121*vehicle_components['Propellers']['Specifications']['Diameter_inches']+235771, -2)))", "Change Reason": "Derived from vehicle component editor propeller size" },
-                "ATC_ACCEL_R_MAX":  { "if": "'ATC_ACCEL_R_MAX' in fc_parameters", "New Value": "max(10000,(round(-2.613267*vehicle_components['Propellers']['Specifications']['Diameter_inches']**3+343.39216*vehicle_components['Propellers']['Specifications']['Diameter_inches']**2-15083.7121*vehicle_components['Propellers']['Specifications']['Diameter_inches']+235771, -2)))", "Change Reason": "Derived from vehicle component editor propeller size" },
-                "ATC_ACCEL_Y_MAX":  { "if": "'ATC_ACCEL_Y_MAX' in fc_parameters", "New Value": "max(8000, round(-900*vehicle_components['Propellers']['Specifications']['Diameter_inches']+36000, -2))", "Change Reason": "Derived from vehicle component editor propeller size" },
-                "ATC_ACC_P_MAX":    { "if": "'ATC_ACC_P_MAX' in fc_parameters", "New Value": "max(10000,(round(-2.613267*vehicle_components['Propellers']['Specifications']['Diameter_inches']**3+343.39216*vehicle_components['Propellers']['Specifications']['Diameter_inches']**2-15083.7121*vehicle_components['Propellers']['Specifications']['Diameter_inches']+235771, -2)))/100", "Change Reason": "Derived from vehicle component editor propeller size" },
-                "ATC_ACC_R_MAX":    { "if": "'ATC_ACC_R_MAX' in fc_parameters", "New Value": "max(10000,(round(-2.613267*vehicle_components['Propellers']['Specifications']['Diameter_inches']**3+343.39216*vehicle_components['Propellers']['Specifications']['Diameter_inches']**2-15083.7121*vehicle_components['Propellers']['Specifications']['Diameter_inches']+235771, -2)))/100", "Change Reason": "Derived from vehicle component editor propeller size" },
-                "ATC_ACC_Y_MAX":    { "if": "'ATC_ACC_Y_MAX' in fc_parameters", "New Value": "max(8000, round(-900*vehicle_components['Propellers']['Specifications']['Diameter_inches']+36000, -2))/100", "Change Reason": "Derived from vehicle component editor propeller size" },
-                "ATC_RAT_PIT_FLTD": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
-                "ATC_RAT_PIT_FLTT": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
-                "ATC_RAT_RLL_FLTD": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
-                "ATC_RAT_RLL_FLTT": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
-                "ATC_RAT_YAW_FLTT": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
+                "Q_A_ANG_YAW_P":    { "New Value": "round(0.5*max(8000, round(-900*vehicle_components['Propellers']['Specifications']['Diameter_inches']+36000, -2))/3000, 1)", "Change Reason": "Derived from vehicle component editor propeller size" },
+                "Q_A_ACCEL_P_MAX":  { "if": "'Q_A_ACCEL_P_MAX' in fc_parameters", "New Value": "max(10000,(round(-2.613267*vehicle_components['Propellers']['Specifications']['Diameter_inches']**3+343.39216*vehicle_components['Propellers']['Specifications']['Diameter_inches']**2-15083.7121*vehicle_components['Propellers']['Specifications']['Diameter_inches']+235771, -2)))", "Change Reason": "Derived from vehicle component editor propeller size" },
+                "Q_A_ACCEL_R_MAX":  { "if": "'Q_A_ACCEL_R_MAX' in fc_parameters", "New Value": "max(10000,(round(-2.613267*vehicle_components['Propellers']['Specifications']['Diameter_inches']**3+343.39216*vehicle_components['Propellers']['Specifications']['Diameter_inches']**2-15083.7121*vehicle_components['Propellers']['Specifications']['Diameter_inches']+235771, -2)))", "Change Reason": "Derived from vehicle component editor propeller size" },
+                "Q_A_ACCEL_Y_MAX":  { "if": "'Q_A_ACCEL_Y_MAX' in fc_parameters", "New Value": "max(8000, round(-900*vehicle_components['Propellers']['Specifications']['Diameter_inches']+36000, -2))", "Change Reason": "Derived from vehicle component editor propeller size" },
+                "Q_A_ACC_P_MAX":    { "if": "'Q_A_ACC_P_MAX' in fc_parameters", "New Value": "max(10000,(round(-2.613267*vehicle_components['Propellers']['Specifications']['Diameter_inches']**3+343.39216*vehicle_components['Propellers']['Specifications']['Diameter_inches']**2-15083.7121*vehicle_components['Propellers']['Specifications']['Diameter_inches']+235771, -2)))/100", "Change Reason": "Derived from vehicle component editor propeller size" },
+                "Q_A_ACC_R_MAX":    { "if": "'Q_A_ACC_R_MAX' in fc_parameters", "New Value": "max(10000,(round(-2.613267*vehicle_components['Propellers']['Specifications']['Diameter_inches']**3+343.39216*vehicle_components['Propellers']['Specifications']['Diameter_inches']**2-15083.7121*vehicle_components['Propellers']['Specifications']['Diameter_inches']+235771, -2)))/100", "Change Reason": "Derived from vehicle component editor propeller size" },
+                "Q_A_ACC_Y_MAX":    { "if": "'Q_A_ACC_Y_MAX' in fc_parameters", "New Value": "max(8000, round(-900*vehicle_components['Propellers']['Specifications']['Diameter_inches']+36000, -2))/100", "Change Reason": "Derived from vehicle component editor propeller size" },
+                "Q_A_RAT_PIT_FLTD": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
+                "Q_A_RAT_PIT_FLTT": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
+                "Q_A_RAT_RLL_FLTD": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
+                "Q_A_RAT_RLL_FLTT": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
+                "Q_A_RAT_YAW_FLTT": { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0))) / 2", "Change Reason": "INS_GYRO_FILTER / 2" },
                 "INS_GYRO_FILTER":  { "New Value": "max(20, (round(289.22*vehicle_components['Propellers']['Specifications']['Diameter_inches']**-0.838, 0)))", "Change Reason": "Derived from vehicle component editor propeller size" },
-                "MOT_THST_EXPO":    { "New Value": "min(0.8, round(0.15686*log(vehicle_components['Propellers']['Specifications']['Diameter_inches'])+0.23693, 2))", "Change Reason": "Derived from vehicle component editor propeller size" }
+                "Q_M_THST_EXPO":    { "New Value": "min(0.8, round(0.15686*log(vehicle_components['Propellers']['Specifications']['Diameter_inches'])+0.23693, 2))", "Change Reason": "Derived from vehicle component editor propeller size" }
             },
             "old_filenames": ["11_initial_atc.param"]
         },
@@ -541,21 +567,21 @@
             "auto_changed_by": "",
             "autoimport_nondefault_regexp": ["BRD_IO_DSHOT", "BRD_IO_ENABLE", "SERVO_.*"],
             "derived_parameters": {
-                "MOT_PWM_MAX": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] not in ['Normal', 'Brushed', 'PWMAngle', 'PWMRange']", "New Value": "2000", "Change Reason": "Digital ESC protocol maximum is per definition 2000" },
-                "MOT_PWM_MIN": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] not in ['Normal', 'Brushed', 'PWMAngle', 'PWMRange']", "New Value": "1000", "Change Reason": "Digital ESC protocol minimum is per definition 1000" }
+                "Q_M_PWM_MAX": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] not in ['Normal', 'Brushed', 'PWMAngle', 'PWMRange']", "New Value": "2000", "Change Reason": "Digital ESC protocol maximum is per definition 2000" },
+                "Q_M_PWM_MIN": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] not in ['Normal', 'Brushed', 'PWMAngle', 'PWMRange']", "New Value": "1000", "Change Reason": "Digital ESC protocol minimum is per definition 1000" }
             },
             "add_parameters": {
                 "BRD_IO_DSHOT": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] in ['DShot150', 'DShot300', 'DShot600', 'DShot1200'] and 'BRD_IO_DSHOT' in fc_parameters" },
                 "BRD_IO_ENABLE": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] in ['DShot150', 'DShot300', 'DShot600', 'DShot1200'] and 'BRD_IO_ENABLE' in fc_parameters" },
-                "MOT_SPIN_ARM": { "Change Reason": "The minimum value at which the motors start spinning reliably" },
-                "MOT_SPIN_MAX": { "Change Reason": "The maximum value at which the motors spin" },
-                "MOT_SPIN_MIN": { "Change Reason": "MOT_SPIN_ARM plus at least 0.03" },
-                "MOT_THST_EXPO": { "Change Reason": "Throttle exponential curve from datasheet or from motor thrust stand" },
+                "Q_M_SPIN_ARM": { "Change Reason": "The minimum value at which the motors start spinning reliably" },
+                "Q_M_SPIN_MAX": { "Change Reason": "The maximum value at which the motors spin" },
+                "Q_M_SPIN_MIN": { "Change Reason": "Q_M_SPIN_ARM plus at least 0.03" },
+                "Q_M_THST_EXPO": { "Change Reason": "Throttle exponential curve from datasheet or from motor thrust stand" },
                 "SERVO_BLH_AUTO": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] in ['DShot150', 'DShot300', 'DShot600', 'DShot1200']" },
                 "SERVO_BLH_BDMASK": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] in ['DShot150', 'DShot300', 'DShot600', 'DShot1200'] and 'SERVO_BLH_BDMASK' in fc_parameters" },
                 "SERVO_DSHOT_ESC": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] in ['DShot150', 'DShot300', 'DShot600', 'DShot1200']" },
                 "SERVO_DSHOT_RATE": { "if": "vehicle_components['ESC']['FC->ESC Connection']['Protocol'] in ['DShot150', 'DShot300', 'DShot600', 'DShot1200']" },
-                "TKOFF_RPM_MIN": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Type'] != 'None'", "Change Reason": "For safety reasons, only start takeoff if all motors spin above this RPM" }
+                "Q_TKOFF_RPM_MIN": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Type'] != 'None'", "Change Reason": "For safety reasons, only start takeoff if all motors spin above this RPM" }
             },
             "delete_parameters": {
                 "ESC_HW_POLES": {},
@@ -614,7 +640,7 @@
             "forced_parameters": {
                 "LOG_BITMASK": { "New Value": 145374, "Change Reason": "Log relevant data for dynamic notch filter tuning. Later on we'll change this to other subsystems" },
                 "LOG_FILE_DSRMROT": { "New Value": 1, "Change Reason": "One .bin log file per flight, not per battery/reboot" },
-                "MOT_HOVER_LEARN": { "if": "fc_parameters['MOT_THST_HOVER'] > 0.125", "New Value": 2, "Change Reason": "So that it can tune the throttle controller on 24_throttle_controller.param file" }
+                "Q_M_HOVER_LEARN": { "if": "'Q_M_THST_HOVER' in fc_parameters and fc_parameters['Q_M_THST_HOVER'] > 0.125", "New Value": 2, "Change Reason": "So that it can tune the throttle controller on 24_throttle_controller.param file" }
             },
             "derived_parameters": {
                 "INS_LOG_BAT_MASK": { "New Value": "1 << int(fc_parameters['EK3_PRIMARY']) if 'F4' in vehicle_components['Flight Controller']['Specifications']['MCU Series'] or vehicle_components['Propellers']['Specifications']['Diameter_inches'] >= 15 else 0", "Change Reason": "'Use EKF primary acc and gyro batch logging on F4 processors or big props' if 'F4' in vehicle_components['Flight Controller']['Specifications']['MCU Series'] or vehicle_components['Propellers']['Specifications']['Diameter_inches'] >= 15 else 'EKF primary gyro raw logging'" },
@@ -642,8 +668,8 @@
         },
         "24_throttle_controller.param": {
             "why": "The throttle controller is crucial for maintaining altitude and controlling the vehicle's vertical movement.",
-            "why_now": "After the first flight because it depends on the MOT_THST_HOVER parameter, before the second flight so that it can safely use the altitude controller",
-            "blog_text": "Use MOT_THST_HOVER value calculated during the first flight to set throttle controller PIDs",
+            "why_now": "After the first flight because it depends on the Q_M_THST_HOVER parameter, before the second flight so that it can safely use the altitude controller",
+            "blog_text": "Use Q_M_THST_HOVER value calculated during the first flight to set throttle controller PIDs",
             "blog_url": "https://ardupilot.github.io/MethodicConfigurator/TUNING_GUIDE_ArduPlane#82-configure-the-throttle-controller",
             "wiki_text": "Test AltHold",
             "wiki_url": "https://ardupilot.org/copter/docs/initial-tuning-flight.html#test-althold",
@@ -652,14 +678,11 @@
             "mandatory_text": "100% mandatory (0% optional)",
             "auto_changed_by": "",
             "derived_parameters": {
-                "ATC_THR_MIX_MAN": { "New Value": "0.5", "Change Reason": "Because ALTHOLD flight mode was used for more than 30 seconds to correctly learn the MOT_THST_HOVER value" },
-                "PSC_ACCZ_I": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) < Version('4.7')", "New Value": "2*fc_parameters['MOT_THST_HOVER']", "Change Reason": "Use 2 * MOT_THST_HOVER assuming MOT_THST_HOVER has been correctly learned" },
-                "PSC_D_ACC_I": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.7')", "New Value": "0.2*fc_parameters['MOT_THST_HOVER']", "Change Reason": "Use 0.2 * MOT_THST_HOVER assuming MOT_THST_HOVER has been correctly learned" },
-                "PSC_ACCZ_P": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) < Version('4.7')", "New Value": "1*fc_parameters['MOT_THST_HOVER']", "Change Reason": "Use MOT_THST_HOVER assuming MOT_THST_HOVER has been correctly learned" },
-                "PSC_D_ACC_P": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.7')", "New Value": "0.1*fc_parameters['MOT_THST_HOVER']", "Change Reason": "Use 0.1 * MOT_THST_HOVER assuming MOT_THST_HOVER has been correctly learned" }
-            },
-            "add_parameters": {
-                "MOT_BAT_VOLT_MAX": { "New Value": "fc_parameters['MOT_BAT_VOLT_MAX']", "Change Reason": "To correctly scale the PID gains. Voltage of a healthy, fully charged battery immediately after takeoff. Read from a flight log" }
+                "Q_A_THR_MIX_MAN": { "New Value": "0.5", "Change Reason": "Because ALTHOLD flight mode was used for more than 30 seconds to correctly learn the Q_M_THST_HOVER value" },
+                "Q_P_ACCZ_I": { "if": "'Q_M_THST_HOVER' in fc_parameters and Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) < Version('4.7')", "New Value": "2*fc_parameters['Q_M_THST_HOVER']", "Change Reason": "Use 2 * Q_M_THST_HOVER assuming Q_M_THST_HOVER has been correctly learned" },
+                "Q_P_D_ACC_I": { "if": "'Q_M_THST_HOVER' in fc_parameters and Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.7')", "New Value": "0.2*fc_parameters['Q_M_THST_HOVER']", "Change Reason": "Use 0.2 * Q_M_THST_HOVER assuming Q_M_THST_HOVER has been correctly learned" },
+                "Q_P_ACCZ_P": { "if": "'Q_M_THST_HOVER' in fc_parameters and Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) < Version('4.7')", "New Value": "1*fc_parameters['Q_M_THST_HOVER']", "Change Reason": "Use Q_M_THST_HOVER assuming Q_M_THST_HOVER has been correctly learned" },
+                "Q_P_D_ACC_P": { "if": "'Q_M_THST_HOVER' in fc_parameters and Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.7')", "New Value": "0.1*fc_parameters['Q_M_THST_HOVER']", "Change Reason": "Use 0.1 * Q_M_THST_HOVER assuming Q_M_THST_HOVER has been correctly learned" }
             },
             "old_filenames": ["19_throttle_controller.param", "20_throttle_controller.param"]
         },
@@ -722,18 +745,18 @@
             "external_tool_url": "https://firmware.ardupilot.org/Tools/WebTools/FilterReview/",
             "mandatory_text": "100% mandatory (0% optional)",
             "auto_changed_by": "",
-            "autoimport_nondefault_regexp": ["FILT.+", "ATC_RAT_.+_N[ET]F", "PSC_ACCZ_N[ET]F"],
+            "autoimport_nondefault_regexp": ["FILT.+", "Q_A_RAT_.+_N[ET]F", "Q_P_ACCZ_N[ET]F"],
             "add_parameters": {
-                "ATC_RAT_RLL_NEF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
-                "ATC_RAT_RLL_NTF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
-                "ATC_RAT_PIT_NEF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
-                "ATC_RAT_PIT_NTF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
-                "ATC_RAT_YAW_NEF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
-                "ATC_RAT_YAW_NTF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
-                "PSC_ACCZ_NEF": { "if": "'PSC_ACCZ_NEF' in fc_parameters", "New Value": "0", "Change Reason": "" },
-                "PSC_ACCZ_NTF": { "if": "'PSC_ACCZ_NTF' in fc_parameters", "New Value": "0", "Change Reason": "" },
-                "PSC_D_ACC_NEF": { "if": "'PSC_D_ACC_NEF' in fc_parameters", "New Value": "0", "Change Reason": "" },
-                "PSC_D_ACC_NTF": { "if": "'PSC_D_ACC_NTF' in fc_parameters", "New Value": "0", "Change Reason": "" }
+                "Q_A_RAT_RLL_NEF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
+                "Q_A_RAT_RLL_NTF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
+                "Q_A_RAT_PIT_NEF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
+                "Q_A_RAT_PIT_NTF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
+                "Q_A_RAT_YAW_NEF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
+                "Q_A_RAT_YAW_NTF": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) >= Version('4.5')", "New Value": "0", "Change Reason": "" },
+                "Q_P_ACCZ_NEF": { "if": "'Q_P_ACCZ_NEF' in fc_parameters", "New Value": "0", "Change Reason": "" },
+                "Q_P_ACCZ_NTF": { "if": "'Q_P_ACCZ_NTF' in fc_parameters", "New Value": "0", "Change Reason": "" },
+                "Q_P_D_ACC_NEF": { "if": "'Q_P_D_ACC_NEF' in fc_parameters", "New Value": "0", "Change Reason": "" },
+                "Q_P_D_ACC_NTF": { "if": "'Q_P_D_ACC_NTF' in fc_parameters", "New Value": "0", "Change Reason": "" }
             },
             "old_filenames": []
         },
@@ -754,8 +777,12 @@
                 "QUIK_ENABLE": { "New Value": 1, "Change Reason": "Use VTOL-Quicktune lua script to estimate a good PID starting values" }
             },
             "old_filenames": ["20_quick_tune_setup.param", "22_quick_tune_setup.param"],
-            "download_file": { "source_url": "https://raw.githubusercontent.com/ArduPilot/ardupilot/Copter-4.5/libraries/AP_Scripting/applets/VTOL-quicktune.lua", "dest_local": "VTOL-quicktune.lua" },
-            "upload_file": { "source_local": "VTOL-quicktune.lua", "dest_on_fc": "/APM/Scripts/VTOL-quicktune.lua" }
+            "download_file": [
+                { "source_url": "https://raw.githubusercontent.com/ArduPilot/ardupilot/Copter-4.5/libraries/AP_Scripting/applets/VTOL-quicktune.lua", "dest_local": "VTOL-quicktune.lua" }
+            ],
+            "upload_file": [
+                { "source_local": "VTOL-quicktune.lua", "dest_on_fc": "/APM/Scripts/VTOL-quicktune.lua" }
+            ]
         },
         "30_quick_tune_results.param": {
             "why": "The VTOL-quicktune lua script can safely estimate good PID starting values for the vehicle.",
@@ -769,25 +796,25 @@
             "mandatory_text": "80% mandatory (20% optional)",
             "auto_changed_by": "VTOL-quicktune lua script",
             "add_parameters": {
-                "ATC_RAT_PIT_D": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_PIT_FLTD": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_PIT_FLTT": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_PIT_I": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_PIT_P": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_PIT_SMAX": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_RLL_D": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_RLL_FLTD": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_RLL_FLTT": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_RLL_I": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_RLL_P": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_RLL_SMAX": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_YAW_D": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_YAW_FLTD": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_YAW_FLTE": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_YAW_FLTT": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_YAW_I": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_YAW_P": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
-                "ATC_RAT_YAW_SMAX": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" }
+                "Q_A_RAT_PIT_D": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_PIT_FLTD": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_PIT_FLTT": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_PIT_I": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_PIT_P": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_PIT_SMAX": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_RLL_D": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_RLL_FLTD": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_RLL_FLTT": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_RLL_I": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_RLL_P": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_RLL_SMAX": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_YAW_D": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_YAW_FLTD": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_YAW_FLTE": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_YAW_FLTT": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_YAW_I": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_YAW_P": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" },
+                "Q_A_RAT_YAW_SMAX": { "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) <= Version('4.7')", "Change Reason": "Tuned by quiktune" }
             },
             "old_filenames": ["21_quick_tune_results.param", "23_quick_tune_results.param"]
         },
@@ -805,7 +832,7 @@
             "autoimport_nondefault_regexp": ["MAGH_.*"],
             "forced_parameters": {
                 "MAGH_LOG_ENABLE": { "New Value": 1, "Change Reason": "Activates the logging of the MAGH.Active message" },
-                "QUIK_ENABLE": { "New Value": 0, "Change Reason": "Quiktune is now completed. Disable it so that we can use the same RC switch to operate the wp-advance script" },
+                "QUIK_ENABLE": { "New Value": 0, "Change Reason": "Quiktune is now completed. Disable it so that we can use the same RC switch to operate the advance-wp script" },
                 "SCR_ENABLE": { "New Value": 1, "Change Reason": "Use lua scripting for MagFit flight path automation" }
             },
             "add_parameters": {
@@ -822,8 +849,14 @@
             },
             "jump_possible": {"66_everyday_use.param": "If you are impatient and do not want a fully optimized flight controller\nYou can skip some steps now.\n\nJump to '66_everyday_use.param' file?"},
             "old_filenames": ["22_inflight_magnetometer_fit_setup.param", "24_inflight_magnetometer_fit_setup.param"],
-            "download_file": { "source_url": "https://discuss.ardupilot.org/uploads/short-url/4pyrl7PcfqiMEaRItUhljuAqLSs.lua", "dest_local": "copter-magfit-helper.lua" },
-            "upload_file": { "source_local": "copter-magfit-helper.lua", "dest_on_fc": "/APM/Scripts/copter-magfit-helper.lua" }
+            "download_file": [
+                { "source_url": "https://discuss.ardupilot.org/uploads/short-url/4pyrl7PcfqiMEaRItUhljuAqLSs.lua", "dest_local": "copter-magfit-helper.lua" },
+                { "source_url": "https://raw.githubusercontent.com/ArduPilot/ardupilot/Copter-4.6.0/libraries/AP_Scripting/applets/advance-wp.lua", "dest_local": "advance-wp.lua" }
+            ],
+            "upload_file": [
+                { "source_local": "copter-magfit-helper.lua", "dest_on_fc": "/APM/Scripts/copter-magfit-helper.lua" },
+                { "source_local": "advance-wp.lua", "dest_on_fc": "/APM/Scripts/advance-wp.lua" }
+            ]
         },
         "32_inflight_magnetometer_fit_results.param": {
             "why": "The compass heading is crucial for the vehicle's navigation and the calibration is very accurate if done during a special flight path.",
@@ -911,13 +944,13 @@
             "mandatory_text": "80% mandatory (20% optional)",
             "auto_changed_by": "",
             "forced_parameters": {
-                "ATC_RATE_FF_ENAB": { "New Value": 0, "Change Reason": "test the stabilization loops independent of the input shaping" },
+                "Q_A_RATE_FF_ENAB": { "New Value": 0, "Change Reason": "test the stabilization loops independent of the input shaping" },
                 "INS_LOG_BAT_MASK": { "New Value": 0, "Change Reason": "IMU batch logging no longer required, notch filter setup is complete, this reduces processor load and log file size" },
                 "INS_RAW_LOG_OPT": { "New Value": 0, "Change Reason": "Gyro raw logging no longer required, notch filter setup is complete, this reduces processor load and log file size" },
                 "LOG_BITMASK": { "New Value": 145118, "Change Reason": "Disable fast harmonic notch logging" }
             },
             "add_parameters": {
-                "MOT_HOVER_LEARN": { "if": "vehicle_components['Frame']['Specifications']['TOW max Kg'] - vehicle_components['Frame']['Specifications']['TOW min Kg'] < 0.01*vehicle_components['Frame']['Specifications']['TOW max Kg']", "New Value": "1", "Change Reason": "The vehicle TOW weight does not change, so no need to save it" }
+                "Q_M_HOVER_LEARN": { "if": "vehicle_components['Frame']['Specifications']['TOW max Kg'] - vehicle_components['Frame']['Specifications']['TOW min Kg'] < 0.01*vehicle_components['Frame']['Specifications']['TOW max Kg']", "New Value": "1", "Change Reason": "The vehicle TOW weight does not change, so no need to save it" }
             },
             "old_filenames": ["26_evaluate_the_aircraft_tune_ff_disable.param", "28_evaluate_the_aircraft_tune_ff_disable.param"]
         },
@@ -933,7 +966,7 @@
             "mandatory_text": "80% mandatory (20% optional)",
             "auto_changed_by": "",
             "forced_parameters": {
-                "ATC_RATE_FF_ENAB": { "New Value": 1, "Change Reason": "re-enable normal operation, activate input shaping" }
+                "Q_A_RATE_FF_ENAB": { "New Value": 1, "Change Reason": "re-enable normal operation, activate input shaping" }
             },
             "old_filenames": ["27_evaluate_the_aircraft_tune_ff_enable.param", "29_evaluate_the_aircraft_tune_ff_enable.param"]
         },
@@ -954,6 +987,7 @@
             "old_filenames": ["28_autotune_roll_setup.param", "30_autotune_roll_setup.param"]
         },
         "36_autotune_roll_results.param": {
+            "plugin": {"name": "autotune_gain_backoff", "placement": "top", "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) < Version('4.7.0') and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'"},
             "why": "To record autotune results after roll step response optimization",
             "why_now": "Because roll is usually the axis that has the highest dynamic, and we start with the highest dynamic axis",
             "blog_text": "Record the results of the roll axis autotuning, providing data for analysis and adjustment.",
@@ -983,6 +1017,7 @@
             "old_filenames": ["30_autotune_pitch_setup.param", "32_autotune_pitch_setup.param"]
         },
         "38_autotune_pitch_results.param": {
+            "plugin": {"name": "autotune_gain_backoff", "placement": "top", "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) < Version('4.7.0') and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'"},
             "why": "To record autotune results after pitch step response optimization",
             "why_now": "Because pitch is usually the axis that has the second highest dynamic, and we continue with the second highest dynamic axis",
             "blog_text": "Record the results of the pitch axis autotuning",
@@ -1010,11 +1045,12 @@
                 "AUTOTUNE_AXES": { "New Value": 4, "Change Reason": "Autotune yaw axis" }
             },
             "derived_parameters": {
-                "ATC_RAT_YAW_FLTD": { "New Value": "fc_parameters['INS_GYRO_FILTER'] / 4", "Change Reason": "Use INS_GYRO_FILTER / 4 as a first guess" }
+                "Q_A_RAT_YAW_FLTD": { "New Value": "fc_parameters['INS_GYRO_FILTER'] / 4", "Change Reason": "Use INS_GYRO_FILTER / 4 as a first guess" }
             },
             "old_filenames": ["32_autotune_yaw_setup.param", "34_autotune_yaw_setup.param"]
         },
         "40_autotune_yaw_results.param": {
+            "plugin": {"name": "autotune_gain_backoff", "placement": "top", "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) < Version('4.7.0') and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'"},
             "why": "To record autotune results after yaw step response optimization",
             "why_now": "Because yaw is usually the axis that has the third highest dynamic, and we continue with the third highest dynamic axis",
             "blog_text": "Record the results of the yaw axis autotuning, providing data for analysis and adjustment.",
@@ -1044,6 +1080,7 @@
             "old_filenames": ["34_autotune_yawd_setup.param", "36_autotune_yawd_setup.param"]
         },
         "42_autotune_yawd_results.param": {
+            "plugin": {"name": "autotune_gain_backoff", "placement": "top", "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) < Version('4.7.0') and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'"},
             "why": "To record autotune results after yaw D step response optimization",
             "why_now": "Because yaw D can only be done after yaw",
             "blog_text": "Record the results of the yaw rate autotuning",
@@ -1073,6 +1110,7 @@
             "old_filenames": ["36_autotune_roll_pitch_retune_setup.param", "38_autotune_roll_pitch_retune_setup.param"]
         },
         "44_autotune_roll_pitch_retune_results.param": {
+            "plugin": {"name": "autotune_gain_backoff", "placement": "top", "if": "Version(vehicle_components['Flight Controller']['Firmware']['Version'].split(' ')[0]) < Version('4.7.0') and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'"},
             "why": "To record autotune roll-pitch results",
             "why_now": "Because it can only be done after the respective autotune flight",
             "blog_text": "Record the results of the roll and pitch axis retuning, providing data for analysis and adjustment.",
@@ -1086,7 +1124,7 @@
             "old_filenames": ["37_autotune_roll_pitch_retune_results.param", "39_autotune_roll_pitch_retune_results.param"]
         },
         "45_autotune_finish.param": {
-            "why": "ATC_THR_MIX_MAX should be increased after autotune to maximize attitude control authority at high throttle",
+            "why": "Q_A_THR_MIX_MAX should be increased after autotune to maximize attitude control authority at high throttle",
             "why_now": "After all autotune flights are complete and the PIDs are finalized",
             "blog_text": "Finalize autotune by setting the maximum throttle mix parameter",
             "blog_url": "https://ardupilot.github.io/MethodicConfigurator/TUNING_GUIDE_ArduPlane#955-roll-and-pitch-axis-re-autotune",
@@ -1097,14 +1135,14 @@
             "mandatory_text": "100% mandatory (0% optional)",
             "auto_changed_by": "",
             "forced_parameters": {
-                "ATC_THR_MIX_MAX": { "New Value": 0.9, "Change Reason": "Maximize attitude control authority at high throttle" }
+                "Q_A_THR_MIX_MAX": { "New Value": 0.9, "Change Reason": "Maximize attitude control authority at high throttle" }
             },
             "old_filenames": []
         },
         "46_pid_d_ff.param": {
             "why": "The D feed-forward term improves aggressive rate tracking and gives the drone a 'locked-in' feel with minimal control latency",
             "why_now": "After all autotune axes are complete and PID values are finalized, since D_FF is calculated from the final tuned PID response",
-            "blog_text": "Calculate angle rate derivative feed-forward gains (ATC_RAT_*_D_FF and PSC_ACCZ_D_FF) to improve aggressive maneuver tracking",
+            "blog_text": "Calculate angle rate derivative feed-forward gains (Q_A_RAT_*_D_FF and Q_P_ACCZ_D_FF) to improve aggressive maneuver tracking",
             "blog_url": "https://ardupilot.github.io/MethodicConfigurator/TUNING_GUIDE_ArduCopter#97-angle-rate-derivative-feed-forward-calculation",
             "wiki_text": "",
             "wiki_url": "",
@@ -1112,7 +1150,7 @@
             "external_tool_url": "https://firmware.ardupilot.org/Tools/WebTools/PIDReview/",
             "mandatory_text": "0% mandatory (100% optional)",
             "auto_changed_by": "",
-            "autoimport_nondefault_regexp": ["ATC_RAT_.+_D_FF", "PSC_ACCZ_D_FF", "PSC_D_ACC_D_FF"],
+            "autoimport_nondefault_regexp": ["Q_A_RAT_.+_D_FF", "Q_P_ACCZ_D_FF", "Q_P_D_ACC_D_FF"],
             "old_filenames": []
         },
         "47_windspeed_estimation.param": {
@@ -1288,7 +1326,7 @@
             "auto_changed_by": "",
             "forced_parameters": {
                 "ARMING_CHECK": { "New Value": 1, "Change Reason": "Normal state for everyday use" },
-                "ATC_RATE_FF_ENAB": { "New Value": 1, "Change Reason": "Restore value now that system identification is done" },
+                "Q_A_RATE_FF_ENAB": { "New Value": 1, "Change Reason": "Restore value now that system identification is done" },
                 "SID_AXIS": { "New Value": 0, "Change Reason": "No more system identification chip injections" }
             },
             "old_filenames": ["44_analytical_pid_optimization.param", "46_analytical_pid_optimization.param"]

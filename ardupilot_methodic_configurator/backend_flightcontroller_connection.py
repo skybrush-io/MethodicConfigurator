@@ -9,7 +9,9 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import contextlib
+from collections import deque
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from logging import debug as logging_debug
 from logging import error as logging_error
 from logging import info as logging_info
@@ -18,9 +20,10 @@ from os import name as os_name
 from os import path as os_path
 from os import readlink as os_readlink
 from sys import platform as sys_platform
+from time import monotonic
 from time import sleep as time_sleep
 from time import time as time_time
-from typing import TYPE_CHECKING, Any, ClassVar, NoReturn, Optional, Union, no_type_check
+from typing import TYPE_CHECKING, Any, ClassVar, NoReturn, Optional, Union, cast, no_type_check
 
 import serial.tools.list_ports
 import serial.tools.list_ports_common
@@ -38,10 +41,71 @@ from ardupilot_methodic_configurator.backend_flightcontroller_factory_serial imp
     SerialPortDiscovery,
     SystemSerialPortDiscovery,
 )
+from ardupilot_methodic_configurator.backend_radio_status import RadioStatusBackend
+from ardupilot_methodic_configurator.data_model_fc_diagnostics import StatusTextAssembler, message_source
+from ardupilot_methodic_configurator.data_model_fc_ids import VID_PID_PRODUCT_DICT, VID_VENDOR_DICT
 from ardupilot_methodic_configurator.data_model_flightcontroller_info import FlightControllerInfo
 
 if TYPE_CHECKING:
     from ardupilot_methodic_configurator.backend_flightcontroller_protocols import MavlinkConnection
+
+# pymavlink initializes this dialect module dynamically and types it as optional.
+mavlink = cast("Any", mavutil.mavlink)
+
+_KNOWN_FC_MANUFACTURERS = tuple(
+    manufacturer.casefold() for manufacturers in VID_VENDOR_DICT.values() for manufacturer in manufacturers
+)
+_KNOWN_FC_BOARD_NAMES = tuple(board.casefold() for boards in VID_PID_PRODUCT_DICT.values() for board in boards)
+_KNOWN_FC_USB_IDS = frozenset(VID_PID_PRODUCT_DICT)
+_KNOWN_TELEMETRY_USB_SERIAL_IDS = frozenset(
+    {
+        (0x0403, 0x6001),  # FTDI FT232R USB-to-serial cable
+        (0x10C4, 0xEA60),  # Silicon Labs CP2102
+    }
+)
+
+
+def _connection_device_key(device: str, *, raise_on_resolution_error: bool = False) -> str:
+    """
+    Deduplicate connection aliases without resolving COM or network endpoints.
+
+    Presence checks can request resolution errors instead of an uncertain fallback.
+    """
+    # Windows realpath can open COM devices and time out on Bluetooth ports.
+    # COM28, com28 and \\.\COM28 identify the same endpoint without any I/O.
+    com_device = device.removeprefix("\\\\.\\").upper()
+    if com_device.startswith("COM") and com_device[3:].isdigit():
+        return com_device
+    if device.startswith(("udp", "tcp")):
+        return device
+    try:
+        return os_path.realpath(device)
+    except OSError:
+        if raise_on_resolution_error:
+            raise
+        # Inaccessible or disappearing POSIX paths must remain usable fallbacks.
+        return device
+
+
+def _serial_port_autodetect_rank(port: ListPortInfo) -> int:
+    """Rank USB metadata without opening the port; larger values are tried first."""
+    usb_id = (port.vid, port.pid)
+    if usb_id in _KNOWN_FC_USB_IDS:
+        return 4
+
+    metadata = " ".join(
+        str(value).casefold()
+        for value in (port.description, port.manufacturer, port.product, port.interface)
+        if value and str(value).casefold() != "n/a"
+    )
+    if "mavlink" in metadata or any(name in metadata for name in _KNOWN_FC_MANUFACTURERS + _KNOWN_FC_BOARD_NAMES):
+        return 3
+    if usb_id in _KNOWN_TELEMETRY_USB_SERIAL_IDS:
+        return 2
+    return 0
+
+
+# pylint: disable=too-many-lines
 
 
 class FakeSerialForTests:
@@ -72,6 +136,7 @@ class FakeSerialForTests:
 
 
 DEFAULT_BAUDRATE: int = 115200
+FC_STATUS_TEXT_BUFFER_LIMIT = 100
 DEVICE_FC_PARAM_FROM_FILE: str = "file"  # Special device name to simulate FC parameters from params.param file
 # https://github.com/ArduPilot/ardupilot/blob/master/libraries/AP_SerialManager/AP_SerialManager.cpp#L741C1-L757C32
 SUPPORTED_BAUDRATES: list[str] = [
@@ -111,6 +176,7 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
     CONNECTION_RETRY_COUNT: ClassVar[int] = 3
     CONNECTION_TIMEOUT: ClassVar[int] = 5
     CONNECTION_RETRY_TIMEOUT: ClassVar[int] = 2
+    CONNECTION_RETRY_DELAY: ClassVar[float] = 1.0
     HEARTBEAT_POLL_DELAY: ClassVar[float] = 0.1
     BANNER_RECEIVE_TIMEOUT: ClassVar[float] = 1.0
 
@@ -120,7 +186,7 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
         "udp:0.0.0.0:14550",
     ]
 
-    def __init__(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def __init__(
         self,
         info: FlightControllerInfo,
         baudrate: int = DEFAULT_BAUDRATE,
@@ -143,6 +209,7 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
         self.master: MavlinkConnection | None = None
         self.comport: mavutil.SerialPort | serial.tools.list_ports_common.ListPortInfo | None = None
         self._baudrate = baudrate
+        self._active_baudrate = baudrate
         self._network_ports = list(network_ports) if network_ports is not None else self.DEFAULT_NETWORK_PORTS[:]
         self._connection_tuples: list[tuple[str, str]] = []
         self._logged_connection_tuples: list[tuple[str, str]] | None = None  # None = never logged
@@ -151,11 +218,88 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             mavlink_connection_factory or SystemMavlinkConnectionFactory()
         )
         self._banner_text_buffer: list[str] = []
+        self._status_text_buffer: deque[tuple[datetime, str]] = deque(maxlen=FC_STATUS_TEXT_BUFFER_LIMIT)
+        self._status_text_assembler = StatusTextAssembler()
+        self._receiving_banner = False
+        self._radio_status = RadioStatusBackend()
 
     @property
     def banner_text_buffer(self) -> list[str]:
-        """Return the most recently received flight-controller banner text."""
-        return self._banner_text_buffer[:]
+        """Return startup banner text from the flight controller."""
+        return list(self._banner_text_buffer)
+
+    @property
+    def status_text_buffer(self) -> list[str]:
+        """Return the latest runtime STATUSTEXT messages."""
+        return [text for _received_at, text in self._status_text_buffer if text not in self._banner_text_buffer]
+
+    @property
+    def status_text_display_buffer(self) -> list[str]:
+        """Return runtime STATUSTEXT lines newest first, prefixed with their local arrival time."""
+        return [
+            f"[{received_at:%Y-%m-%d %H:%M:%S}] {text}"
+            for received_at, text in reversed(self._status_text_buffer)
+            if text not in self._banner_text_buffer
+        ]
+
+    def append_status_text(self, text: str) -> None:
+        """Retain a received STATUSTEXT message for the flight-controller banner window."""
+        status_text = text.strip()
+        if not status_text:
+            return
+        if self._receiving_banner:
+            if status_text not in self._banner_text_buffer:
+                self._banner_text_buffer.append(status_text)
+            self._status_text_buffer = deque(
+                ((received_at, text) for received_at, text in self._status_text_buffer if text != status_text),
+                maxlen=FC_STATUS_TEXT_BUFFER_LIMIT,
+            )
+            return
+        if status_text in self._banner_text_buffer:
+            return
+        self._status_text_buffer.append((datetime.now().astimezone(), status_text))
+
+    def poll_status_text(self) -> list[str]:
+        """Read a bounded batch while the diagnostics UI exclusively owns the idle connection."""
+        deadline = monotonic() + 0.02
+        try:
+            for _packet in range(1000):
+                if self.master is None or monotonic() >= deadline:
+                    break
+                if self.master.recv_match(blocking=False) is None:  # pyright: ignore[reportAttributeAccessIssue]
+                    break
+        except (OSError, SerialException) as exc:
+            logging_debug("Failed to read flight-controller diagnostics: %s", exc)
+        return self.status_text_buffer
+
+    def _register_status_text_hook(self, master: object) -> None:
+        """Register a PyMAVLink message hook to capture STATUSTEXT before type filtering."""
+        message_hooks = getattr(master, "message_hooks", None)
+        if isinstance(message_hooks, list) and self._capture_status_text not in message_hooks:
+            message_hooks.append(self._capture_status_text)
+
+    def _capture_status_text(self, master: object, message: object) -> None:
+        """Capture STATUSTEXT messages whenever PyMAVLink parses an incoming packet."""
+        get_message_type = getattr(message, "get_type", None)
+        if not callable(get_message_type) or get_message_type() != "STATUSTEXT":
+            return
+        source = message_source(message)
+        target_system = int(self.info.system_id) if self.info.system_id else getattr(master, "target_system", None)
+        target_component = int(self.info.component_id) if self.info.component_id else getattr(master, "target_component", None)
+        if isinstance(target_system, int) and target_system > 0 and (source is None or source[0] != target_system):
+            return
+        if isinstance(target_component, int) and target_component > 0 and (source is None or source[1] != target_component):
+            return
+        status_text = self._status_text_assembler.assemble(message)
+        if status_text is not None:
+            self.append_status_text(status_text)
+
+    def _clear_diagnostics(self) -> None:
+        """Reset complete and unfinished diagnostics at connection boundaries."""
+        self._banner_text_buffer.clear()
+        self._status_text_buffer.clear()
+        self._status_text_assembler.clear()
+        self._receiving_banner = False
 
     def discover_connections(
         self,
@@ -229,13 +373,19 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
 
         self._logged_connection_tuples = list(current)
 
+    def start_gcs_heartbeat(self) -> None:
+        """Keep GCS heartbeats alive until disconnect once a telemetry host requests them."""
+        if self.master is not None:
+            self._radio_status.start(self.master)
+
     def disconnect(self) -> None:
         """Close the connection to the flight controller."""
+        self._radio_status.close()
         if self.master is not None:
             with contextlib.suppress(Exception):
                 self.master.close()  # pyright: ignore[reportAttributeAccessIssue]
             self.master = None
-        self._banner_text_buffer.clear()
+        self._clear_diagnostics()
         self.info.reset()
 
     def add_connection(self, connection_string: str) -> bool:
@@ -260,7 +410,6 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             logging_debug(_("Did not add empty connection"))
         return False
 
-    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def _register_and_try_connect(
         self,
         comport: mavutil.SerialPort | serial.tools.list_ports_common.ListPortInfo,
@@ -308,9 +457,9 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
         Establishes a connection to the FlightController using a specified device.
 
         This method attempts to connect to the FlightController using the provided device
-        connection string. If no device is specified, it attempts to auto-detect a serial
-        port that matches the preferred ports list. If no serial device is found it tries
-        the "standard" ArduPilot UDP and TCP connections.
+        connection string. If no device is specified, it ranks candidates using USB IDs
+        and serial-port metadata, then opens them in priority order to confirm MAVLink.
+        If no candidate connects, it tries the "standard" ArduPilot UDP and TCP connections.
 
         Args:
             device (str): The connection string to the flight controller. If an empty string
@@ -327,10 +476,11 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
 
         """
         connection_baudrate = baudrate if baudrate is not None else self._baudrate
+        self._active_baudrate = connection_baudrate
 
         # Always clear cached metadata before attempting a new connection so UI
         # components never display stale data while we probe ports.
-        self._banner_text_buffer.clear()
+        self._clear_diagnostics()
         self.info.reset()
 
         if device:
@@ -345,25 +495,24 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
         # Try to autodetect serial ports
         if progress_callback:
             progress_callback(10, 100)  # Starting serial detection
-        autodetect_serial = self._auto_detect_serial()
-        if autodetect_serial:
-            # Resolve the soft link if it's a Linux system
+        autodetect_serial = self._auto_detect_serial() or []
+        # Prefer the last endpoint, as dual-interface FCs commonly expose SLCAN
+        # first and MAVLink second. Fall back to the other detected endpoints.
+        for index, comport in enumerate(reversed(autodetect_serial)):
+            # Resolve each Linux symlink separately; only one endpoint may carry MAVLink.
             if os_name == "posix":
                 try:
-                    dev = autodetect_serial[0].device
-                    logging_debug(_("Auto-detected device %s"), dev)
-                    # Get the directory part of the soft link
-                    softlink_dir = os_path.dirname(dev)
-                    # Resolve the soft link and join it with the directory part
-                    resolved_path = os_path.abspath(os_path.join(softlink_dir, os_readlink(dev)))
-                    autodetect_serial[0].device = resolved_path
-                    logging_debug(_("Resolved soft link %s to %s"), dev, resolved_path)
+                    device = comport.device
+                    logging_debug(_("Auto-detected device %s"), device)
+                    softlink_dir = os_path.dirname(device)
+                    comport.device = os_path.abspath(os_path.join(softlink_dir, os_readlink(device)))
+                    logging_debug(_("Resolved soft link %s to %s"), device, comport.device)
                 except OSError:
                     pass  # Not a soft link, proceed with the original device path
             if progress_callback:
-                progress_callback(25, 100)  # Trying serial
+                progress_callback(25 + index * 20 // max(1, len(autodetect_serial)), 100)
             err = self._register_and_try_connect(
-                comport=autodetect_serial[-1],
+                comport=comport,
                 progress_callback=progress_callback,
                 baudrate=connection_baudrate,
                 log_errors=False,
@@ -393,7 +542,7 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
 
         return _("No auto-detected ports responded.")
 
-    def _create_mavlink_connection(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def _create_mavlink_connection(
         self,
         device: str,
         baudrate: int = 115200,
@@ -425,12 +574,15 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             progress_callback=progress_callback,
         )
 
-    def _detect_vehicles_from_heartbeats(self, timeout: int) -> dict[tuple[int, int], Any]:
+    def _detect_vehicles_from_heartbeats(
+        self, timeout: int, return_after_first_heartbeat: bool = False
+    ) -> dict[tuple[int, int], Any]:
         """
         Detect all vehicles by collecting HEARTBEAT messages within timeout period.
 
         Args:
-            timeout: Time in seconds to wait for HEARTBEAT messages
+            timeout: Time in seconds to wait for HEARTBEAT messages.
+            return_after_first_heartbeat: Stop when a supported vehicle responds.
 
         Returns:
             dict[tuple[int, int], Any]: Dictionary mapping (system_id, component_id) to HEARTBEAT message
@@ -438,7 +590,6 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
         """
         start_time = time_time()
         detected_vehicles: dict[tuple[int, int], Any] = {}
-
         while time_time() - start_time < timeout:
             try:
                 m = (
@@ -462,6 +613,8 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             compid = m.get_srcComponent()
             detected_vehicles[(sysid, compid)] = m
             logging_debug(_("Detected vehicle %u:%u (autopilot=%u, type=%u)"), sysid, compid, m.autopilot, m.type)
+            if return_after_first_heartbeat and m.autopilot == mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA:
+                return detected_vehicles
 
         return detected_vehicles
 
@@ -486,6 +639,8 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             )
             self.info.set_autopilot(m.autopilot)
             if self.info.is_supported:
+                # Discovery can encounter several vehicles before selecting this one.
+                self._clear_diagnostics()
                 msg = _("Autopilot type {self.info.autopilot}")
                 logging_info(msg.format(**locals()))
                 self.info.set_type(m.type)
@@ -514,7 +669,7 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
         banner_msgs = self._receive_banner_text()
 
         # Request AUTOPILOT_VERSION message
-        self._request_message(mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION)
+        self._request_message(mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION)
         m = (
             self.master.recv_match(  # pyright: ignore[reportAttributeAccessIssue]
                 type="AUTOPILOT_VERSION", blocking=True, timeout=timeout
@@ -534,7 +689,7 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             self.master.mav.command_long_send(  # pyright: ignore[reportAttributeAccessIssue]
                 self.master.target_system,  # pyright: ignore[reportAttributeAccessIssue]
                 self.master.target_component,  # pyright: ignore[reportAttributeAccessIssue]
-                mavutil.mavlink.MAV_CMD_DO_SEND_BANNER,
+                mavlink.MAV_CMD_DO_SEND_BANNER,
                 # pylint: disable=duplicate-code
                 0,
                 0,
@@ -556,21 +711,21 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
 
         """
         start_time = time_time()
-        banner_msgs: list[str] = []
-        while self.master:
-            msg = self.master.recv_match(  # pyright: ignore[reportAttributeAccessIssue]
-                type="STATUSTEXT", blocking=False
-            )
-            if msg:
-                self._banner_text_buffer.append(msg.text)
-                if banner_msgs:
-                    banner_msgs.append(msg.text)
-                else:
-                    banner_msgs = [msg.text]
-            time_sleep(0.1)  # Sleep briefly to reduce CPU usage
-            if time_time() - start_time > self.BANNER_RECEIVE_TIMEOUT:
-                break  # Exit the loop if timeout elapsed
-        return banner_msgs
+        self._receiving_banner = True
+        try:
+            while self.master:
+                # The packet hook assembles and routes complete banner messages.
+                while (
+                    self.master.recv_match(type="STATUSTEXT", blocking=False)  # pyright: ignore[reportAttributeAccessIssue]
+                    is not None
+                ):
+                    pass
+                time_sleep(0.1)
+                if time_time() - start_time > self.BANNER_RECEIVE_TIMEOUT:
+                    break
+        finally:
+            self._receiving_banner = False
+        return self.banner_text_buffer
 
     def _request_message(self, message_id: int) -> None:
         """
@@ -590,7 +745,7 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             self.master.mav.command_long_send(  # pyright: ignore[reportAttributeAccessIssue]
                 system_id,
                 component_id,
-                mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                mavlink.MAV_CMD_REQUEST_MESSAGE,
                 0,  # confirmation
                 message_id,
                 0,
@@ -695,7 +850,7 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
                 firmware_type = firmware_type_banner_substrings[0]
 
         # Fallback: try first banner message (for SITL or systems without ChibiOS)
-        elif banner_msgs and not firmware_type:
+        elif banner_msgs:
             firmware_type_banner_substrings = banner_msgs[0].split(" ")
             if len(firmware_type_banner_substrings) >= 1 and firmware_type_banner_substrings[0].strip():
                 firmware_type = firmware_type_banner_substrings[0].strip()
@@ -716,6 +871,17 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
         self.info.set_board_version(m.board_version)
         self.info.set_flight_custom_version(m.flight_custom_version)
         self.info.set_os_custom_version(m.os_custom_version)
+        uid2_value = getattr(m, "uid2", None)
+        try:
+            uid2 = bytes(uid2_value) if uid2_value is not None else b""
+        except (TypeError, ValueError):
+            uid2 = b""
+        uid = getattr(m, "uid", 0)
+        self.info.hw_unique_id = ""
+        if any(uid2):
+            self.info.hw_unique_id = f"0x{uid2.hex().upper()}"
+        elif isinstance(uid, int) and uid:
+            self.info.hw_unique_id = f"0x{uid:016X}"
 
     def _process_autopilot_version(self, m: MAVLink_autopilot_version_message | None, banner_msgs: list[str]) -> str:
         """
@@ -779,10 +945,10 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
     # pylint: disable=duplicate-code
     def _auto_detect_serial(self) -> list[mavutil.SerialPort]:
         """
-        Auto-detect serial ports with connected flight controllers.
+        Enumerate and rank unconfirmed connection candidates without opening ports.
 
         Returns:
-            list[mavutil.SerialPort]: List of detected serial ports
+            list[mavutil.SerialPort]: Candidates in reverse attempt order for connect().
 
         """
         preferred_ports = [
@@ -793,6 +959,8 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             "*PX4*",
             "*Hex_*",
             "*ProfiCNC*",
+            "*Cube*",
+            "*CUAV*",
             "*Holybro_*",
             "*mRo*",
             "*FMU*",
@@ -809,45 +977,55 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             if connection[1] and "mavlink" in connection[1].lower()
         ]
 
-        if len(serial_list) == 1:
-            # selected automatically if unique
-            return serial_list
+        explicit_mavlink_devices = {_connection_device_key(port.device) for port in serial_list}
+        # Both discovery APIs read OS metadata without opening serial ports.
+        # PySerial supplies VID/PID; PyMAVLink also finds POSIX by-id paths.
+        available_ports = self._serial_port_discovery.get_available_ports()
+        usb_metadata_ranks = {
+            _connection_device_key(port.device): _serial_port_autodetect_rank(port) for port in available_ports
+        }
+        pymavlink_ports = mavutil.auto_detect_serial(preferred_list=preferred_ports)
+        pymavlink_detected_devices = {_connection_device_key(port.device) for port in pymavlink_ports}
+        mavlink_interfaces = {
+            _connection_device_key(port.device)
+            for port in available_ports
+            if "mavlink" in f"{port.description} {port.product} {port.interface}".casefold()
+        }
+        detected_devices = {_connection_device_key(port.device) for port in serial_list}
+        # Keep every interface and unknown device as a fallback. Deduplicate
+        # only aliases of the same port, not ports with the same USB IDs.
+        for port in [*pymavlink_ports, *available_ports]:
+            resolved_device = _connection_device_key(port.device)
+            if resolved_device not in detected_devices:
+                serial_list.append(mavutil.SerialPort(device=port.device, description=str(port.description)))
+                detected_devices.add(resolved_device)
 
-        serial_list = mavutil.auto_detect_serial(preferred_list=preferred_ports)
-        serial_list.sort(key=lambda x: x.device)
+        # connect() reverses this list. Prefer known FC IDs, then FC descriptions,
+        # telemetry adapters, PyMAVLink candidates, and finally unknown ports.
+        # Within a tier, prefer a named MAVLink interface, then the last endpoint
+        # in natural port order (COM10 follows COM9).
+        def candidate_rank(port: mavutil.SerialPort) -> tuple[int, bool, ListPortInfo]:
+            resolved_device = _connection_device_key(port.device)
+            rank = max(
+                usb_metadata_ranks.get(resolved_device, 0),
+                4 if resolved_device in explicit_mavlink_devices else int(resolved_device in pymavlink_detected_devices),
+            )
+            return rank, resolved_device in mavlink_interfaces, ListPortInfo(port.device, skip_link_detection=True)
 
-        if serial_list:
-            return serial_list
-        if os_name == "posix":
-            serial_list = [
-                mavutil.SerialPort(
-                    device=port.device,
-                    description=port.description,
-                )
-                for port in self._serial_port_discovery.get_available_ports()
-                if port.description and port.description.lower() != "n/a"
-            ]
-            serial_list.sort(key=lambda x: x.device)
-
-        # remove OTG2 ports for dual CDC
-        if (
-            len(serial_list) == 2
-            and serial_list[0].device.startswith("/dev/serial/by-id")
-            and serial_list[0].device[:-1] == serial_list[1].device[0:-1]
-        ):
-            serial_list.pop(1)
-
+        serial_list.sort(key=candidate_rank)
         return serial_list
 
     # pylint: enable=duplicate-code
 
-    def create_connection_with_retry(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def create_connection_with_retry(  # noqa: PLR0915 # pylint: disable=too-many-arguments, too-many-positional-arguments, too-many-locals, too-many-branches, too-many-statements
         self,
         progress_callback: Callable[[int, int], None] | None,
         retries: int = 3,
         timeout: int = 5,
         baudrate: int = DEFAULT_BAUDRATE,
         log_errors: bool = True,
+        reconnect_progress_callback: Callable[[int, int], None] | None = None,
+        is_reconnect: bool = False,
     ) -> str:
         """
         Attempts to create a connection to the flight controller with retries.
@@ -860,62 +1038,97 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
         Args:
             progress_callback (callable, optional): A callback function to report the progress
                                                     of the connection attempt. Default is None.
-            retries (int, optional): The number of retries before giving up. Default is 3.
+            retries (int, optional): PyMAVLink retries, or reconnect attempts when reconnecting. Default is 3.
             timeout (int, optional): The timeout in seconds for each connection attempt. Default is 5.
             baudrate (int, optional): The baud rate for the connection. Default is DEFAULT_BAUDRATE.
             log_errors (bool): log errors.
+            reconnect_progress_callback: Optional reset/reconnect UI progress callback.
+            is_reconnect: Use reconnect retry behavior even without a UI callback.
 
         Returns:
             str: An error message if the connection fails after all retries, otherwise an empty string
                 indicating a successful connection.
 
         """
-        if self.comport is None or self.comport.device == DEVICE_FC_PARAM_FROM_FILE:
+        self._active_baudrate = baudrate
+        comport = self.comport
+        if comport is None or comport.device == DEVICE_FC_PARAM_FROM_FILE:
             # will read parameters from a params.param file instead of a from a flight controller
             return ""
-        if self.comport.device.startswith("udp") or self.comport.device.startswith("tcp"):
-            logging_info(_("Will connect to %s"), self.comport.device)
+        if comport.device.startswith("udp") or comport.device.startswith("tcp"):
+            logging_info(_("Will connect to %s"), comport.device)
         else:
-            logging_info(_("Will connect to %s @ %u baud"), self.comport.device, baudrate)
-        try:
-            # Create the connection
-            self.master = self._create_mavlink_connection(
-                device=self.comport.device,
-                baudrate=baudrate,
-                timeout=timeout,
-                retries=retries,
-                progress_callback=progress_callback,
-            )
-            logging_debug(_("Waiting for MAVLink heartbeats..."))
-            if not self.master:
-                msg = f"Failed to create mavlink connect to {self.comport.device}"
-                raise ConnectionError(msg)
-
-            # Detect all vehicles from HEARTBEAT messages
-            detected_vehicles = self._detect_vehicles_from_heartbeats(timeout)
-
-            # Select a supported autopilot
-            error = self._select_supported_autopilot(detected_vehicles)
-            if error:
+            logging_info(_("Will connect to %s @ %u baud"), comport.device, baudrate)
+        reconnecting = is_reconnect or reconnect_progress_callback is not None
+        attempts = max(1, retries) if reconnecting else 1
+        attempt = 1
+        while True:
+            retryable_failure = True
+            try:
+                if attempt > 1 and (serial_number := getattr(comport, "serial_number", None)):
+                    ports = self._serial_port_discovery.get_available_ports()
+                    comport = next((port for port in ports if port.serial_number == serial_number), comport)
+                    self.comport = comport
+                if comport is None:
+                    msg = "No flight controller connection port selected."
+                    raise ConnectionError(msg)
+                if reconnect_progress_callback:
+                    attempt_progress = 30 + int((attempt - 1) * 40 / max(1, attempts - 1))
+                    reconnect_progress_callback(attempt_progress, 100)
+                self._radio_status.close()
+                self.master = self._create_mavlink_connection(
+                    device=comport.device,
+                    baudrate=baudrate,
+                    timeout=timeout,
+                    retries=1 if reconnecting else retries,
+                    progress_callback=progress_callback,
+                )
+                logging_debug(_("Waiting for MAVLink heartbeats..."))
+                if not self.master:
+                    msg = f"Failed to create mavlink connect to {comport.device}"
+                    raise ConnectionError(msg)
+                self._register_status_text_hook(self.master)
+                detected_vehicles = self._detect_vehicles_from_heartbeats(timeout, reconnecting)
+                if not detected_vehicles:
+                    error = self._select_supported_autopilot(detected_vehicles)
+                    raise ConnectionError(error)
+                error = self._select_supported_autopilot(detected_vehicles)
+                if error:
+                    self.disconnect()
+                    if reconnecting:
+                        raise ConnectionError(error)
+                    return error
+                retryable_failure = False
+                if reconnect_progress_callback:
+                    reconnect_progress_callback(90, 100)
+                error = self._retrieve_autopilot_version_and_banner(timeout)
+                if error:
+                    self.disconnect()
+                    return error
+                if reconnect_progress_callback:
+                    reconnect_progress_callback(100, 100)
+                return ""
+            except (ConnectionError, SerialException, PermissionError, ConnectionRefusedError) as error:
                 self.disconnect()
-                return error
-
-            # Retrieve autopilot version and banner information
-            error = self._retrieve_autopilot_version_and_banner(timeout)
-            if error:
-                self.disconnect()
-            return error
-
-        except (ConnectionError, SerialException, PermissionError, ConnectionRefusedError) as e:
-            self.disconnect()
-            if log_errors:
-                logging_warning(_("Connection failed: %s"), e)
-                logging_error(_("Failed to connect after %d attempts."), retries)
-            error_message = str(e)
-            guidance = self._get_connection_error_guidance(e, self.comport.device if self.comport else "")
-            if guidance:
-                error_message = f"{error_message}\n\n{guidance}"
-            return error_message
+                if reconnecting and retryable_failure and not isinstance(error, PermissionError) and attempt < attempts:
+                    logging_debug(
+                        _("Connection attempt %d/%d failed: %s. Retrying in %.1f seconds."),
+                        attempt,
+                        attempts,
+                        error,
+                        self.CONNECTION_RETRY_DELAY,
+                    )
+                    time_sleep(self.CONNECTION_RETRY_DELAY)
+                    attempt += 1
+                    continue
+                if log_errors:
+                    logging_warning(_("Connection failed: %s"), error)
+                    logging_error(_("Failed to connect after %d attempts."), attempt)
+                error_message = str(error)
+                guidance = self._get_connection_error_guidance(error, self.comport.device if self.comport else "")
+                if guidance:
+                    error_message = f"{error_message}\n\n{guidance}"
+                return error_message
 
     def get_connection_tuples(self) -> list[tuple[str, str]]:
         """
@@ -939,6 +1152,11 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
         """Get the default baud rate for serial connections."""
         return self._baudrate
 
+    @property
+    def active_baudrate(self) -> int:
+        """Get the baud rate used for the current or most recent serial session."""
+        return self._active_baudrate
+
     def set_master_for_testing(
         self,
         master: Optional["MavlinkConnection"],
@@ -957,8 +1175,11 @@ class FlightControllerConnection:  # pylint: disable=too-many-instance-attribute
             master: The MAVLink connection object or None
 
         """
+        self._radio_status.close()
         self.master = master
+        if master is not None:
+            self._register_status_text_hook(master)
         # If setting to None, also clear related state
         if master is None:
             self.comport = None
-            self._banner_text_buffer.clear()
+            self._clear_diagnostics()

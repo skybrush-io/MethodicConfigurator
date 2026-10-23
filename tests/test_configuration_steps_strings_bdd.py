@@ -10,9 +10,28 @@ SPDX-FileCopyrightText: 2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+from types import ModuleType
+
 from gettext_capture_helper import capture_gettext_calls
 
 from ardupilot_methodic_configurator import configuration_steps_strings as config_strings
+
+
+# pylint: disable=duplicate-code
+def _load_translation_update_script() -> ModuleType:
+    """Load the scripts-directory translation updater without relying on the current working directory."""
+    script_path = Path(__file__).parent.parent / "scripts" / "update_configuration_steps_translation.py"
+    module_spec = spec_from_file_location("update_configuration_steps_translation", script_path)
+    assert module_spec
+    assert module_spec.loader
+    module = module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module
+
+
+# pylint: enable=duplicate-code
 
 
 class TestConfigurationStepsStringsModule:
@@ -49,3 +68,37 @@ class TestConfigurationStepsStringsModule:
         )
         assert captured_values
         assert all(isinstance(value, str) and value for value in captured_values)
+
+    def test_configuration_steps_strings_include_every_change_reason(self, monkeypatch) -> None:
+        """Every Change Reason in the JSON resources is registered for translation."""
+        captured_values = capture_gettext_calls(
+            monkeypatch,
+            config_strings,
+            config_strings.configuration_steps_strings,
+        )
+        translation_updater = _load_translation_update_script()
+        extracted_strings = translation_updater.gather_all_translatable_strings(str(Path(config_strings.__file__).parent))
+
+        assert set(extracted_strings["change_reasons"]) <= set(captured_values)
+
+    def test_translation_update_script_loads_when_tests_are_run_outside_repository_root(self) -> None:
+        """The translation updater can be loaded by this test without repository-root imports."""
+        translation_updater = _load_translation_update_script()
+
+        assert callable(translation_updater.gather_all_translatable_strings)
+
+    def test_translation_extractor_includes_add_parameter_change_reasons(self) -> None:
+        """Change reasons on add-from-FC parameters are registered for translation."""
+        translation_updater = _load_translation_update_script()
+        strings = {"change_reasons": set()}
+        translation_updater.process_configuration_steps(
+            [],
+            strings,
+            {
+                "steps": {
+                    "01_test.param": {"add_parameters": {"PARAM1": {"Change Reason": "Added from the flight controller"}}}
+                }
+            },
+        )
+
+        assert "Added from the flight controller" in strings["change_reasons"]

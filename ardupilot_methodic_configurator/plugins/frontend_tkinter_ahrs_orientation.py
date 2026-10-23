@@ -21,6 +21,8 @@ from ardupilot_methodic_configurator.data_model_parameter_editor import (
     OperationNotPossibleError,
     ParameterValueUpdateStatus,
 )
+from ardupilot_methodic_configurator.frontend_tkinter_scroll_frame import ScrollFrame
+from ardupilot_methodic_configurator.plugins.frontend_tkinter_helpers import refresh_parameter_editor_table
 from ardupilot_methodic_configurator.plugins.imu_helpers import (
     ImuPollHandlers,
     poll_imu_periodically,
@@ -28,6 +30,7 @@ from ardupilot_methodic_configurator.plugins.imu_helpers import (
 )
 from ardupilot_methodic_configurator.plugins.plugin_constants import PLUGIN_AHRS_ORIENTATION
 from ardupilot_methodic_configurator.plugins.plugin_factory import PluginModelContext, plugin_factory
+from ardupilot_methodic_configurator.plugins.plugin_protocol import PluginPauseReason
 
 if TYPE_CHECKING:
     from ardupilot_methodic_configurator.frontend_tkinter_base_window import BaseWindow
@@ -64,7 +67,9 @@ class AhrsOrientationView(Frame):  # pylint: disable=too-many-instance-attribute
         self._start_imu_polling()
 
     def _setup_ui(self) -> None:
-        main_frame = ttk.Frame(self)
+        self._scroll_frame = ScrollFrame(self)
+        self._scroll_frame.pack(fill="both", expand=True)
+        main_frame = ttk.Frame(self._scroll_frame.view_port)
         main_frame.pack(fill="both", expand=True)
 
         manual_option_frame = ttk.LabelFrame(
@@ -72,15 +77,16 @@ class AhrsOrientationView(Frame):  # pylint: disable=too-many-instance-attribute
             text=_("Option 1 - Set AHRS_ORIENTATION manually"),
             padding=10,
         )
-        manual_option_frame.pack(fill="x", padx=10, pady=(0, 10))
+        manual_option_frame.pack(fill="x", pady=(2, 2), padx=(4, 4))
+        wraplength = 800
         ttk.Label(
             manual_option_frame,
             text=_(
-                "Use this option if you know the vehicle orientation.\n"
-                "Set AHRS_ORIENTATION manually in the parameter list on the right."
+                "Use this option if you know the vehicle orientation. "
+                "Set AHRS_ORIENTATION manually in the parameter list below."
             ),
             justify="left",
-            wraplength=640,
+            wraplength=wraplength,
         ).pack(anchor="w")
 
         automated_option_frame = ttk.LabelFrame(
@@ -88,15 +94,15 @@ class AhrsOrientationView(Frame):  # pylint: disable=too-many-instance-attribute
             text=_("Option 2 - Determine AHRS_ORIENTATION automatically"),
             padding=10,
         )
-        automated_option_frame.pack(fill="x", padx=10)
+        automated_option_frame.pack(fill="x", pady=(2, 2), padx=(4, 4))
         info_text = _(
-            "Use this option if you do not know the vehicle orientation.\n"
+            "Use this option if you do not know the vehicle orientation. "
             "This assistant estimates AHRS_ORIENTATION from three vehicle positions:\n"
             "LEVEL, NOSE DOWN, and RIGHT SIDE DOWN.\n\n"
-            "It compensates for the current preset AHRS_ORIENTATION. If a custom\n"
+            "It compensates for the current preset AHRS_ORIENTATION. If a custom "
             "orientation is active, set AHRS_ORIENTATION to 0 and upload parameters first."
         )
-        ttk.Label(automated_option_frame, text=info_text, justify="left", wraplength=640).pack(anchor="w", pady=(0, 16))
+        ttk.Label(automated_option_frame, text=info_text, justify="left", wraplength=wraplength).pack(anchor="w", pady=(0, 16))
 
         self._wizard_frame = ttk.Frame(automated_option_frame)
         self._wizard_frame.pack(fill="x")
@@ -277,13 +283,7 @@ class AhrsOrientationView(Frame):  # pylint: disable=too-many-instance-attribute
         return bool(result.status in (ParameterValueUpdateStatus.UPDATED, ParameterValueUpdateStatus.UNCHANGED))
 
     def _refresh_parameter_table(self) -> None:
-        parameter_editor_table = getattr(self.base_window, "parameter_editor_table", None)
-        if parameter_editor_table is None:
-            return
-        show_only_differences_var = getattr(self.base_window, "show_only_differences", None)
-        show_only_differences = show_only_differences_var.get() if show_only_differences_var else False
-        gui_complexity = getattr(self.base_window, "gui_complexity", "simple")
-        parameter_editor_table.repopulate_table(show_only_differences=show_only_differences, gui_complexity=gui_complexity)
+        refresh_parameter_editor_table(self.base_window)
 
     def _update_wizard_text(self) -> None:
         step_name = self._steps[self._step_index]
@@ -333,6 +333,18 @@ class AhrsOrientationView(Frame):  # pylint: disable=too-many-instance-attribute
         self.model.stop_imu_monitoring()
         self._wizard_active = False
         self._continue_btn.configure(state="disabled")
+
+    # pylint: disable-next=unused-argument
+    def on_suspend(self, reason: PluginPauseReason = PluginPauseReason.EXCLUSIVE_OPERATION) -> None:  # noqa: ARG002
+        """Yield telemetry to diagnostics without discarding poses, progress, or recommendations."""
+        self._stop_imu_polling()
+        self.model.stop_imu_monitoring()
+        self._latest_imu = None
+        self._continue_btn.configure(state="disabled")
+
+    def on_resume(self) -> None:
+        """Resume only polling; the next fresh IMU sample re-enables pose capture."""
+        self._start_imu_polling()
 
     def destroy(self) -> None:
         """Cleanup resources when plugin is removed."""

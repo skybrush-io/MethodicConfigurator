@@ -28,35 +28,52 @@ import tkinter.font as tk_font
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from tkinter import simpledialog, ttk
 from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock, patch
 
 import pyautogui
 from PIL import Image, ImageDraw
 
+from ardupilot_methodic_configurator import _ as translate
 from ardupilot_methodic_configurator import __version__
+from ardupilot_methodic_configurator.__main__ import register_plugins
 from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.backend_filesystem_program_settings import ProgramSettings
+from ardupilot_methodic_configurator.backend_firmware_upload import FirmwareBoardInfo, FirmwareUploadService
 from ardupilot_methodic_configurator.backend_flightcontroller import FlightController
+from ardupilot_methodic_configurator.data_model_data_telemetry import (
+    MessageRate,
+    MessageSample,
+    RadioSample,
+    TelemetryState,
+)
+from ardupilot_methodic_configurator.data_model_firmware_catalog import FirmwareRelease
+from ardupilot_methodic_configurator.data_model_firmware_upload import UploadStage
 from ardupilot_methodic_configurator.data_model_par_dict import ParDict
 from ardupilot_methodic_configurator.data_model_parameter_editor import ParameterEditor
 from ardupilot_methodic_configurator.frontend_tkinter_about_popup_window import AboutWindow
+from ardupilot_methodic_configurator.frontend_tkinter_base_window import BaseWindow
 from ardupilot_methodic_configurator.frontend_tkinter_connection_selection import ConnectionSelectionWindow
+from ardupilot_methodic_configurator.frontend_tkinter_fc_banner_window import FlightControllerBannerWindow
+from ardupilot_methodic_configurator.frontend_tkinter_firmware_upload import FirmwareUploadWindow
 from ardupilot_methodic_configurator.frontend_tkinter_flightcontroller_info import FlightControllerInfoWindow
+from ardupilot_methodic_configurator.frontend_tkinter_mavlink_inspector import MavlinkInspectorWindow
 from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
 from ardupilot_methodic_configurator.frontend_tkinter_project_creator import VehicleProjectCreatorWindow
 from ardupilot_methodic_configurator.frontend_tkinter_project_opener import VehicleProjectOpenerWindow
 from ardupilot_methodic_configurator.frontend_tkinter_template_overview import TemplateOverviewWindow
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_windows import display_parameter_editor_usage_popup
-from ardupilot_methodic_configurator.plugins.data_model_motor_test import MotorTestDataModel
-from ardupilot_methodic_configurator.plugins.frontend_tkinter_motor_test import MotorTestView, MotorTestWindow
+from ardupilot_methodic_configurator.plugins.plugin_constants import PLUGIN_MOTOR_TEST
+from ardupilot_methodic_configurator.plugins.plugin_factory import PluginModelContext, plugin_factory
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator, Iterator
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 IMAGES_DIR = ROOT_DIR / "images"
 DEFAULT_VEHICLE_DIR = ROOT_DIR / "ardupilot_methodic_configurator" / "vehicle_templates" / "ArduCopter" / "empty_4.6.x"
+WINDOWS_APPLICATION_ICON_PATH = ROOT_DIR / "windows" / "ardupilot_methodic_configurator.ico"
 
 
 # pylint: disable=too-many-lines
@@ -77,36 +94,55 @@ class CaptureTarget:
 TARGETS: tuple[CaptureTarget, ...] = (
     CaptureTarget("App_screenshot_about.png", "about"),
     CaptureTarget("App_screenshot_FC_connection.png", "connection"),
+    CaptureTarget("App_screenshot_FC_connection_add_another.png", "connection_add_another"),
+    CaptureTarget("App_screenshot_FC_connection_udp_forwarding.png", "connection_udp_forwarding"),
     CaptureTarget("App_screenshot_FC_info_and_param_download.png", "fc_info"),
+    CaptureTarget("App_screenshot_FC_banner.png", "fc_banner"),
     CaptureTarget("App_screenshot_instructions.png", "instructions"),
     CaptureTarget("App_screenshot_motor_test.png", "motor_test"),
+    CaptureTarget("App_screenshot_Parameter_export.png", "parameter_export"),
+    CaptureTarget("App_screenshot_MAVLink_inspector.png", "mavlink_inspector", variant="radio"),
+    CaptureTarget("App_screenshot_MAVLink_inspector_no_radio.png", "mavlink_inspector", variant="no_radio"),
+    CaptureTarget("App_screenshot_MAVLink_inspector_collapsed.png", "mavlink_inspector", variant="collapsed"),
+    CaptureTarget("App_screenshot_Firmware_upload.png", "firmware_upload"),
+    CaptureTarget("App_screenshot_Firmware_upload_progress.png", "firmware_upload_progress"),
     CaptureTarget(
         "App_screenshot_Parameter_file_editor_and_uploader4_4_simple.png",
         "param_04_simple",
         scale=0.666,
         gui_complexity="simple",
-        current_file="04_board_orientation.param",
+        current_file="05_board_orientation.param",
     ),
     CaptureTarget(
         "App_screenshot_Parameter_file_editor_and_uploader4_4.png",
         "param_04_normal",
         scale=0.666,
         gui_complexity="normal",
-        current_file="04_board_orientation.param",
+        current_file="05_board_orientation.param",
     ),
     CaptureTarget(
         "App_screenshot_Parameter_file_editor_and_uploader4.png",
         "param_20_normal",
         scale=0.666,
         gui_complexity="normal",
-        current_file="20_throttle_controller.param",
+        current_file="24_throttle_controller.param",
     ),
     CaptureTarget("App_screenshot_Vehicle_directory.png", "vehicle_opener"),
     CaptureTarget("App_screenshot_Vehicle_directory10.png", "vehicle_opener"),
     CaptureTarget("App_screenshot_Vehicle_directory_create_from_template.png", "vehicle_opener_from_template", scale=0.8),
+    CaptureTarget(
+        "App_screenshot_Vehicle_directory_create_from_flight_controller.png",
+        "vehicle_opener_from_flight_controller",
+        scale=0.8,
+    ),
     CaptureTarget("App_screenshot_Vehicle_directory_create_from_bin.png", "vehicle_opener_from_bin", scale=0.8),
     CaptureTarget("App_screenshot_Vehicle_directory4.png", "vehicle_opener_legacy4", scale=0.8),
     CaptureTarget("App_screenshot_Vehicle_directory11.png", "vehicle_creator"),
+    CaptureTarget(
+        "App_screenshot_Vehicle_directory_create_from_flight_controller_creator.png",
+        "vehicle_creator_from_flight_controller",
+        scale=0.8,
+    ),
     CaptureTarget(
         "App_screenshot_Vehicle_directory_create_from_template_source.png",
         "create_from_template_source",
@@ -131,31 +167,13 @@ TARGETS: tuple[CaptureTarget, ...] = (
         scale=0.8,
         variant="from_configured_source",
     ),
-    CaptureTarget(
-        "App_screenshot_Vehicle_directory_create_from_configured_options.png",
-        "vehicle_creator_options",
-        scale=0.8,
-        variant="from_configured_options",
-    ),
-    CaptureTarget(
-        "App_screenshot_Vehicle_directory_create_from_configured_name.png",
-        "vehicle_creator_name",
-        scale=0.8,
-        variant="from_configured_name",
-    ),
-    CaptureTarget(
-        "App_screenshot_Vehicle_directory_create_from_configured_create.png",
-        "vehicle_creator_create",
-        scale=0.8,
-        variant="from_configured_create",
-    ),
     CaptureTarget("App_screenshot_Vehicle_overview.png", "template_overview"),
     CaptureTarget(
         "App_screenshot1.png",
         "param_20_normal",
         scale=0.666,
         gui_complexity="normal",
-        current_file="20_throttle_controller.param",
+        current_file="24_throttle_controller.param",
     ),
 )
 
@@ -241,7 +259,7 @@ class FakeFlightControllerForInfoWindow:  # pylint: disable=too-few-public-metho
 class FakeProjectManager:
     """Minimal project manager API for opener/creator windows."""
 
-    def __init__(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def __init__(
         self,
         template_dir: Path,
         base_dir: Path,
@@ -260,6 +278,9 @@ class FakeProjectManager:
 
     def get_recently_used_dirs(self) -> tuple[str, str, str]:
         return self._template_dir, self._base_dir, self._vehicle_dir
+
+    def get_fc_default_template_dir(self) -> str:
+        return self._template_dir
 
     def get_recent_vehicle_dirs(self) -> list[str]:
         return [self._vehicle_dir]
@@ -304,6 +325,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--delay", type=float, default=0.2, help="Delay before capture in seconds")
     parser.add_argument("--padding", type=int, default=0, help="Capture padding in pixels")
+    parser.add_argument(
+        "--screenshots",
+        nargs="+",
+        choices=[target.filename for target in TARGETS],
+        metavar="FILENAME",
+        help="Screenshot filenames to regenerate (default: all screenshots)",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
     parser.add_argument(
         "--log-level",
@@ -367,12 +395,38 @@ def _widget_text(widget: tk.Misc) -> str:
     return str(text)
 
 
+def _set_windows_application_icon(widget: tk.Misc) -> None:
+    """Use the native AMC icon for screenshot windows on Windows."""
+    if platform.system() != "Windows" or not WINDOWS_APPLICATION_ICON_PATH.is_file():
+        return
+
+    window = widget if isinstance(widget, (tk.Tk, tk.Toplevel)) else widget.winfo_toplevel()
+    try:
+        window.iconbitmap(default=str(WINDOWS_APPLICATION_ICON_PATH))
+    except (OSError, tk.TclError) as exc:
+        logging.debug("Could not set the Windows application icon: %s", exc)
+
+
 def _find_descendant(widget: tk.Misc, predicate: Callable[[tk.Misc], bool]) -> tk.Misc | None:
     """Return first descendant matching predicate."""
     for candidate in _iter_descendants(widget):
         if predicate(candidate):
             return candidate
     return None
+
+
+def _press_no_on_fc_copy_prompt(root: tk.Tk) -> None:
+    """Dismiss the file-24 FC-copy prompt by choosing its No button."""
+    prompt_title = translate("Update file with values from FC?")
+    for child in root.winfo_children():
+        if not isinstance(child, tk.Toplevel) or not child.winfo_exists():
+            continue
+        if child.title() != prompt_title:
+            continue
+        no_button = _find_descendant(child, lambda widget: _widget_text(widget) == translate("No"))
+        if no_button is not None:
+            no_button.invoke()
+        return
 
 
 def _widget_screen_box(widget: tk.Misc, margin: int = 2) -> tuple[int, int, int, int]:
@@ -465,8 +519,10 @@ def capture_widget(  # pylint: disable=too-many-arguments, too-many-positional-a
     padding: int = 0,
     scale: float = 1.0,
     highlight_boxes: list[tuple[int, int, int, int]] | None = None,
+    trim_windows_frame: bool = True,
 ) -> None:
     """Capture screenshot of a Tk widget region."""
+    _set_windows_application_icon(widget)
     settle_tk(widget)
     if delay > 0:
         time.sleep(delay)
@@ -485,7 +541,7 @@ def capture_widget(  # pylint: disable=too-many-arguments, too-many-positional-a
                 draw.rectangle((rel_left, rel_top, rel_right, rel_bottom), outline="red", width=3)
 
     # Crop superfluous pixels on Windows before resizing
-    if platform.system() == "Windows":
+    if platform.system() == "Windows" and trim_windows_frame:
         crop_left = 15
         crop_right = 15
         crop_bottom = 20
@@ -501,7 +557,7 @@ def capture_widget(  # pylint: disable=too-many-arguments, too-many-positional-a
 
 
 @contextmanager
-def hidden_root() -> Iterator[tk.Tk]:
+def hidden_root() -> Generator[tk.Tk, None, None]:
     """Create a hidden root and always clean it up."""
     root = tk.Tk()
     root.withdraw()
@@ -535,6 +591,69 @@ def _capture_connection(output_path: Path, delay: float, padding: int) -> None:
             window.root.destroy()
 
 
+def _capture_connection_forwarding(output_path: Path, delay: float, padding: int, show_dialog: bool) -> None:
+    """Capture the real custom-connection workflow without connecting or saving settings."""
+    window = ConnectionSelectionWindow(
+        cast("FlightController", FakeConnectionFlightController()),
+        "No ArduPilot flight controller was auto-detected yet.",
+    )
+    widgets = window.connection_selection_widgets
+    window.root.attributes("-topmost", 1)
+    window.root.geometry("+100+100")
+    window.root.lift()
+    widgets.stop_periodic_refresh()
+    widgets.conn_selection_combobox.set("Add another")
+    settle_tk(window.root)
+    try:
+        if not show_dialog:
+            capture_widget(
+                window.root,
+                output_path,
+                delay,
+                padding,
+                highlight_boxes=[_widget_screen_box(widgets.conn_selection_combobox)],
+            )
+            return
+
+        capture_error: Exception | None = None
+
+        def capture_dialog() -> None:
+            """Capture and cancel the real Tk dialog before any external side effects."""
+            nonlocal capture_error
+            dialog: simpledialog.Dialog | None = None
+            try:
+                dialog = next(child for child in window.root.winfo_children() if isinstance(child, simpledialog.Dialog))
+                dialog.attributes("-topmost", 1)
+                dialog.geometry("+150+150")
+                dialog.lift()
+                capture_widget(dialog, output_path, delay, padding)
+            # Tk callbacks otherwise swallow exceptions, so capture and re-raise the callback error.
+            except Exception as error:  # pylint: disable=broad-exception-caught
+                capture_error = error
+            finally:
+                if dialog is not None:
+                    dialog.cancel()
+
+        askstring = simpledialog.askstring
+
+        def ask_forwarding_connection(title: str, prompt: str) -> str | None:
+            """Supply documentation text to the production dialog."""
+            window.root.after(250, capture_dialog)
+            return askstring(title, prompt, parent=window.root, initialvalue="udpin:0.0.0.0:14600")
+
+        with patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_connection_selection.simpledialog.askstring",
+            side_effect=ask_forwarding_connection,
+        ):
+            widgets.add_connection()
+        if capture_error is not None:
+            raise capture_error
+    finally:
+        widgets.stop_periodic_refresh()
+        if window.root.winfo_exists():
+            window.root.destroy()
+
+
 def _capture_fc_info(output_path: Path, delay: float, padding: int, vehicle_dir: Path) -> None:
     fake_fc = FakeFlightControllerForInfoWindow()
 
@@ -551,6 +670,40 @@ def _capture_fc_info(output_path: Path, delay: float, padding: int, vehicle_dir:
     finally:
         if window.root.winfo_exists():
             window.root.destroy()
+
+
+def _capture_fc_banner(output_path: Path, delay: float, padding: int) -> None:
+    """Capture the FC diagnostics window with illustrative banner, status and device data."""
+    banner_text = [
+        "ArduPilot V4.6.0 (a1b2c3d4)",
+        "ChibiOS: 2026-06-18",
+        "Free RAM: 123456",
+        "Frame: QUAD/X",
+    ]
+    status_text = [
+        "[2026-06-18 12:34:56] GPS 1: detected as u-blox",
+        "[2026-06-18 12:34:57] EKF3 IMU0 is using GPS",
+        "[2026-06-18 12:34:58] PreArm: Need Position Estimate",
+    ]
+    fc_parameters = {
+        "BARO1_DEVID": 423937,
+        "COMPASS_DEV_ID2": 423681,
+        "COMPASS_PRIO1_ID": 423681,
+        "INS_ACC2_ID": (52 << 16) | (1 << 8) | (3 << 3) | 2,
+    }
+    with hidden_root() as root:
+        root.geometry("1x1+0+0")
+        root.deiconify()
+        window = FlightControllerBannerWindow(root, banner_text, status_text, fc_parameters)
+        try:
+            window.root.geometry("+100+80")
+            window.root.attributes("-topmost", 1)
+            window.root.lift()
+            settle_tk(window.root)
+            capture_widget(window.root, output_path, delay, padding)
+        finally:
+            if window.root.winfo_exists():
+                window.root.destroy()
 
 
 def _capture_instructions(output_path: Path, delay: float, padding: int) -> None:
@@ -589,12 +742,22 @@ def _vehicle_opener_highlight_box(window: VehicleProjectOpenerWindow, action: st
     if action == "vehicle_opener_from_template":
         template_button = _find_descendant(
             window.main_frame,
-            lambda w: _widget_text(w).startswith("Create a vehicle configuration directory from template"),
+            lambda w: _widget_text(w).startswith("Create a vehicle project from a template"),
         )
         if template_button is None:
             msg = "Could not find create from template button"
             raise RuntimeError(msg)
         return _widget_screen_box(template_button, margin=2)
+
+    if action == "vehicle_opener_from_flight_controller":
+        fc_button = _find_descendant(
+            window.main_frame,
+            lambda w: _widget_text(w).startswith("Create a vehicle project from an already configured flight controller"),
+        )
+        if fc_button is None:
+            msg = "Could not find create from flight controller button"
+            raise RuntimeError(msg)
+        return _widget_screen_box(fc_button, margin=2)
 
     if action == "vehicle_opener_from_bin":
         bin_button = _find_descendant(
@@ -617,8 +780,16 @@ def _capture_vehicle_opener_with_highlight(  # pylint: disable=too-many-argument
     vehicle_dir: Path,
     action: str = "vehicle_opener_legacy4",
     scale: float = 1.0,
+    fc_connected: bool = False,
 ) -> None:
-    manager = FakeProjectManager(vehicle_dir, vehicle_dir.parent, vehicle_dir)
+    fc_params = _load_fc_params_from_file(vehicle_dir) if fc_connected else None
+    manager = FakeProjectManager(
+        vehicle_dir,
+        vehicle_dir.parent,
+        vehicle_dir,
+        fc_connected=fc_connected,
+        fc_parameters=fc_params,
+    )
     window = VehicleProjectOpenerWindow(manager)  # type: ignore[arg-type]
     try:
         settle_tk(window.root, cycles=6, delay=0.05)
@@ -639,7 +810,9 @@ def _capture_vehicle_creator(output_path: Path, delay: float, padding: int, vehi
             window.root.destroy()
 
 
-def _create_vehicle_creator_window(vehicle_dir: Path, fc_connected: bool = False) -> VehicleProjectCreatorWindow:
+def _create_vehicle_creator_window(
+    vehicle_dir: Path, fc_connected: bool = False, from_flight_controller: bool = False
+) -> VehicleProjectCreatorWindow:
     fc_params = _load_fc_params_from_file(vehicle_dir) if fc_connected else {}
     manager = FakeProjectManager(
         vehicle_dir,
@@ -648,9 +821,19 @@ def _create_vehicle_creator_window(vehicle_dir: Path, fc_connected: bool = False
         fc_connected=fc_connected,
         fc_parameters=fc_params if fc_connected else None,
     )
-    window = VehicleProjectCreatorWindow(manager)  # type: ignore[arg-type]
+    window = VehicleProjectCreatorWindow(manager, from_flight_controller=from_flight_controller)  # type: ignore[arg-type]
     settle_tk(window.root, cycles=6, delay=0.05)
     return window
+
+
+def _capture_vehicle_creator_from_flight_controller(output_path: Path, delay: float, padding: int, vehicle_dir: Path) -> None:
+    """Capture the minimal creator dialog for an already configured flight controller."""
+    window = _create_vehicle_creator_window(vehicle_dir, fc_connected=True, from_flight_controller=True)
+    try:
+        capture_widget(window.root, output_path, delay, padding)
+    finally:
+        if window.root.winfo_exists():
+            window.root.destroy()
 
 
 def _find_template_browse_button(window: VehicleProjectCreatorWindow) -> tuple[int, int, int, int]:
@@ -683,7 +866,7 @@ def _find_create_button(window: VehicleProjectCreatorWindow) -> tuple[int, int, 
     """Find and return bounding box for create vehicle directory button."""
     create_button = _find_descendant(
         window.main_frame,
-        lambda w: _widget_text(w).startswith("Create a vehicle configuration directory"),
+        lambda w: _widget_text(w).startswith("Create a vehicle project from a template"),
     )
     if create_button is None:
         msg = "Could not find create vehicle directory button"
@@ -786,6 +969,26 @@ def _load_fc_params_from_file(vehicle_dir: Path) -> dict[str, float]:
     return {name: param.value for name, param in pardict.items()}
 
 
+def _configure_fake_flight_controller(flight_controller: FlightController, fc_params: dict[str, float]) -> None:
+    """Configure a connected, non-blocking FC double for screenshot-only GUI workflows."""
+    flight_controller.set_master_for_testing(MagicMock())
+    flight_controller.fc_parameters = fc_params
+    flight_controller.request_scaled_imu_messages = MagicMock(return_value=(True, ""))
+    flight_controller.poll_scaled_imu = MagicMock(return_value=None)
+    flight_controller.request_periodic_battery_status = MagicMock(return_value=(True, ""))
+    flight_controller.get_battery_statuses = MagicMock(return_value=(None, ""))
+
+
+def _cleanup_plugin_view(plugin_view: object) -> None:
+    """Call optional plugin cleanup hooks on a dynamically-created view."""
+    on_deactivate = getattr(plugin_view, "on_deactivate", None)
+    if callable(on_deactivate):
+        on_deactivate()
+    destroy = getattr(plugin_view, "destroy", None)
+    if callable(destroy):
+        destroy()
+
+
 def _build_parameter_editor(
     current_file: str,
     vehicle_dir: Path,
@@ -810,19 +1013,28 @@ def _build_parameter_editor(
     flight_controller = FlightController()
 
     # Fake an FC connection so the table renders FC values instead of "N/A".
-    flight_controller.set_master_for_testing(MagicMock())  # make master non-None
-    flight_controller.fc_parameters = fc_params  # pre-populate parameter cache
+    # Stub telemetry requests as well, because plugin activation runs during Tk event settling.
+    _configure_fake_flight_controller(flight_controller, fc_params)
 
     # Patch download_params so the window startup download returns our fake data
     # without attempting any real MAVLink communication.
     try:
-        with patch.object(
-            FlightController,
-            "download_params",
-            return_value=(fc_params, ParDict()),
+        with (
+            patch.object(
+                FlightController,
+                "download_params",
+                return_value=(fc_params, ParDict()),
+            ),
+            patch.object(ParameterEditor, "open_documentation_in_browser"),
         ):
             editor = ParameterEditor(current_file, flight_controller, filesystem)
             window = ParameterEditorWindow(editor)
+            if current_file == "24_throttle_controller.param":
+                # This step asks whether the FC values should be copied into the
+                # file. Choose No before the startup workflow can block on it.
+                # Leave enough time for the dialog to finish its own setup
+                # (including focus_set()) before destroying it.
+                window.root.after(500, lambda: _press_no_on_fc_copy_prompt(window.root))
             settle_tk(window.root, cycles=8, delay=0.05)
     finally:
         # Restore prior settings to avoid persistent side effects on the user's config.
@@ -852,14 +1064,196 @@ def _capture_parameter_editor(  # pylint: disable=too-many-arguments, too-many-p
         try:
             capture_widget(window.root, output_path, delay, padding, scale)
         finally:
+            if window.current_plugin_view is not None:
+                _cleanup_plugin_view(window.current_plugin_view)
             if window.root.winfo_exists():
                 window.root.destroy()
             flight_controller.disconnect()
 
 
-def _suppress_motor_view_periodic_updates(_view: MotorTestView) -> None:
-    """Disable periodic updates to keep capture deterministic and non-blocking."""
-    return
+def _capture_parameter_export(  # pylint: disable=too-many-locals
+    output_path: Path, delay: float, padding: int, vehicle_dir: Path
+) -> None:
+    """Capture the FC parameter export dialog with representative downloaded values."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_vehicle_dir = Path(tmpdir) / vehicle_dir.name
+        shutil.copytree(vehicle_dir, tmp_vehicle_dir)
+        editor_window, flight_controller = _build_parameter_editor(
+            "05_board_orientation.param",
+            tmp_vehicle_dir,
+            "normal",
+        )
+        export_window = None
+        try:
+            fc_parameters = flight_controller.fc_parameters
+            parameter_models = editor_window.parameter_editor.get_fc_parameters_for_export()
+            non_default_names = ("WPNAV_SPEED", "ANGLE_MAX", "ATC_ANG_RLL_P")
+            if not all(name in fc_parameters for name in non_default_names):
+                msg = "The parameter export screenshot fixture is missing representative Copter parameters"
+                raise RuntimeError(msg)
+            fc_parameters["WPNAV_SPEED"] += 100.0
+            fc_parameters["ANGLE_MAX"] = 3500.0
+            fc_parameters["ATC_ANG_RLL_P"] = 4.7
+
+            default_names = [
+                name
+                for name in ("RTL_ALT", "WPNAV_RADIUS")
+                if name in parameter_models
+                and parameter_models[name].fc_value_equals_default_value
+                and not parameter_models[name].is_calibration
+            ]
+            default_names.extend(
+                name
+                for name, parameter in parameter_models.items()
+                if len(default_names) < 2
+                and name not in default_names
+                and parameter.fc_value_equals_default_value
+                and not parameter.is_calibration
+                and not parameter.is_readonly
+            )
+            calibration_names = [
+                name
+                for name, parameter in parameter_models.items()
+                if parameter.is_calibration and name.startswith(("COMPASS_", "INS_"))
+            ]
+            if len(calibration_names) < 2:
+                calibration_names.extend(
+                    name
+                    for name, parameter in parameter_models.items()
+                    if len(calibration_names) < 2 and name not in calibration_names and parameter.is_calibration
+                )
+            if len(default_names) < 2 or len(calibration_names) < 2:
+                msg = "The parameter export screenshot fixture needs two default and two calibration parameters"
+                raise RuntimeError(msg)
+
+            selected_names = [*non_default_names, *default_names[:2], *calibration_names[:2]]
+            selected_fc_parameters = {name: fc_parameters[name] for name in selected_names}
+            fc_parameters.clear()
+            fc_parameters.update(selected_fc_parameters)
+            editor_window.on_export_parameters_click()
+            export_window = next(
+                (
+                    child
+                    for child in editor_window.root.winfo_children()
+                    if isinstance(child, tk.Toplevel) and child.title() == translate("Export parameters")
+                ),
+                None,
+            )
+            if export_window is None:
+                msg = "Could not find the parameter export window for the parameter export screenshot"
+                raise RuntimeError(msg)
+            for checkbox_label in ("Calibration", "Default value"):
+                checkbox = _find_descendant(
+                    export_window,
+                    lambda widget, label=checkbox_label: (
+                        isinstance(widget, (ttk.Checkbutton, tk.Checkbutton)) and _widget_text(widget) == translate(label)
+                    ),
+                )
+                invoke = getattr(checkbox, "invoke", None)
+                if not callable(invoke):
+                    msg = f"Could not find the {checkbox_label} checkbox for the parameter export screenshot"
+                    raise RuntimeError(msg)
+                invoke()
+            capture_widget(export_window, output_path, delay, padding)
+        finally:
+            if export_window is not None and export_window.winfo_exists():
+                export_window.destroy()
+            if editor_window.current_plugin_view is not None:
+                _cleanup_plugin_view(editor_window.current_plugin_view)
+            if editor_window.root.winfo_exists():
+                editor_window.root.destroy()
+            flight_controller.disconnect()
+
+
+def _mavlink_inspector_state(*, with_radio: bool) -> TelemetryState:
+    """Provide illustrative received values, independent of hardware or network access."""
+    attitude_fields = (("roll", "0.01"), ("pitch", "0.02"), ("yaw", "1.57"), ("rollspeed", "0.0"))
+    messages = [
+        MessageRate((1, 1, name), MessageSample(count, count * 40, 120.0, fields), hz, rate, 0.1)
+        for name, count, hz, rate, fields in (
+            ("HEARTBEAT", 120, 1.0, 21.0, (("type", "2"), ("autopilot", "3"))),
+            ("SYS_STATUS", 240, 2.0, 86.0, (("voltage_battery", "16800"),)),
+            ("ATTITUDE", 1200, 10.0, 400.0, attitude_fields),
+            ("GLOBAL_POSITION_INT", 240, 2.0, 84.0, (("relative_alt", "0"),)),
+            ("VFR_HUD", 240, 2.0, 64.0, (("groundspeed", "0.0"),)),
+        )
+    ]
+    radio = RadioSample((51, 68), 120.0, 160, 150, 50, 45, 90, 3, 12) if with_radio else None
+    if radio is not None:
+        messages.append(
+            MessageRate(
+                (51, 68, "RADIO_STATUS"),
+                MessageSample(120, 2520, 120.0, (("rssi", "160"), ("remrssi", "150"), ("txbuf", "90"))),
+                1.0,
+                21.0,
+                0.1,
+            )
+        )
+    return TelemetryState(
+        connected=True,
+        receiving=True,
+        rx_rate=685.0,
+        tx_rate=35.0,
+        parse_error_rate=0.0,
+        radio_error_rate=0.0 if radio is not None else None,
+        radio=radio,
+        messages=tuple(messages),
+    )
+
+
+def _capture_mavlink_inspector(output_path: Path, delay: float, padding: int, variant: str) -> None:
+    """Capture the actual inspector with and without modem reports, or with fields collapsed."""
+    controller = MagicMock(spec=FlightController)
+    controller.master = None
+    with hidden_root() as root, patch.object(MavlinkInspectorWindow, "_poll"):
+        window = MavlinkInspectorWindow(controller, root)
+        try:
+            window.root.geometry("+100+80")
+            window.root.attributes("-topmost", 1)
+            window.root.lift()
+            window.refresh(_mavlink_inspector_state(with_radio=variant != "no_radio"))
+            window.table.selection_set("1:1:ATTITUDE")
+            window.table.event_generate("<<TreeviewSelect>>")
+            settle_tk(window.root)
+            if variant == "collapsed":
+                window.message_contents.set_expanded(False)
+            capture_widget(window.main_frame, output_path, delay, padding, trim_windows_frame=False)
+        finally:
+            window.close()
+
+
+def _capture_firmware_upload(output_path: Path, delay: float, padding: int, show_progress: bool) -> None:
+    """Capture the real firmware UI with sample catalog data and no hardware or downloads."""
+    controller = MagicMock(spec=FlightController)
+    board = FirmwareBoardInfo(9, "CubeBlack", "/dev/ttyACM0", "Copter")
+    release = FirmwareRelease(
+        "Copter", "4.6.0", "OFFICIAL", "CubeBlack", "https://firmware.ardupilot.org/Copter/stable/CubeBlack/arducopter.apj", 9
+    )
+    with (
+        patch.object(FirmwareUploadService, "connected_board_info", return_value=board),
+        patch.object(FirmwareUploadWindow, "refresh_versions"),
+    ):
+        window = FirmwareUploadWindow(controller)
+        try:
+            window.events.put(("catalog", window.catalog_request_id, [release]))
+            settle_tk(window.root)
+            window.version.set(release.label)
+            window.version_combo.event_generate("<<ComboboxSelected>>")
+            if show_progress:
+                window.busy = True
+                window.uploading = True
+                for button in (window.refresh_button, window.upload_button, window.custom_button):
+                    button.configure(state="disabled")
+                window.events.put(("progress", UploadStage.ERASING, 1, 1))
+                window.events.put(("progress", UploadStage.PROGRAMMING, 65, 100))
+            # Expand to the requested height so every action button is visible at this display's DPI.
+            window.root.update_idletasks()
+            window.root.geometry(f"{window.root.winfo_width()}x{window.root.winfo_reqheight()}")
+            pyautogui.moveTo(20, 20)  # Keep hover tooltips out of the documentation screenshots.
+            capture_widget(window.root, output_path, delay, padding)
+        finally:
+            window.uploading = False
+            window.close()
 
 
 def _capture_motor_test(output_path: Path, delay: float, padding: int, vehicle_dir: Path) -> None:
@@ -881,32 +1275,60 @@ def _capture_motor_test(output_path: Path, delay: float, padding: int, vehicle_d
             save_component_to_system_templates=False,
         )
         flight_controller = FlightController()
-        flight_controller.set_master_for_testing(MagicMock())
-        flight_controller.fc_parameters = fc_params
+        _configure_fake_flight_controller(flight_controller, fc_params)
         flight_controller.stop_all_motors = MagicMock(return_value=(True, ""))
 
-        model = MotorTestDataModel(flight_controller, filesystem)
-        with patch.object(MotorTestView, "_update_view", _suppress_motor_view_periodic_updates):
-            window = MotorTestWindow(model)
+        model = plugin_factory.create_model(
+            PLUGIN_MOTOR_TEST,
+            PluginModelContext(
+                flight_controller=flight_controller,
+                local_filesystem=filesystem,
+                parameter_editor=cast("ParameterEditor", MagicMock()),
+            ),
+        )
+        if model is None:
+            msg = f"Could not create {PLUGIN_MOTOR_TEST} plugin model"
+            raise RuntimeError(msg)
+
+        window = BaseWindow()
+        window.root.title(translate("ArduPilot Motor Test"))
+        window.root.geometry(window.calculate_scaled_geometry(400, 610))
+        plugin_view = plugin_factory.create(PLUGIN_MOTOR_TEST, window.main_frame, model, window)
+        if plugin_view is None:
+            window.root.destroy()
+            msg = f"Could not create {PLUGIN_MOTOR_TEST} plugin view"
+            raise RuntimeError(msg)
+        plugin_view.pack(fill="both", expand=True)
         try:
             capture_widget(window.root, output_path, delay, padding)
         finally:
-            window.on_close()
+            _cleanup_plugin_view(plugin_view)
+            window.root.destroy()
+            flight_controller.disconnect()
 
 
 def capture_target(target: CaptureTarget, output_path: Path, args: argparse.Namespace) -> None:  # pylint: disable=too-many-branches
     """Capture one screenshot target."""
     action = target.action
-    if action == "about":
-        _capture_about(output_path, args.delay, args.padding)
-    elif action == "connection":
-        _capture_connection(output_path, args.delay, args.padding)
+    simple_captures = {"about": _capture_about, "connection": _capture_connection, "instructions": _capture_instructions}
+    if action in simple_captures:
+        simple_captures[action](output_path, args.delay, args.padding)
+    elif action in ("connection_add_another", "connection_udp_forwarding"):
+        _capture_connection_forwarding(
+            output_path, args.delay, args.padding, show_dialog=action == "connection_udp_forwarding"
+        )
     elif action == "fc_info":
         _capture_fc_info(output_path, args.delay, args.padding, args.vehicle_dir)
-    elif action == "instructions":
-        _capture_instructions(output_path, args.delay, args.padding)
+    elif action == "fc_banner":
+        _capture_fc_banner(output_path, args.delay, args.padding)
     elif action == "motor_test":
         _capture_motor_test(output_path, args.delay, args.padding, args.vehicle_dir)
+    elif action == "parameter_export":
+        _capture_parameter_export(output_path, args.delay, args.padding, args.vehicle_dir)
+    elif action == "mavlink_inspector":
+        _capture_mavlink_inspector(output_path, args.delay, args.padding, target.variant or "radio")
+    elif action in ("firmware_upload", "firmware_upload_progress"):
+        _capture_firmware_upload(output_path, args.delay, args.padding, show_progress=action == "firmware_upload_progress")
     elif action.startswith("param_"):
         if target.gui_complexity is None:
             msg = f"gui_complexity required for {action}"
@@ -925,12 +1347,25 @@ def capture_target(target: CaptureTarget, output_path: Path, args: argparse.Name
         )
     elif action == "vehicle_opener":
         _capture_vehicle_opener(output_path, args.delay, args.padding, args.vehicle_dir)
-    elif action in ("vehicle_opener_from_template", "vehicle_opener_legacy4", "vehicle_opener_from_bin"):
+    elif action in (
+        "vehicle_opener_from_template",
+        "vehicle_opener_from_flight_controller",
+        "vehicle_opener_legacy4",
+        "vehicle_opener_from_bin",
+    ):
         _capture_vehicle_opener_with_highlight(
-            output_path, args.delay, args.padding, args.vehicle_dir, action=action, scale=target.scale
+            output_path,
+            args.delay,
+            args.padding,
+            args.vehicle_dir,
+            action=action,
+            scale=target.scale,
+            fc_connected=action == "vehicle_opener_from_flight_controller",
         )
     elif action == "vehicle_creator":
         _capture_vehicle_creator(output_path, args.delay, args.padding, args.vehicle_dir)
+    elif action == "vehicle_creator_from_flight_controller":
+        _capture_vehicle_creator_from_flight_controller(output_path, args.delay, args.padding, args.vehicle_dir)
     elif action.startswith("vehicle_creator_"):
         if target.variant is None:
             msg = f"variant required for {action}"
@@ -970,6 +1405,9 @@ def main() -> int:
     """Program entrypoint."""
     args = parse_args()
     configure_logging(args.log_level)
+    # Screenshot windows are created directly rather than through application
+    # startup, so explicitly initialize the same plugin registry first.
+    register_plugins()
 
     pyautogui.FAILSAFE = True
 
@@ -977,8 +1415,13 @@ def main() -> int:
         logging.error("Vehicle dir does not exist: %s", args.vehicle_dir)
         return 1
 
+    screenshots = getattr(args, "screenshots", None)
+    requested_screenshots = list(screenshots) if screenshots is not None else None
+    targets = [target for target in TARGETS if requested_screenshots is None or target.filename in requested_screenshots]
+    selected_filenames = {target.filename for target in targets}
+
     failures: list[str] = []
-    for target in TARGETS:
+    for target in targets:
         output_path = args.images_dir / target.filename if args.overwrite else args.images_dir / f"{target.filename}.new.png"
 
         try:
@@ -988,16 +1431,15 @@ def main() -> int:
             logging.exception("Failed to generate %s: %s", target.filename, exc)
 
     # Keep the historical alias in sync in case only one of the two was captured.
-    if args.overwrite:
-        path_4 = args.images_dir / "App_screenshot_Parameter_file_editor_and_uploader4.png"
-        path_1 = args.images_dir / "App_screenshot1.png"
-    else:
-        path_4 = args.images_dir / "App_screenshot_Parameter_file_editor_and_uploader4.png.new.png"
-        path_1 = args.images_dir / "App_screenshot1.png.new.png"
-    if path_4.exists() and not path_1.exists():
-        shutil.copy2(path_4, path_1)
-    if path_1.exists() and not path_4.exists():
-        shutil.copy2(path_1, path_4)
+    alias_filenames = {"App_screenshot_Parameter_file_editor_and_uploader4.png", "App_screenshot1.png"}
+    if selected_filenames & alias_filenames:
+        suffix = "" if args.overwrite else ".new.png"
+        path_4 = args.images_dir / f"App_screenshot_Parameter_file_editor_and_uploader4.png{suffix}"
+        path_1 = args.images_dir / f"App_screenshot1.png{suffix}"
+        if path_4.exists() and not path_1.exists():
+            shutil.copy2(path_4, path_1)
+        if path_1.exists() and not path_4.exists():
+            shutil.copy2(path_1, path_4)
 
     if failures:
         logging.error("Completed with failures: %s", ", ".join(failures))

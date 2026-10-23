@@ -16,8 +16,10 @@ from typing import Any
 import pytest
 
 from ardupilot_methodic_configurator.data_model_ardupilot_parameter import (
+    MULTIPLE_CHOICE_BLACKLIST,
     ArduPilotParameter,
     BitmaskHelper,
+    ParameterForcedOrDerivedError,
     ParameterOutOfRangeError,
     ParameterUnchangedError,
 )
@@ -257,6 +259,28 @@ def test_value_dictionary_operations(param_fixture) -> None:
     assert param_fixture["basic_param"].get_selected_value_from_dict() is None
 
 
+@pytest.mark.parametrize(
+    "parameter_name",
+    sorted(MULTIPLE_CHOICE_BLACKLIST),
+)
+def test_continuous_tuning_parameters_do_not_use_multiple_choice(parameter_name: str) -> None:
+    """Parameters with continuous ranges stay editable even when metadata lists sample values."""
+    metadata = {"values": {"0.5": "Sample value", "1.0": "Another sample value"}}
+    parameter = ArduPilotParameter(parameter_name, Par(0.5, ""), metadata)
+
+    assert parameter.is_in_values_dict
+    assert not parameter.is_multiple_choice
+    assert parameter.is_editable
+
+
+def test_regular_enum_parameter_uses_multiple_choice() -> None:
+    """Parameters outside the continuous-range exception list retain their choices."""
+    metadata = {"values": {"0.5": "First option", "1.0": "Second option"}}
+    parameter = ArduPilotParameter("TEST_ENUM", Par(0.5, ""), metadata)
+
+    assert parameter.is_multiple_choice
+
+
 def test_set_new_value(param_fixture) -> None:
     """
     User can update parameter values with validation.
@@ -284,7 +308,7 @@ def test_set_new_value(param_fixture) -> None:
     original_value = param_fixture["forced_param"]._new_value
 
     # Act & Assert: User attempts to change forced parameter
-    with pytest.raises(ValueError, match="forced or derived"):
+    with pytest.raises(ParameterForcedOrDerivedError, match="forced or derived"):
         param_fixture["forced_param"].set_new_value(new_value)
 
     # Assert: Forced parameter value unchanged
@@ -294,7 +318,7 @@ def test_set_new_value(param_fixture) -> None:
     original_value = param_fixture["derived_param"]._new_value
 
     # Act & Assert: User attempts to change derived parameter
-    with pytest.raises(ValueError, match="forced or derived"):
+    with pytest.raises(ParameterForcedOrDerivedError, match="forced or derived"):
         param_fixture["derived_param"].set_new_value(new_value)
 
     # Assert: Derived parameter value unchanged

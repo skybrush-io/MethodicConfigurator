@@ -10,7 +10,6 @@ SPDX-FileCopyrightText: 2024-2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
-import sys
 import tkinter as tk
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable
@@ -18,7 +17,6 @@ from collections.abc import Callable
 # from logging import debug as logging_debug
 # from logging import info as logging_info
 from logging import basicConfig as logging_basicConfig
-from logging import getLevelName as logging_getLevelName
 from tkinter import ttk
 
 from ardupilot_methodic_configurator import _, __version__
@@ -35,6 +33,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_pair_tuple_combobox import
 
 # from ardupilot_methodic_configurator.frontend_tkinter_show import show_tooltip
 from ardupilot_methodic_configurator.frontend_tkinter_show import show_error_message, show_warning_message
+from ardupilot_methodic_configurator.macos_utilities import is_macos_sequoia_or_older
 
 
 def argument_parser() -> Namespace:
@@ -55,7 +54,6 @@ def argument_parser() -> Namespace:
         )
     )
     parser = LocalFilesystem.add_argparse_arguments(parser)
-    parser = ComponentEditorWindow.add_argparse_arguments(parser)
     return add_common_arguments(parser).parse_args()
     # pylint: enable=duplicate-code
 
@@ -63,7 +61,7 @@ def argument_parser() -> Namespace:
 class ComponentEditorWindow(ComponentEditorWindowBase):
     """Validates the user input and handles user interactions for editing component configurations."""
 
-    def __init__(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def __init__(
         self,
         version: str,
         local_filesystem: LocalFilesystem,
@@ -181,7 +179,8 @@ class ComponentEditorWindow(ComponentEditorWindowBase):
         widget = self.entry_widgets.get(telem_protocol_path)
         if isinstance(widget, PairTupleCombobox):
             self.set_combobox_entries_preserving_width(widget, [(new_protocol, new_protocol)], new_protocol)
-            widget.update_idletasks()
+            if not is_macos_sequoia_or_older():
+                widget.update_idletasks()
         self._set_esc_telemetry_combobox_mirror_state()
 
     def _on_esc_fc_protocol_invalid_type(self, valid_telem_types: tuple[str, ...]) -> None:
@@ -194,13 +193,15 @@ class ComponentEditorWindow(ComponentEditorWindowBase):
         if isinstance(telem_type_widget, PairTupleCombobox):
             type_tuples = get_connection_type_tuples_with_labels(valid_telem_types)
             self.set_combobox_entries_preserving_width(telem_type_widget, type_tuples, "None")
-            telem_type_widget.update_idletasks()
+            if not is_macos_sequoia_or_older():
+                telem_type_widget.update_idletasks()
         telem_protocol_widget = self.entry_widgets.get(telem_protocol_path)
         if isinstance(telem_protocol_widget, PairTupleCombobox):
             valid_telem_protocols = self.data_model.get_combobox_values_for_path(telem_protocol_path)
             protocol_tuples = [(p, p) for p in valid_telem_protocols]
             self.set_combobox_entries_preserving_width(telem_protocol_widget, protocol_tuples, "None")
-            telem_protocol_widget.update_idletasks()
+            if not is_macos_sequoia_or_older():
+                telem_protocol_widget.update_idletasks()
 
     def _on_esc_fc_protocol_recompute(self, current_telem_type: str) -> None:
         """Recompute telemetry type AND protocol choices and validate current selection."""
@@ -214,7 +215,8 @@ class ComponentEditorWindow(ComponentEditorWindowBase):
         if isinstance(telem_type_widget, PairTupleCombobox):
             type_tuples = get_connection_type_tuples_with_labels(valid_telem_types)
             self.set_combobox_entries_preserving_width(telem_type_widget, type_tuples, current_telem_type)
-            telem_type_widget.update_idletasks()
+            if not is_macos_sequoia_or_older():
+                telem_type_widget.update_idletasks()
         self.data_model.set_component_value(telem_type_path, current_telem_type)
         new_choices = self.data_model.get_combobox_values_for_path(telem_protocol_path)
         widget = self.entry_widgets.get(telem_protocol_path)
@@ -243,7 +245,8 @@ class ComponentEditorWindow(ComponentEditorWindowBase):
                 current_selection = new_choices[0]
                 self.data_model.set_component_value(telem_protocol_path, current_selection)
             self.set_combobox_entries_preserving_width(widget, protocol_tuples, current_selection)
-        widget.update_idletasks()
+        if not is_macos_sequoia_or_older():
+            widget.update_idletasks()
 
     def _on_esc_fc_protocol_changed(self, new_protocol: str) -> None:
         """
@@ -318,7 +321,7 @@ class ComponentEditorWindow(ComponentEditorWindowBase):
                 if err_msg:
                     show_error_message(_("Error"), err_msg)
                     protocol_combobox.configure(style="comb_input_invalid.TCombobox")
-                if sys.platform != "darwin":  # update_idletasks() segfaults on macOS with Tcl/Tk 9.0
+                if not is_macos_sequoia_or_older():
                     protocol_combobox.update_idletasks()  # re-draw the combobox ASAP
         return err_msg
 
@@ -514,7 +517,7 @@ class ComponentEditorWindow(ComponentEditorWindowBase):
 if __name__ == "__main__":  # pragma: no cover
     args = argument_parser()
 
-    logging_basicConfig(level=logging_getLevelName(args.loglevel), format="%(asctime)s - %(levelname)s - %(message)s")
+    logging_basicConfig(level=args.loglevel, format="%(asctime)s - %(levelname)s - %(message)s")
 
     filesystem = LocalFilesystem(
         args.vehicle_dir, args.vehicle_type, "", args.allow_editing_template_files, args.save_component_to_system_templates
@@ -522,9 +525,6 @@ if __name__ == "__main__":  # pragma: no cover
     component_editor_window = ComponentEditorWindow(__version__, filesystem, {})
 
     component_editor_window.populate_frames()
-    if args.skip_component_editor:
-        component_editor_window.root.after(10, component_editor_window.root.destroy)
-
     component_editor_window.validate_data_and_highlight_errors_in_red()
 
     component_editor_window.root.mainloop()

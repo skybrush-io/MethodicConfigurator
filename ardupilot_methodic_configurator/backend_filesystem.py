@@ -10,7 +10,9 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 # from sys import exit as sys_exit
-from argparse import ArgumentParser
+from argparse import Action, ArgumentParser, Namespace
+from collections.abc import Sequence
+from copy import deepcopy
 from logging import debug as logging_debug
 from logging import error as logging_error
 from logging import exception as logging_exception
@@ -30,10 +32,11 @@ from shutil import copy2 as shutil_copy2
 from shutil import copytree as shutil_copytree
 from shutil import rmtree as shutil_rmtree
 from subprocess import SubprocessError, run
-from typing import Any
+from tempfile import TemporaryDirectory
+from typing import Any, cast
 from zipfile import ZipFile
 
-from argcomplete.completers import DirectoriesCompleter
+from argcomplete.completers import DirectoriesCompleter, FilesCompleter
 
 from ardupilot_methodic_configurator import _
 from ardupilot_methodic_configurator.annotate_params import (
@@ -47,16 +50,42 @@ from ardupilot_methodic_configurator.annotate_params import (
     split_into_lines,
     update_parameter_documentation,
 )
-from ardupilot_methodic_configurator.backend_filesystem_configuration_steps import ConfigurationSteps
+from ardupilot_methodic_configurator.backend_filesystem_configuration_steps import (
+    ConfigurationSteps,
+    DownloadFileConfig,
+    UploadFileConfig,
+)
 from ardupilot_methodic_configurator.backend_filesystem_program_settings import ProgramSettings
 from ardupilot_methodic_configurator.backend_filesystem_vehicle_components import VehicleComponents
+from ardupilot_methodic_configurator.backend_internet import download_file_from_url
 from ardupilot_methodic_configurator.data_model_par_dict import MANUAL_OVERRIDE_PREFIX, Par, ParDict, is_within_tolerance
 
 PARAMETER_FILE_REGEXP = r"^\d{2}_.*\.param$"
 TOOLTIP_MAX_LENGTH = 105
 
 
-class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  # pylint: disable=too-many-public-methods
+def _firmware_versions_match(left: str, right: str) -> bool:
+    """Compare every dot-separated firmware component, including the patch version."""
+    return tuple(left.split(".")) == tuple(right.split("."))
+
+
+class _VehicleDirAction(Action):
+    """Store ``--vehicle-dir`` and remember whether it was explicitly supplied."""
+
+    def __call__(
+        self,
+        parser: ArgumentParser,
+        namespace: Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        del parser
+        del option_string
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"{self.dest}_explicit", True)
+
+
+class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  # pylint: disable=too-many-public-methods, too-many-instance-attributes
     """
     A class to manage local filesystem operations for the ArduPilot methodic configurator.
 
@@ -70,13 +99,15 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
 
     """
 
-    def __init__(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         vehicle_dir: str,
         vehicle_type: str,
         fw_version: str,
         allow_editing_template_files: bool,
         save_component_to_system_templates: bool,
+        *,
+        load_project: bool = True,
     ) -> None:
         self.file_parameters: dict[str, ParDict] = {}
         VehicleComponents.__init__(self, save_component_to_system_templates)
@@ -84,12 +115,36 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
         ProgramSettings.__init__(self)
         self.vehicle_type = vehicle_type
         self.fw_version = fw_version
+        self._fw_version_is_explicit = bool(fw_version)
         self.allow_editing_template_files = allow_editing_template_files
         self.param_default_dict: ParDict = ParDict()
         self.vehicle_dir = vehicle_dir
         self.doc_dict: dict[str, Any] = {}
-        if vehicle_dir is not None:
+        self._parameter_metadata_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        if load_project and vehicle_dir is not None:
+            self.remove_cached_parameter_metadata_for_mismatched_firmware(vehicle_dir)
             self.re_init(vehicle_dir, vehicle_type)
+
+    @classmethod
+    def for_external_parameter_file(
+        cls,
+        vehicle_dir: str,
+        vehicle_type: str,
+        firmware_version: str,
+        default_parameters: ParDict,
+    ) -> "LocalFilesystem":
+        """Create filesystem services for an external file without opening an AMC project."""
+        filesystem = cls(
+            vehicle_dir,
+            vehicle_type,
+            firmware_version,
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+            load_project=False,
+        )
+        filesystem.param_default_dict = default_parameters
+        filesystem.load_parameter_metadata_for_flight_controller(vehicle_type, firmware_version)
+        return filesystem
 
     def re_init(self, vehicle_dir: str, vehicle_type: str, blank_component_data: bool = False) -> None:
         self.vehicle_dir = vehicle_dir
@@ -103,7 +158,7 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
             if self.vehicle_components_fs.data and "Components" in self.vehicle_components_fs.data:
                 self.save_vehicle_components_json_data(self.vehicle_components_fs.data, self.vehicle_dir)
 
-        if not self.fw_version:
+        if not self._fw_version_is_explicit:
             self.fw_version = self.get_fc_fw_version_from_vehicle_components_json()
 
         if vehicle_type == "":
@@ -125,12 +180,15 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
 
         fw_version = re_compile(r"[ _-]").split(self.fw_version, 1)[0]
         # Read ArduPilot parameter documentation
-        xml_url = get_xml_url(vehicle_type, fw_version)
-        fallback_xml_url = get_fallback_xml_url(vehicle_type, fw_version)
         xml_dir = get_xml_dir(vehicle_dir)
-        self.doc_dict = parse_parameter_metadata(
-            xml_url, xml_dir, PARAM_DEFINITION_XML_FILE, vehicle_type, TOOLTIP_MAX_LENGTH, fallback_xml_url
-        )
+        metadata_cache_key = (vehicle_type, fw_version, xml_dir)
+        if metadata_cache_key not in self._parameter_metadata_cache:
+            xml_url = get_xml_url(vehicle_type, fw_version)
+            fallback_xml_url = get_fallback_xml_url(vehicle_type, fw_version)
+            self._parameter_metadata_cache[metadata_cache_key] = parse_parameter_metadata(
+                xml_url, xml_dir, PARAM_DEFINITION_XML_FILE, vehicle_type, TOOLTIP_MAX_LENGTH, fallback_xml_url
+            )
+        self.doc_dict = deepcopy(self._parameter_metadata_cache[metadata_cache_key])
         self.param_default_dict = load_default_param_file(vehicle_dir)
 
         # Extend parameter documentation metadata if <parameter_file>.pdef.xml exists
@@ -141,6 +199,72 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
                 self.doc_dict.update(doc_dict)
 
         self.__extend_and_reformat_parameter_documentation_metadata()
+
+    def load_parameter_metadata_for_flight_controller(self, vehicle_type: str, firmware_version: str) -> str:
+        """Fetch metadata for the exact FC firmware and return its source URL."""
+        if not vehicle_type or not firmware_version:
+            msg = _("The connected flight controller did not report its vehicle type and firmware version.")
+            raise ValueError(msg)
+
+        version = re_compile(r"[ _-]").split(firmware_version, 1)[0]
+        metadata_url = get_xml_url(vehicle_type, version) + PARAM_DEFINITION_XML_FILE
+
+        with TemporaryDirectory() as xml_dir:
+            metadata_path = os_path.join(xml_dir, PARAM_DEFINITION_XML_FILE)
+            if not download_file_from_url(metadata_url, metadata_path):
+                msg = _("Could not download parameter metadata for the connected firmware from {url}").format(url=metadata_url)
+                raise ValueError(msg)
+            self.doc_dict = parse_parameter_metadata(
+                "",
+                xml_dir,
+                PARAM_DEFINITION_XML_FILE,
+                vehicle_type,
+                TOOLTIP_MAX_LENGTH,
+            )
+        self.vehicle_type = vehicle_type
+        self.fw_version = firmware_version
+        self.__extend_and_reformat_parameter_documentation_metadata()
+        return metadata_url
+
+    def remove_cached_parameter_metadata_for_mismatched_firmware(self, vehicle_dir: str) -> bool:
+        """
+        Remove cached parameter metadata when a project was made for another FC firmware.
+
+        ``fw_version`` is explicit only when it came from a connected flight controller.
+        In that case, a project's cached ``apm.pdef.xml`` may belong to the firmware
+        recorded in its vehicle_components.json instead.  Remove both the on-disk and
+        in-memory copies so the following reinitialization downloads matching metadata.
+        """
+        if not self._fw_version_is_explicit:
+            return False
+
+        fc_fw_version = re_compile(r"[ _-]").split(self.fw_version, 1)[0]
+        if not fc_fw_version or not self.load_vehicle_components_json_data(vehicle_dir):
+            return False
+
+        project_fw_version = self.get_fc_fw_version_from_vehicle_components_json()
+        if not project_fw_version or _firmware_versions_match(project_fw_version, fc_fw_version):
+            return False
+
+        project_vehicle_type = self.get_fc_fw_type_from_vehicle_components_json()
+        cache_key = (project_vehicle_type, fc_fw_version, get_xml_dir(vehicle_dir))
+        removed_from_memory = self._parameter_metadata_cache.pop(cache_key, None) is not None
+
+        metadata_file = os_path.join(vehicle_dir, PARAM_DEFINITION_XML_FILE)
+        try:
+            os_remove(metadata_file)
+        except FileNotFoundError:
+            return removed_from_memory
+        except OSError as error:
+            logging_warning(_("Could not remove cached parameter metadata %s: %s"), metadata_file, error)
+            return removed_from_memory
+
+        logging_info(
+            _("Removed cached parameter metadata because project firmware %s differs from connected FC firmware %s."),
+            project_fw_version,
+            fc_fw_version,
+        )
+        return True
 
     def vehicle_configuration_files_exist(self, vehicle_dir: str) -> bool:
         vehicle_path = Path(vehicle_dir)
@@ -163,22 +287,21 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
         if self.vehicle_dir is None or self.configuration_steps is None:
             return
         # Rename parameter files if some new files got added to the vehicle directory
-        for new_filename in self.configuration_steps:
-            if "old_filenames" in self.configuration_steps[new_filename]:
-                for old_filename in self.configuration_steps[new_filename]["old_filenames"]:
-                    if self.vehicle_configuration_file_exists(old_filename) and old_filename != new_filename:
-                        if self.vehicle_configuration_file_exists(new_filename):
-                            logging_error(
-                                _("File %s already exists. Will not rename file %s to %s."),
-                                new_filename,
-                                old_filename,
-                                new_filename,
-                            )
-                            continue
-                        new_filename_path = os_path.join(self.vehicle_dir, new_filename)
-                        old_filename_path = os_path.join(self.vehicle_dir, old_filename)
-                        os_rename(old_filename_path, new_filename_path)
-                        logging_info("Renamed %s to %s", old_filename, new_filename)
+        for new_filename, file_info in self.configuration_steps.items():
+            for old_filename in file_info.get("old_filenames", []):
+                if self.vehicle_configuration_file_exists(old_filename) and old_filename != new_filename:
+                    if self.vehicle_configuration_file_exists(new_filename):
+                        logging_error(
+                            _("File %s already exists. Will not rename file %s to %s."),
+                            new_filename,
+                            old_filename,
+                            new_filename,
+                        )
+                        continue
+                    new_filename_path = os_path.join(self.vehicle_dir, new_filename)
+                    old_filename_path = os_path.join(self.vehicle_dir, old_filename)
+                    os_rename(old_filename_path, new_filename_path)
+                    logging_info("Renamed %s to %s", old_filename, new_filename)
 
     def _format_columns_sorted_numerically(  # pylint: disable=too-many-locals
         self, values: dict[str, Any], max_width: int = 105, max_columns: int = 4
@@ -451,8 +574,18 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
           bool: True if the file exists and is a file (not a directory) and is not empty, False otherwise.
 
         """
+        file_size = self.vehicle_configuration_file_size(filename)
+        return file_size is not None and file_size > 0
+
+    def vehicle_configuration_file_size(self, filename: str) -> int | None:
+        """Return a regular vehicle file's size, or None when it is unavailable."""
         file_path = os_path.join(self.vehicle_dir, filename)
-        return os_path.exists(file_path) and os_path.isfile(file_path) and os_path.getsize(file_path) > 0
+        if not os_path.exists(file_path) or not os_path.isfile(file_path):
+            return None
+        try:
+            return os_path.getsize(file_path)
+        except OSError:
+            return None
 
     def __all_intermediate_parameter_file_comments(self) -> dict[str, str]:
         """
@@ -830,7 +963,7 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
             param_dict_as_par = ParDict({param: Par(float(value), "") for param, value in param_dict.items()})
             param_dict_as_par.export_to_param(os_path.join(self.vehicle_dir, filename))
 
-    def get_eval_variables(self) -> dict[str, dict[str, Any]]:
+    def get_eval_variables(self) -> dict[str, Any]:
         variables = {}
         if (
             hasattr(self, "vehicle_components_fs")
@@ -1058,20 +1191,36 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
         return os_path.realpath(os_path.join(base_dir, untrusted_path))
 
     def get_download_url_and_local_filename(self, selected_file: str) -> tuple[str, str]:
-        if selected_file in self.configuration_steps and self.configuration_steps[selected_file].get("download_file"):
-            src = self.configuration_steps[selected_file]["download_file"].get("source_url", "")
-            dst = self.configuration_steps[selected_file]["download_file"].get("dest_local", "")
-            if self.vehicle_dir and src and dst:
-                return src, self._safe_path_join(self.vehicle_dir, dst)
-        return "", ""
+        return next(iter(self.get_download_files(selected_file)), ("", ""))
 
     def get_upload_local_and_remote_filenames(self, selected_file: str) -> tuple[str, str]:
-        if selected_file in self.configuration_steps and self.configuration_steps[selected_file].get("upload_file"):
-            src = self.configuration_steps[selected_file]["upload_file"].get("source_local", "")
-            dst = self.configuration_steps[selected_file]["upload_file"].get("dest_on_fc", "")
-            if self.vehicle_dir and src and dst:
-                return self._safe_path_join(self.vehicle_dir, src), dst
-        return "", ""
+        return next(iter(self.get_upload_files(selected_file)), ("", ""))
+
+    def get_download_files(self, selected_file: str) -> list[tuple[str, str]]:
+        """Return all configured URL/local pairs in their normalized list form."""
+        entries: list[DownloadFileConfig] = cast(
+            "list[DownloadFileConfig]", self.configuration_steps.get(selected_file, {}).get("download_file", [])
+        )
+        if not self.vehicle_dir:
+            return []
+        return [
+            (entry["source_url"], self._safe_path_join(self.vehicle_dir, entry["dest_local"]))
+            for entry in entries
+            if entry.get("source_url") and entry.get("dest_local")
+        ]
+
+    def get_upload_files(self, selected_file: str) -> list[tuple[str, str]]:
+        """Return all configured local/FC pairs in their normalized list form."""
+        entries: list[UploadFileConfig] = cast(
+            "list[UploadFileConfig]", self.configuration_steps.get(selected_file, {}).get("upload_file", [])
+        )
+        if not self.vehicle_dir:
+            return []
+        return [
+            (self._safe_path_join(self.vehicle_dir, entry["source_local"]), entry["dest_on_fc"])
+            for entry in entries
+            if entry.get("source_local") and entry.get("dest_on_fc")
+        ]
 
     @staticmethod
     def get_git_commit_hash() -> str:
@@ -1122,14 +1271,42 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
             "--vehicle-type",
             choices=VehicleComponents.supported_vehicles(),
             default="",
-            help=_("The type of the vehicle. Default is ArduCopter"),
+            help=_(
+                "The type of the vehicle. With --bin-log, validates the vehicle type reported by the log "
+                "and the selected template. SITL and AP_Periph cannot be used with --bin-log. "
+                "Default is ArduCopter"
+            ),
         )
         parser.add_argument(  # type: ignore[attr-defined]
             "--vehicle-dir",
             type=str,
             default=os_getcwd(),
+            action=_VehicleDirAction,
             help=_(
-                "Directory containing vehicle-specific intermediate parameter files. Default is the current working directory"
+                "Directory containing vehicle-specific intermediate parameter files. For --bin-log, "
+                "an explicitly supplied value is the complete destination project directory. "
+                "Default is the current working directory"
+            ),
+        ).completer = DirectoriesCompleter()  # pyright: ignore[reportAttributeAccessIssue]
+        parser.add_argument(  # type: ignore[attr-defined]
+            "--bin-log",
+            type=str,
+            default="",
+            metavar="PATH",
+            help=_(
+                "Create a vehicle project from an ArduPilot .bin log file. "
+                "By default, the project is created in the default vehicles directory; "
+                "an explicitly supplied --vehicle-dir is the complete destination project directory."
+            ),
+        ).completer = FilesCompleter(allowednames=(".bin", ".BIN"))  # pyright: ignore[reportAttributeAccessIssue]
+        parser.add_argument(  # type: ignore[attr-defined]
+            "--template-dir",
+            type=str,
+            default="",
+            metavar="PATH",
+            help=_(
+                "Optional template directory to use with --bin-log. "
+                "Defaults to the empty template matching the log firmware version."
             ),
         ).completer = DirectoriesCompleter()  # pyright: ignore[reportAttributeAccessIssue]
         parser.add_argument(

@@ -133,8 +133,8 @@ So, [start the ArduPilot Methodic Configurator and select a vehicle that resembl
 1. Connect the flight controller to the PC via a USB cable and wait 7 seconds.
 1. Open *ArduPilot Methodic Configurator*, and [connect it to the vehicle](USERMANUAL.md#step-1-flight-controller-connection).<br>
    ![FC connection and parameter download](images/App_screenshot_FC_info_and_param_download.png)
-1. Press the *Create a vehicle configuration directory from template* button.<br>
-   ![Create a vehicle configuration directory from template](images/App_screenshot_Vehicle_directory_create_from_template.png)
+1. Press the *Create a vehicle project from a template* button.<br>
+   ![Create a vehicle project from a template](images/App_screenshot_Vehicle_directory_create_from_template.png)
 1. Now using [New vehicle](USERMANUAL.md#create-a-new-vehicle-configuration-directory) subsection<br>
    ![New vehicle](images/App_screenshot_Vehicle_directory_create_from_template_source.png)
 1. From the existing templates, select the one most similar to your vehicle:<br>
@@ -152,7 +152,7 @@ So, [start the ArduPilot Methodic Configurator and select a vehicle that resembl
    creating a new vehicle configuration directory from a template.
    Only makes sense if your FC has already been correctly configured. This option is only available when a flight controller is connected.
    - *Blank parameter change reason* - Do not use the parameters change reason from the template.
-1. Select the destination directory, give it a name, and press the *Create a vehicle configuration directory from template* button.
+1. Select the destination directory, give it a name, and press the *Create a vehicle project from a template* button.
 1. On the component editor window, **add all the details of the components of your system** as we did in [Section 1.2](#12-our-example-vehicle):<br>
    ![Component editor window](images/App_screenshot_Component_Editor.png)
 
@@ -516,6 +516,11 @@ The `Change Reason` field is extremely important because:
 
 In our setup, we used an advanced RC receiver that cannot be fully configured using Mission Planner's `SETUP >> Mandatory Hardware >> Radio Calibration` menu.
 
+On some flight controllers, it might be necessary to add and change the `BRD_ALT_CONFIG`
+parameter, in order to be able to connect the RC receiver or ESC telemetry to a pin that can decode it.
+This is necessary if not enough serial ports are available when `BRD_ALT_CONFIG==0` or
+when DMA-capable servo-outputs conflict with serial ports.
+
 Repeat the steps from [Section 6.1.1](#611-use-ardupilot-methodic-configurator-to-edit-the-parameter-file-and-upload-it-to-the-flight-controller) to edit and upload the `06_remote_controller_receiver.param` file
 
 ### 6.2.2 Configure the RC controller
@@ -546,6 +551,11 @@ Once this is operating we no longer need the USB connection to the vehicle. We c
 ## 6.4 Configure the ESC
 
 In our setup, we used a [Bi-directional Dshot ESC](https://ardupilot.org/copter/docs/common-dshot-escs.html) that cannot be fully configured using Mission Planner's `SETUP >> Mandatory Hardware >> Servo Output` menu.
+
+On some flight controllers, it might be necessary to add and change the `BRD_ALT_CONFIG`
+parameter, in order to be able to connect the RC receiver or ESC telemetry to a pin that can decode it.
+This is necessary if not enough serial ports are available when `BRD_ALT_CONFIG==0` or
+when DMA-capable servo-outputs conflict with serial ports.
 
 Repeat the steps from [Section 6.1.1](#611-use-ardupilot-methodic-configurator-to-edit-the-parameter-file-and-upload-it-to-the-flight-controller) to edit and upload the `09_esc_telemetry.param` file
 
@@ -1188,14 +1198,13 @@ Afterward, repeat the steps to edit and upload the `28_pid_notch_filter_results.
 If your flight controller can run lua scripts perform a [PID lua VTOL-Quiktune](https://ardupilot.org/copter/docs/quiktune.html).
 If you have an STM32 F4 or F7 processor that can not run lua scripts perform a [manual PID tune](https://ardupilot.org/copter/docs/ac_rollpitchtuning.html) instead.
 
-Setup the lua script using:
+Set up the Lua scripts using:
 
 1. Connect your flight controller to the PC
 1. Close mission planner, open *ArduPilot Methodic Configurator* and select your vehicle's directory
 1. Make sure your PC has internet connection
 1. On *ArduPilot Methodic Configurator* select `29_quick_tune_setup.param` on the *Current intermediate parameter file:* Combobox.
-1. When asked if you want to download the .lua script from internet answer yes.
-1. When asked if you want to upload the .lua script to the FC answer yes.
+1. When asked, download and upload `VTOL-quicktune.lua`.
 1. Read the documentation links inside the `29_quick_tune_setup.param` documentation.
 1. Edit the parameters' `New Value` and `Change Reason` to suit your requirements.
 1. Press `Upload selected params to FC, and advance to next file` button.
@@ -1233,14 +1242,12 @@ You can either manually perform a flight in `ALT_HOLD` or `STABILIZE` flight mod
 with throttle changes.
 Or you follow these steps to create an auto mission that performs the required flight patterns:
 
-1. On ArduPilot versions < 4.6.0 download the `advance-wp.lua` scripts from [ardupilot github repository](https://github.com/ArduPilot/ardupilot/blob/master/libraries/AP_Scripting/applets/advance-wp.lua), follow [Scripted MagFit flightpath generation](https://discuss.ardupilot.org/t/scripted-magfit-flightpath-generation/97536) and put it on the micro SDCard's `APM/scripts` folder.
-1. On ArduPilot versions >= 4.6.0 the script is already included.
 1. Insert the SD-Card on the flight controller.
 1. Connect your flight controller to the PC.
 1. Make sure your PC has internet connection.
 1. On *ArduPilot Methodic Configurator* select `31_inflight_magnetometer_fit_setup.param` on the *Current intermediate parameter file:* Combobox.
-1. When asked if you want to download the .lua script from internet answer yes.
-1. When asked if you want to upload the .lua script to the FC answer yes.
+1. When asked, download the MAGFit and `advance-wp.lua` scripts.
+1. When asked, upload both scripts to the FC.
 1. Read the documentation links inside the `31_inflight_magnetometer_fit_setup.param` documentation.
 1. Edit the parameters' `New Value` and `Change Reason` to suit your requirements.
 1. Press `Upload selected params to FC, and advance to next file` button.
@@ -1256,7 +1263,7 @@ Or you follow these steps to create an auto mission that performs the required f
 1. Upon execution of the mission, several messages will be displayed via telemetry:
    ![MagFit MissionPlanner mission messages](images/blog/MagFit_MissionPlanner_mission_messages.png)
    At this point, the figure-8 has been created, and the script is awaiting the user to set the waypoint beyond the loiter to commence the pattern.
-   Download the mission to confirm obstacle clearance before proceeding, and then use the GCS to set the indicated waypoint to continue (or use the additional helper script `advance-wp.lua` above to use an RC switch for advancing the waypoint).
+   Download the mission to confirm obstacle clearance before proceeding, and then use the GCS to set the indicated waypoint to continue (or use the `advance-wp.lua` helper script uploaded during step 31 to use an RC switch for advancing the waypoint).
    ![MagFit MissionPlanner mission map figure8](images/blog/MagFit_MissionPlanner_mission_map_figure8.jpeg)
 1. The figure-8 will then repeat `MAGH_COUNT` times, occasionally climbing and descending by `MAGH_ALT_DELTA` meters and
    incrementing speed toward `WPNAV_SPEED`.

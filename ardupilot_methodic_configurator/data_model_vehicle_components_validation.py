@@ -147,6 +147,8 @@ SERIAL_PROTOCOLS_DICT: dict[str, dict[str, Any]] = {
     "46": {"type": SERIAL_PORTS, "protocol": "IMUDATA", "component": None},
     "48": {"type": SERIAL_PORTS, "protocol": "PPP", "component": "Telemetry"},
     "49": {"type": SERIAL_PORTS, "protocol": "i-BUS Telemetry", "component": None},
+    # ArduPilot 4.7.x
+    "50": {"type": SERIAL_PORTS, "protocol": "IOMCU", "component": None},
 }
 
 # Serial telemetry-only protocols
@@ -189,6 +191,10 @@ BATT_MONITOR_CONNECTION: dict[str, dict[str, tuple[str, ...] | str]] = {
     "27": {"type": I2C_PORTS, "protocol": "EFI"},
     "28": {"type": I2C_PORTS, "protocol": "AD7091R5"},
     "29": {"type": OTHER_PORTS, "protocol": "Scripting"},
+    # ArduPilot 4.7.x
+    "30": {"type": I2C_PORTS, "protocol": "INA3221"},
+    "31": {"type": ANALOG_PORTS, "protocol": "Analog Current Only"},
+    "32": {"type": I2C_PORTS, "protocol": "TIBQ76952-I2C (Periph only)"},
 }
 
 GNSS_RECEIVER_CONNECTION: dict[str, dict[str, tuple[str, ...] | str]] = {
@@ -328,6 +334,7 @@ RC_PROTOCOLS_DICT: dict[str, dict[str, tuple[str, ...] | str]] = {
     "16384": {"type": CAN_PORTS, "protocol": "DroneCAN"},  # Bit 14
     "32768": {"type": RC_PORTS + SERIAL_PORTS, "protocol": "Ghost"},  # Bit 15
     "65536": {"type": RC_PORTS + SERIAL_PORTS, "protocol": "MAVRadio"},  # Bit 16
+    "262144": {"type": RC_PORTS + SERIAL_PORTS, "protocol": "SITL UDP"},  # Bit 18, ArduPilot 4.7.x
 }
 
 # When adding new entries here, make sure to also update the self._verify_dict_is_uptodate() calls
@@ -572,6 +579,18 @@ class ComponentDataModelValidation(ComponentDataModelBase):
         if "Q_M_PWM_TYPE" in doc_dict:
             self._mot_pwm_types = get_combobox_values("Q_M_PWM_TYPE")
 
+        # FRAME_CLASS is vehicle-specific metadata.  ArduPlane uses Q_FRAME_CLASS,
+        # whose values differ from Copter's FRAME_CLASS values.  Prefer the loaded
+        # firmware metadata so a project created from a connected FC reflects the
+        # parameters supported by that FC; retain the static mapping as an offline
+        # fallback when parameter metadata is unavailable.
+        frame_class_parameter = "Q_FRAME_CLASS" if fw_type == "ArduPlane" else "FRAME_CLASS"
+        frame_class_choices = get_combobox_values(frame_class_parameter) if frame_class_parameter in doc_dict else ()
+        if fw_type != "ArduPlane":
+            frame_class_choices = tuple(frame_class for frame_class in frame_class_choices if frame_class != "Undefined")
+        if not frame_class_choices:
+            frame_class_choices = get_frame_class_valid_tuple(fw_type)
+
         self._possible_choices = {
             ("Flight Controller", "Firmware", "Type"): VehicleComponents.supported_vehicles(),
             ("RC Receiver", "FC Connection", "Type"): get_connection_types(RC_PROTOCOLS_DICT),
@@ -597,7 +616,7 @@ class ComponentDataModelValidation(ComponentDataModelBase):
             ("GNSS Receiver", "FC Connection", "Type"): ("None", *SERIAL_PORTS, *CAN_PORTS),
             ("GNSS Receiver", "FC Connection", "Protocol"): get_all_protocols(GNSS_RECEIVER_CONNECTION),
             ("Battery", "Specifications", "Chemistry"): BatteryCell.chemistries(),
-            ("Frame", "Specifications", "Frame class"): get_frame_class_valid_tuple(fw_type),
+            ("Frame", "Specifications", "Frame class"): frame_class_choices,
         }
         for component in ["RC Receiver", "Telemetry", "Battery Monitor", "ESC", "GNSS Receiver"]:
             if component not in self._data.get("Components", {}):
@@ -992,7 +1011,7 @@ class ComponentDataModelValidation(ComponentDataModelBase):
             return BatteryCell.recommended_cell_voltage(self._battery_chemistry, path[-1])
         return 3.8
 
-    def validate_against_another_value(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def validate_against_another_value(
         self,
         value: float,
         limit_value,  # limit_value has no type, because it can have any type # noqa: ANN001

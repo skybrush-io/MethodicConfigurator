@@ -14,11 +14,14 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 from math import isnan, nan
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+from pymavlink.dialects.v20 import ardupilotmega as mavlink2
 
 from ardupilot_methodic_configurator.backend_flightcontroller import FlightController
+from ardupilot_methodic_configurator.backend_flightcontroller_business_logic import get_battery_parameter_prefix
+from ardupilot_methodic_configurator.backend_flightcontroller_commands import FlightControllerCommands
 from ardupilot_methodic_configurator.plugins.data_model_battery_monitor import BatteryMonitorDataModel
 
 # pylint: disable=redefined-outer-name,protected-access
@@ -44,8 +47,8 @@ def connected_flight_controller_with_battery_enabled() -> MagicMock:
 
     fc.is_battery_monitoring_enabled.return_value = True
     fc.get_voltage_thresholds.return_value = (11.0, 16.8)
-    fc.get_battery_status.return_value = ((12.4, 2.1), "")  # Voltage, current, message
-    fc.request_periodic_battery_status.return_value = None
+    fc.get_battery_statuses.return_value = ({0: (12.4, 2.1)}, "")  # Voltage, current, message
+    fc.request_periodic_battery_status.return_value = (True, "")
 
     return fc
 
@@ -84,6 +87,102 @@ def battery_monitor_data_model(
 # ==================== UNIT TESTS ====================
 
 
+@pytest.mark.parametrize("monitor_count", [1, 2, 9, 16])
+def test_user_sees_continuous_readings_from_round_robin_battery_telemetry(
+    connected_flight_controller_with_battery_enabled: MagicMock, monitor_count: int
+) -> None:
+    """
+    Every enabled battery stays visible while its telemetry stream is active.
+
+    GIVEN: Enabled monitors send one battery per requested stream interval.
+    WHEN: The user polls battery readings every 500 ms.
+    THEN: All rows stay available after startup and expire when telemetry stops.
+    """
+    fc = connected_flight_controller_with_battery_enabled
+    fc.fc_parameters = {f"{get_battery_parameter_prefix(battery_id)}_MONITOR": 4 for battery_id in range(monitor_count)}
+    commands = FlightControllerCommands(params_manager=fc, connection_manager=fc)
+    fc.get_battery_statuses.side_effect = commands.get_battery_statuses
+    model = BatteryMonitorDataModel(fc)
+    fc.master.recv_match.return_value = None
+    model.get_battery_statuses()
+    interval_seconds = fc.request_periodic_battery_status.call_args.args[0] / 1_000_000
+    next_message_time = interval_seconds
+    next_battery_id = 0
+
+    for poll in range(1, 41):
+        now = poll * 0.5
+        messages = []
+        while next_message_time <= now + 1e-9:
+            messages.append(
+                mavlink2.MAVLink_battery_status_message(next_battery_id, 0, 0, 32767, [12400] + [65535] * 9, 210, -1, -1, -1)
+            )
+            next_battery_id = (next_battery_id + 1) % monitor_count
+            next_message_time += interval_seconds
+        fc.master.recv_match.side_effect = [*messages, None]
+        with patch("ardupilot_methodic_configurator.backend_flightcontroller_commands.time_time", return_value=now):
+            readings = model.get_battery_statuses()
+        if poll >= monitor_count:
+            assert readings == dict.fromkeys(range(monitor_count), (12.4, 2.1))
+
+    fc.master.recv_match.side_effect = None
+    with patch("ardupilot_methodic_configurator.backend_flightcontroller_commands.time_time", return_value=23.0):
+        assert model.get_battery_statuses() is None
+
+
+def test_monitoring_adapts_when_another_battery_is_enabled(
+    connected_flight_controller_with_battery_enabled: MagicMock,
+) -> None:
+    """
+    Enabling another battery preserves the per-battery refresh rate.
+
+    GIVEN: An established battery stream and a newly enabled second monitor.
+    WHEN: The user refreshes battery status.
+    THEN: The requested interval keeps both batteries updating within 500 ms.
+    """
+    fc = connected_flight_controller_with_battery_enabled
+    model = BatteryMonitorDataModel(fc)
+    model.get_battery_statuses()
+    fc.fc_parameters["BATT2_MONITOR"] = 4
+
+    model.get_battery_statuses()
+
+    fc.request_periodic_battery_status.assert_called_with(250000)
+
+
+def test_failed_interval_change_is_retried_while_cached_readings_continue(
+    connected_flight_controller_with_battery_enabled: MagicMock,
+) -> None:
+    """A failed stream request is retried even when the old stream still supplies readings."""
+    fc = connected_flight_controller_with_battery_enabled
+    model = BatteryMonitorDataModel(fc)
+    model.get_battery_statuses()
+    fc.fc_parameters.update({f"BATT{battery_id}_MONITOR": 4 for battery_id in range(2, 8)})
+    fc.request_periodic_battery_status.reset_mock()
+    fc.request_periodic_battery_status.side_effect = [(False, "ACK failed"), (True, "")]
+
+    model.get_battery_statuses()
+    model.get_battery_statuses()
+    model.get_battery_statuses()
+
+    assert [call.args[0] for call in fc.request_periodic_battery_status.call_args_list] == [71428, 71428]
+
+
+def test_replaced_connection_requests_battery_stream_despite_default_readings(
+    connected_flight_controller_with_battery_enabled: MagicMock,
+) -> None:
+    """A new flight controller connection receives its own stream request."""
+    fc = connected_flight_controller_with_battery_enabled
+    model = BatteryMonitorDataModel(fc)
+    model.get_battery_statuses()
+    fc.request_periodic_battery_status.reset_mock()
+    fc.master = MagicMock()
+
+    model.get_battery_statuses()
+    model.get_battery_statuses()
+
+    fc.request_periodic_battery_status.assert_called_once_with(500000)
+
+
 class TestBatteryMonitorWithConnectedFlightController:
     """Test battery monitor behavior when flight controller is connected and battery monitoring enabled."""
 
@@ -99,15 +198,15 @@ class TestBatteryMonitorWithConnectedFlightController:
         AND: Color should be "red" for immediate visual alert
         """
         # Arrange: Configure high battery voltage
-        connected_flight_controller_with_battery_enabled.get_battery_status.return_value = (
-            (17.0, 2.1),
+        connected_flight_controller_with_battery_enabled.get_battery_statuses.return_value = (
+            {0: (17.0, 2.1)},
             "",
         )
         model = BatteryMonitorDataModel(connected_flight_controller_with_battery_enabled)
 
         # Act: Check voltage status
-        status = model.get_voltage_status()
-        color = model.get_battery_status_color()
+        status = model.get_voltage_status(0, (model.get_battery_statuses() or {}).get(0, (None, None))[0])
+        color = model.get_battery_status_color(0, (model.get_battery_statuses() or {}).get(0, (None, None))[0])
 
         # Assert: Status reflects critical condition
         assert status == "critical", "Voltage above maximum threshold should be critical"
@@ -129,19 +228,19 @@ class TestBatteryMonitorWithConnectedFlightController:
         assert model._got_battery_status is False, "Stream should not be established initially"
 
         # Act: First call retrieves battery status
-        status1 = model.get_battery_status()
+        status1 = model.get_battery_statuses()
         first_request_made = model.flight_controller.request_periodic_battery_status.called
 
         # Second call should not re-request if data is still coming
         model.flight_controller.request_periodic_battery_status.reset_mock()
-        status2 = model.get_battery_status()
+        status2 = model.get_battery_statuses()
         second_request_made = model.flight_controller.request_periodic_battery_status.called
 
         # Assert: Stream established after first data reception
-        assert status1 == (12.4, 2.1), "First call should return battery data"
+        assert status1 == {0: (12.4, 2.1)}, "First call should return battery data"
         assert first_request_made, "First call should request periodic stream"
         assert model._got_battery_status is True, "Stream should be marked as established"
-        assert status2 == (12.4, 2.1), "Second call should return cached data"
+        assert status2 == {0: (12.4, 2.1)}, "Second call should return cached data"
         assert not second_request_made, "Second call should not re-request if data flowing"
 
     def test_flight_controller_request_periodic_battery_status_called_on_first_read(
@@ -159,7 +258,7 @@ class TestBatteryMonitorWithConnectedFlightController:
         fc = model.flight_controller
 
         # Act: First battery status request
-        model.get_battery_status()
+        model.get_battery_statuses()
 
         # Assert: Periodic status request was initiated
         fc.request_periodic_battery_status.assert_called_once_with(500000)
@@ -193,20 +292,47 @@ class TestBatteryMonitorWithDisconnectedFlightController:
 
     def test_battery_monitoring_check_returns_false_when_disconnected(self, disconnected_flight_controller: MagicMock) -> None:
         """
-        Battery monitoring check returns False when flight controller is disconnected.
+        Battery monitoring check returns False and logs debug when flight controller is disconnected.
 
         GIVEN: Flight controller is not connected (master is None)
         WHEN: is_battery_monitoring_enabled() is called
         THEN: Should return False
+        AND: Should log at debug level rather than warning level
         """
         # Arrange: Disconnected FC
         model = BatteryMonitorDataModel(disconnected_flight_controller)
 
-        # Act: Check battery monitoring status
-        result = model.is_battery_monitoring_enabled()
+        # Act & Assert: Check battery monitoring status logs debug not warning
+        with (
+            patch("ardupilot_methodic_configurator.plugins.data_model_battery_monitor.logging_warning") as mock_warn,
+            patch("ardupilot_methodic_configurator.plugins.data_model_battery_monitor.logging_debug") as mock_dbg,
+        ):
+            result = model.is_battery_monitoring_enabled()
 
-        # Assert: Returns False when disconnected
-        assert result is False, "Should return False when flight controller disconnected"
+            assert result is False, "Should return False when flight controller disconnected"
+            mock_warn.assert_not_called()
+            mock_dbg.assert_called_once()
+
+    def test_get_battery_status_returns_none_when_disconnected(self, disconnected_flight_controller: MagicMock) -> None:
+        """
+        get_battery_status returns None and logs debug when flight controller is disconnected.
+
+        GIVEN: Flight controller is not connected (master is None)
+        WHEN: get_battery_status() is called
+        THEN: Should return None
+        AND: Should log at debug level rather than warning level
+        """
+        model = BatteryMonitorDataModel(disconnected_flight_controller)
+
+        with (
+            patch("ardupilot_methodic_configurator.plugins.data_model_battery_monitor.logging_warning") as mock_warn,
+            patch("ardupilot_methodic_configurator.plugins.data_model_battery_monitor.logging_debug") as mock_dbg,
+        ):
+            result = model.get_battery_statuses()
+
+            assert result is None
+            mock_warn.assert_not_called()
+            mock_dbg.assert_called_once()
 
     def test_connection_status_reflects_disconnected_state(self, disconnected_flight_controller: MagicMock) -> None:
         """
@@ -243,7 +369,7 @@ class TestBatteryMonitorThresholdHandling:
         model = battery_monitor_data_model
 
         # Act: Get voltage thresholds
-        min_volt, max_volt = model.get_voltage_thresholds()
+        min_volt, max_volt = model.get_voltage_thresholds(0)
 
         # Assert: Correct thresholds returned
         assert min_volt == 11.0, "Minimum voltage threshold should be BATT_ARM_VOLT"
@@ -260,14 +386,14 @@ class TestBatteryMonitorThresholdHandling:
         THEN: Status should be "critical" (must be strictly > min)
         """
         # Arrange: Set voltage at exact minimum
-        connected_flight_controller_with_battery_enabled.get_battery_status.return_value = (
-            (11.0, 2.1),
+        connected_flight_controller_with_battery_enabled.get_battery_statuses.return_value = (
+            {0: (11.0, 2.1)},
             "",
         )
         model = BatteryMonitorDataModel(connected_flight_controller_with_battery_enabled)
 
         # Act: Check voltage status
-        status = model.get_voltage_status()
+        status = model.get_voltage_status(0, (model.get_battery_statuses() or {}).get(0, (None, None))[0])
 
         # Assert: At minimum boundary is critical
         assert status == "critical", "Voltage at minimum threshold should be critical"
@@ -283,14 +409,14 @@ class TestBatteryMonitorThresholdHandling:
         THEN: Status should be "safe" (must be strictly < max, not <=)
         """
         # Arrange: Set voltage just below maximum
-        connected_flight_controller_with_battery_enabled.get_battery_status.return_value = (
-            (16.79, 2.1),
+        connected_flight_controller_with_battery_enabled.get_battery_statuses.return_value = (
+            {0: (16.79, 2.1)},
             "",
         )
         model = BatteryMonitorDataModel(connected_flight_controller_with_battery_enabled)
 
         # Act: Check voltage status
-        status = model.get_voltage_status()
+        status = model.get_voltage_status(0, (model.get_battery_statuses() or {}).get(0, (None, None))[0])
 
         # Assert: Just below maximum is safe
         assert status == "safe", "Voltage just below maximum threshold should be safe"
@@ -306,14 +432,14 @@ class TestBatteryMonitorThresholdHandling:
         THEN: Status should be "critical" (must be strictly < max)
         """
         # Arrange: Set voltage at exact maximum
-        connected_flight_controller_with_battery_enabled.get_battery_status.return_value = (
-            (16.8, 2.1),
+        connected_flight_controller_with_battery_enabled.get_battery_statuses.return_value = (
+            {0: (16.8, 2.1)},
             "",
         )
         model = BatteryMonitorDataModel(connected_flight_controller_with_battery_enabled)
 
         # Act: Check voltage status
-        status = model.get_voltage_status()
+        status = model.get_voltage_status(0, (model.get_battery_statuses() or {}).get(0, (None, None))[0])
 
         # Assert: At maximum boundary is critical
         assert status == "critical", "Voltage at maximum threshold should be critical"
@@ -351,7 +477,7 @@ class TestBatteryMonitorConnectionStatusIntegration:
         model = BatteryMonitorDataModel(disconnected_flight_controller)
 
         # Act: Try to get battery status
-        status = model.get_battery_status()
+        status = model.get_battery_statuses()
 
         # Assert: No request made when disconnected
         assert status is None, "Should return None when disconnected"
@@ -371,7 +497,7 @@ class TestBatteryMonitorConnectionStatusIntegration:
         model = BatteryMonitorDataModel(disconnected_flight_controller)
 
         # Act: Get voltage thresholds
-        min_volt, max_volt = model.get_voltage_thresholds()
+        min_volt, max_volt = model.get_voltage_thresholds(0)
 
         # Assert: Both thresholds are NaN
         assert isnan(min_volt), "Minimum threshold should be NaN when disconnected"
@@ -393,7 +519,7 @@ class TestBatteryMonitorDataModelEdgeCases:
         model = BatteryMonitorDataModel(connected_flight_controller_battery_disabled)
 
         # Act: Try to get battery status
-        status = model.get_battery_status()
+        status = model.get_battery_statuses()
 
         # Assert: Returns None
         assert status is None
@@ -409,14 +535,14 @@ class TestBatteryMonitorDataModelEdgeCases:
         THEN: Should return None
         """
         # Arrange: Return error message
-        connected_flight_controller_with_battery_enabled.get_battery_status.return_value = (
+        connected_flight_controller_with_battery_enabled.get_battery_statuses.return_value = (
             None,
             "Failed to read battery sensor",
         )
         model = BatteryMonitorDataModel(connected_flight_controller_with_battery_enabled)
 
         # Act: Get battery status
-        status = model.get_battery_status()
+        status = model.get_battery_statuses()
 
         # Assert: Returns None
         assert status is None
@@ -433,11 +559,78 @@ class TestBatteryMonitorDataModelEdgeCases:
         """
         # Arrange: Return NaN thresholds
         connected_flight_controller_with_battery_enabled.get_voltage_thresholds.return_value = (nan, nan)
-        connected_flight_controller_with_battery_enabled.get_battery_status.return_value = ((12.4, 2.1), "")
+        connected_flight_controller_with_battery_enabled.get_battery_statuses.return_value = ({0: (12.4, 2.1)}, "")
         model = BatteryMonitorDataModel(connected_flight_controller_with_battery_enabled)
 
         # Act: Check voltage status
-        status = model.get_voltage_status()
+        status = model.get_voltage_status(0, (model.get_battery_statuses() or {}).get(0, (None, None))[0])
 
         # Assert: Returns unavailable
         assert status == "unavailable"
+
+    def test_warning_logged_once_on_stream_loss_and_debug_thereafter(
+        self, connected_flight_controller_with_battery_enabled: MagicMock
+    ) -> None:
+        """
+        Warning is logged once when stream is lost, subsequent calls log at debug level.
+
+        GIVEN: Battery monitor has established a stream (_got_battery_status is True)
+        WHEN: get_battery_status encounters error messages across multiple calls
+        THEN: logging_warning should be called only once (on transition)
+        AND: logging_debug should be called on subsequent errors without spamming warnings
+        """
+        fc = connected_flight_controller_with_battery_enabled
+        model = BatteryMonitorDataModel(fc)
+        # Establish stream first
+        model._got_battery_status = True
+
+        fc.get_battery_statuses.return_value = (None, "Battery status not available from telemetry")
+
+        with (
+            patch("ardupilot_methodic_configurator.plugins.data_model_battery_monitor.logging_warning") as mock_warn,
+            patch("ardupilot_methodic_configurator.plugins.data_model_battery_monitor.logging_debug") as mock_dbg,
+        ):
+            # First poll after stream loss
+            res1 = model.get_battery_statuses()
+            assert res1 is None
+            assert model._got_battery_status is False
+            mock_warn.assert_called_once_with("Battery status not available from telemetry")
+
+            # Second poll while still lost - should NOT call warning again
+            res2 = model.get_battery_statuses()
+            assert res2 is None
+            assert mock_warn.call_count == 1
+            mock_dbg.assert_called_with("Battery status not available from telemetry")
+
+    @patch("ardupilot_methodic_configurator.backend_flightcontroller.FlightController.discover_connections")
+    def test_silent_connection_drives_model_through_backend_without_error_logs(self, mock_discover: MagicMock) -> None:
+        """
+        Model driven through real FlightController backend logs at debug without error spam on silent link.
+
+        GIVEN: FlightController with silent connection (commands time out, no telemetry)
+        WHEN: BatteryMonitorDataModel.get_battery_status is called
+        THEN: Returns None
+        AND: Neither logging_error nor logging_warning is called
+        """
+        mock_discover.return_value = None
+        fc = FlightController(reboot_time=2, baudrate=115200)
+        mock_master = MagicMock()
+        mock_master.recv_match.return_value = None
+        fc.set_master_for_testing(mock_master)
+        fc.fc_parameters["BATT_MONITOR"] = 4.0
+
+        model = BatteryMonitorDataModel(fc)
+
+        # 3 retry attempts, each evaluating start time and timeout
+        time_seq = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0]
+        with (
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_commands.time_time", side_effect=time_seq),
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_commands.time_sleep"),
+            patch("ardupilot_methodic_configurator.backend_flightcontroller_commands.logging_error") as mock_backend_err,
+            patch("ardupilot_methodic_configurator.plugins.data_model_battery_monitor.logging_warning") as mock_model_warn,
+        ):
+            status = model.get_battery_statuses()
+
+            assert status is None
+            mock_backend_err.assert_not_called()
+            mock_model_warn.assert_not_called()

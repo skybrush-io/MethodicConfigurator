@@ -44,42 +44,49 @@ classifiers = [
 
 dependencies = [
     "argcomplete==3.7.2",
-    "certifi==2026.7.22",
+    "certifi==2026.10.19",
     "defusedxml==0.7.1",
     "jsonschema==4.26.0",
     "matplotlib==3.10.3; python_version < '3.14'",
-    "matplotlib==3.10.9; python_version >= '3.14'",
+    "matplotlib==3.10.9; python_version >= '3.14' and python_version < '3.15'",
+    "matplotlib==3.11.2; python_version >= '3.15'",
     "numpy==2.0.2; python_version < '3.13'",
-    "numpy==2.3.4; python_version >= '3.13'",
+    "numpy==2.3.4; python_version >= '3.13' and python_version < '3.15'",
+    "numpy==2.5.4; python_version >= '3.15'",
     "pillow==12.3.0",
     "pip_system_certs==5.3",
-    "platformdirs==4.11.3",
-    "pymavlink==2.4.49",
+    "platformdirs==4.12.3",
+    "pymavlink==2.4.50",
     "pyserial==3.5",
     "requests==2.34.2",
     "screeninfo==0.8.1",
-    "simpleeval==1.0.7",
+    "selenium==4.50.0",
+    "simpleeval==1.0.8",
+    "typing_extensions==4.16.0; python_version < '3.11'",
 ]
 
 dynamic = ["version"]
 
 [project.optional-dependencies]
 dev = [
-    "coverage==7.15.4",
+    "coverage==7.16.2",
     "mock==5.2.0",
-    "mypy==2.3.0",
-    "pre-commit==4.6.1",
-    "pylint==4.0.5",
+    "mypy==2.3.1",
+    "pre-commit==4.6.2",
+    "pylint==4.1.2",
     "pyautogui==0.9.54",
-    "pyright==1.1.411",
+    "pyright==1.1.414",
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
     "pytest-md==0.2.0",
-    "pytest-mock==3.15.1",
+    "pytest-mock==3.16.0",
+    "pytest-timeout==2.4.0",
     "python-gettext==5.0",
-    "ruff==0.16.3",
-    "types-requests==2.33.0.20260712",
-    "ty==0.0.72",
+    "ruff==0.16.9",
+    "tomli==2.2.1; python_version < '3.11'",
+    "types-requests==2.33.0.20260906",
+    "ty==0.0.86",
+    "typing_extensions==4.16.0",
 ]
 
 ci_headless_tests = [
@@ -89,12 +96,11 @@ ci_headless_tests = [
 scripts = [
     "bs4==0.0.2",
     "psutil==7.2.2",
-    "selenium==4.47.0",
     "webdriver_manager==4.1.2",
 ]
 
 pypi_dist = [
-    "build==1.6.0",
+    "build==1.6.1",
     "packaging==26.3",
     "setuptools==84.0.0",
 ]
@@ -102,22 +108,28 @@ pypi_dist = [
 win_dist = [
     "pip==26.2.1",
     "pywin32==312",
-    "pyinstaller==6.22.2",
-    "pyinstaller-hooks-contrib==2026.7",
+    "pyinstaller==6.20.0; python_full_version < '3.14.7'",
+    "pyinstaller==6.22.3; python_full_version >= '3.14.7'",
+    "pyinstaller-hooks-contrib==2026.6; python_full_version < '3.14.7'",
+    "pyinstaller-hooks-contrib==2026.8; python_full_version >= '3.14.7'",
     "packaging==26.3",
 ]
 
 mac_dist = [
     "pip==26.2.1",
-    "pyinstaller==6.22.2",
-    "pyinstaller-hooks-contrib==2026.7",
+    "pyinstaller==6.20.0; python_full_version < '3.14.7'",
+    "pyinstaller==6.22.3; python_full_version >= '3.14.7'",
+    "pyinstaller-hooks-contrib==2026.6; python_full_version < '3.14.7'",
+    "pyinstaller-hooks-contrib==2026.8; python_full_version >= '3.14.7'",
     "packaging==26.3",
 ]
 
 linux_dist = [
     "pip==26.2.1",
-    "pyinstaller==6.22.2",
-    "pyinstaller-hooks-contrib==2026.7",
+    "pyinstaller==6.20.0; python_full_version < '3.14.7'",
+    "pyinstaller==6.22.3; python_full_version >= '3.14.7'",
+    "pyinstaller-hooks-contrib==2026.6; python_full_version < '3.14.7'",
+    "pyinstaller-hooks-contrib==2026.8; python_full_version >= '3.14.7'",
     "packaging==26.3",
 ]
 
@@ -127,6 +139,11 @@ extract_param_defaults = "ardupilot_methodic_configurator.extract_param_defaults
 annotate_params = "ardupilot_methodic_configurator.annotate_params:main"
 param_pid_adjustment_update = "ardupilot_methodic_configurator.param_pid_adjustment_update:main"
 mavftp = "ardupilot_methodic_configurator.backend_mavftp:main"
+amc_mavftp = "ardupilot_methodic_configurator.frontend_tkinter_file_browser:main"
+amc_parameter_compare_and_upload = "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload:main"
+amc_parameter_export = "ardupilot_methodic_configurator.frontend_tkinter_parameter_export:main"
+amc_mavlink_inspector = "ardupilot_methodic_configurator.frontend_tkinter_mavlink_inspector:main"
+amc_firmware_upload = "ardupilot_methodic_configurator.frontend_tkinter_firmware_upload:main"
 
 [project.entry-points."argcomplete.completers"]
 ardupilot_methodic_configurator = "ardupilot_methodic_configurator.__main__:create_argument_parser"
@@ -134,6 +151,11 @@ extract_param_defaults = "ardupilot_methodic_configurator.extract_param_defaults
 annotate_params = "ardupilot_methodic_configurator.annotate_params:create_argument_parser"
 param_pid_adjustment_update = "ardupilot_methodic_configurator.param_pid_adjustment_update:create_argument_parser"
 mavftp = "ardupilot_methodic_configurator.backend_mavftp:create_argument_parser"
+amc_mavftp = "ardupilot_methodic_configurator.frontend_tkinter_file_browser:create_argument_parser"
+amc_parameter_compare_and_upload = "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload:create_argument_parser"
+amc_parameter_export = "ardupilot_methodic_configurator.frontend_tkinter_parameter_export:create_argument_parser"
+amc_mavlink_inspector = "ardupilot_methodic_configurator.frontend_tkinter_mavlink_inspector:create_argument_parser"
+amc_firmware_upload = "ardupilot_methodic_configurator.frontend_tkinter_firmware_upload:create_argument_parser"
 
 [project.urls]
 homepage = "https://ardupilot.github.io/MethodicConfigurator/"
@@ -146,14 +168,14 @@ download = "https://github.com/ArduPilot/MethodicConfigurator/releases"
 changelog = "https://github.com/ArduPilot/MethodicConfigurator/releases"
 
 [tool.uv]
-required-version = "==0.12.6"
+required-version = ">=0.12.6"
 
 [tool.setuptools]
-# Rely on discovery for just the top-level package and specify data via package-data
+# Discover the application and its subpackages; specify data via package-data.
 include-package-data = false
 
 [tool.setuptools.packages.find]
-include = ["ardupilot_methodic_configurator"]
+include = ["ardupilot_methodic_configurator*"]
 
 [tool.setuptools.package-data]
 ardupilot_methodic_configurator = ["**/*.param", "**/*.png", "**/*.jpg", "**/*.json", "**/*.xml", "**/*.mo"]
@@ -170,6 +192,7 @@ skip = "*.pdef.xml,*.pdf,*.po"
 target-version = "py310"
 exclude = [
     ".git",
+    ".packaging-check",
     "__pycache__",
     "__target__",
     "dist",
@@ -190,6 +213,8 @@ exclude = [
     "find_exclusive_parameter_names.py",
     # Synchronized verbatim from ArduPilot by update_flightcontroller_ids.yml.
     "ardupilot_methodic_configurator/decode_devid.py",
+    # Maintained MAVProxy adaptation covered by focused MAVFTP tests.
+    "ardupilot_methodic_configurator/backend_mavftp.py",
 ]
 
 # https://docs.astral.sh/ruff/rules/
@@ -266,6 +291,11 @@ warn_unused_configs = true
 
 files = ["ardupilot_methodic_configurator/*.py"]
 
+[[tool.mypy.overrides]]
+# The maintained MAVProxy adaptation is checked by focused runtime tests.
+module = "ardupilot_methodic_configurator.backend_mavftp"
+ignore_errors = true
+
 [tool.pyright]
 include = [
     "ardupilot_methodic_configurator/*.py",
@@ -292,6 +322,7 @@ exclude = [
     "mavftp.py",
     "fix_with_statements.py",
     "find_exclusive_parameter_names.py",
+    "ardupilot_methodic_configurator/decode_devid.py",
     "ardupilot_methodic_configurator/tempcal_imu.py",
     "ardupilot_methodic_configurator/backend_mavftp.py",
     "ardupilot_methodic_configurator/mavftp_example.py",

@@ -14,7 +14,6 @@ from argparse import ArgumentParser, Namespace
 from logging import basicConfig as logging_basicConfig
 from logging import debug as logging_debug
 from logging import error as logging_error
-from logging import getLevelName as logging_getLevelName
 from logging import info as logging_info
 from typing import Any
 
@@ -185,7 +184,7 @@ def remove_directory(mav_ftp: mavftp.MAVFTP, remote_directory: str) -> None:
 def upload_script(mav_ftp: mavftp.MAVFTP, remote_directory: str, local_filename: str, timeout: float) -> None:
     # Upload it from the PC to the flight controller
     mav_ftp.cmd_put([local_filename, remote_directory + "/" + local_filename])
-    ret = mav_ftp.process_ftp_reply("CreateFile", timeout=timeout)
+    ret = mav_ftp.process_ftp_reply("put", timeout=timeout)
     ret.display_message()
     debug_class_member_variable_changes(mav_ftp)
 
@@ -216,7 +215,7 @@ def main() -> None:
     """For testing/example purposes only."""
     args = argument_parser()
 
-    logging_basicConfig(level=logging_getLevelName(args.loglevel), format="%(levelname)s - %(message)s")
+    logging_basicConfig(level=args.loglevel, format="%(levelname)s - %(message)s")
 
     # create a mavlink serial instance
     comport = auto_connect(args.device)

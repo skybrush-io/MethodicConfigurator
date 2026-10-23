@@ -40,16 +40,17 @@ import argparse
 import tkinter as tk
 from logging import basicConfig as logging_basicConfig
 from logging import error as logging_error
-from logging import getLevelName as logging_getLevelName
 from tkinter import ttk
 
 from ardupilot_methodic_configurator import _
 from ardupilot_methodic_configurator.backend_filesystem_configuration_steps import ConfigurationSteps, PhaseData
 from ardupilot_methodic_configurator.common_arguments import add_common_arguments
+from ardupilot_methodic_configurator.frontend_tkinter_collapsible_label_frame import CollapsibleLabelFrame
+from ardupilot_methodic_configurator.frontend_tkinter_font import get_safe_font_config
 from ardupilot_methodic_configurator.frontend_tkinter_show import show_tooltip
 
 
-class StageProgressBar(ttk.LabelFrame):  # pylint: disable=too-many-ancestors
+class StageProgressBar(CollapsibleLabelFrame):  # pylint: disable=too-many-ancestors
     """Stage-segmented Configuration sequence progress UI."""
 
     def __init__(
@@ -66,13 +67,18 @@ class StageProgressBar(ttk.LabelFrame):  # pylint: disable=too-many-ancestors
         self.phase_frames: dict[str, ttk.Frame] = {}
         self.phase_bars: list[dict[str, ttk.Progressbar | int]] = []
 
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        default_font = get_safe_font_config()
+        default_font_size = int(default_font["size"])
+        smaller_font_size = int(default_font_size * 0.9)
+        ttk.Style(self).configure("PhaseProgress.TLabel", font=(default_font["family"], smaller_font_size))
+
+        self.content_frame.columnconfigure(0, weight=1)
+        self.content_frame.rowconfigure(0, weight=1)
 
         self.create_phase_frames(gui_complexity)
         self.bind("<Configure>", self._on_resize)
         show_tooltip(
-            self,
+            self.content_frame,
             _(
                 "This bar shows your progress through the configuration phases. "
                 "Each phase contains configuration steps that must be completed in sequence."
@@ -88,7 +94,7 @@ class StageProgressBar(ttk.LabelFrame):  # pylint: disable=too-many-ancestors
         phases_to_display = non_optional_phases if gui_complexity == "simple" else self.phases
 
         # Create container frame that will expand
-        container = ttk.Frame(self)
+        container = ttk.Frame(self.content_frame)
         container.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
         # Configure container columns to expand equally
@@ -100,7 +106,7 @@ class StageProgressBar(ttk.LabelFrame):  # pylint: disable=too-many-ancestors
             end = phase_data.get("end", self.total_files)
             self.phase_frames[phase_name] = self._create_phase_frame(container, i, phase_name, phase_data, (start, end))
 
-    def _create_phase_frame(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def _create_phase_frame(
         self, container: ttk.Frame, i: int, phase_name: str, phase_data: PhaseData, limits: tuple[int, int]
     ) -> ttk.Frame:
         frame = ttk.Frame(container)
@@ -134,6 +140,7 @@ class StageProgressBar(ttk.LabelFrame):  # pylint: disable=too-many-ancestors
             justify=tk.CENTER,
             anchor="center",
             foreground=label_fg,
+            style="PhaseProgress.TLabel",
         )
         label.grid(row=1, column=0, sticky="ew")
 
@@ -223,7 +230,7 @@ def argument_parser() -> argparse.Namespace:  # pragma: no cover
 def main() -> None:  # pragma: no cover
     args = argument_parser()
 
-    logging_basicConfig(level=logging_getLevelName(args.loglevel), format="%(asctime)s - %(levelname)s - %(message)s")
+    logging_basicConfig(level=args.loglevel, format="%(asctime)s - %(levelname)s - %(message)s")
 
     root = tk.Tk()
     root.title("Configuration Progress")

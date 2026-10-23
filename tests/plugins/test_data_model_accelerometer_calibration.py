@@ -5,7 +5,7 @@ Tests for the data_model_accelerometer_calibration.py file.
 
 This file is part of ArduPilot Methodic Configurator. https://github.com/ArduPilot/MethodicConfigurator
 
-SPDX-FileCopyrightText: 2026 ArduPilot Contributors
+SPDX-FileCopyrightText: 2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 
 SPDX-License-Identifier: GPL-3.0-or-later
 """
@@ -18,6 +18,49 @@ from pymavlink import mavutil
 from ardupilot_methodic_configurator.plugins.data_model_accelerometer_calibration import AccelerometerCalibrationDataModel
 
 # pylint: disable=protected-access
+
+
+def test_accelerometer_monitor_restarts_telemetry_after_leaving_and_returning(connected_flight_controller: MagicMock) -> None:
+    """
+    Recover accelerometer monitoring after a plugin is reopened.
+
+    GIVEN: A controller that supplies samples after an initial telemetry gap
+    WHEN: Monitoring stops and then resumes
+    THEN: Samples are returned and the stream is requested again after stopping
+    """
+    # Given: Only controller I/O is mocked.
+    controller = connected_flight_controller
+    controller.request_scaled_imu_messages.return_value = (True, "")
+    controller.poll_scaled_imu.side_effect = [None, (0.0, 0.0, -1000.0), (0.0, -1000.0, 0.0)]
+    model = AccelerometerCalibrationDataModel(controller)
+    # When: Poll, leave the plugin and return.
+    assert model.poll_imu_raw() is None
+    assert model.poll_imu_raw() == (0.0, 0.0, -1000.0)
+    model.stop_imu_monitoring()
+    sample = model.poll_imu_raw()
+    # Then: The new reading has physical units and orientation appropriate to calibration.
+    assert sample is not None
+    assert sample == (0.0, -1000.0, 0.0)
+    assert model.compute_detected_position(*sample) == "RIGHT"
+    assert model.compute_movement_magnitude_ms2(*sample) == pytest.approx(9.80665)
+    assert controller.request_scaled_imu_messages.call_count == 2
+
+
+@pytest.mark.parametrize(("position", "expected"), [(1, "LEVEL"), (3, "RIGHT"), (999, "")])
+def test_requested_calibration_pose_has_an_orientation_for_live_comparison(
+    connected_flight_controller: MagicMock, position: int, expected: str
+) -> None:
+    """
+    Compare a requested calibration pose with live orientation feedback.
+
+    GIVEN: A standard or unrecognized position request
+    WHEN: The requested orientation is queried
+    THEN: Known positions have a name and unknown positions have no false match
+    """
+    # Given: A real calibration model.
+    model = AccelerometerCalibrationDataModel(connected_flight_controller)
+    # When / Then: Resolve the controller's requested position.
+    assert model.get_position_orientation_name(position) == expected
 
 
 class TestAccelerometerCalibrationDataModelConnection:
@@ -46,6 +89,23 @@ class TestAccelerometerCalibrationDataModelConnection:
         model = AccelerometerCalibrationDataModel(disconnected_flight_controller)
 
         assert model.is_connected() is False
+
+
+class TestAccelerometerCalibrationCancellation:  # pylint: disable=too-few-public-methods
+    """Closing the wizard resets local state without claiming to cancel FC work."""
+
+    def test_cancel_closes_locally_without_sending_an_fc_cancel_command(self, connected_flight_controller) -> None:
+        """The user can leave the wizard even though ArduPilot has no MAVLink cancel command."""
+        model = AccelerometerCalibrationDataModel(connected_flight_controller)
+        model._current_position = mavutil.mavlink.ACCELCAL_VEHICLE_POS_LEFT
+
+        success, message = model.cancel_full_calibration()
+
+        assert success is True
+        assert "wizard was closed" in message.lower()
+        assert "may still be finishing" in message.lower()
+        assert model._current_position is None
+        connected_flight_controller.cancel_accel_calibration.assert_not_called()
 
 
 class TestAccelerometerCalibrationDataModelSimpleCalibration:
@@ -115,75 +175,6 @@ class TestAccelerometerCalibrationDataModelSimpleCalibration:
 
         assert success is False
         assert message == "Calibration failed"
-
-
-class TestAccelerometerCalibrationDataModelLevelCalibration:
-    """Test the level-trim calibration workflow."""
-
-    def test_level_calibration_is_refused_when_disconnected(self, disconnected_flight_controller) -> None:
-        """
-        Level calibration cannot run without a connected flight controller.
-
-        GIVEN: A disconnected flight controller
-        WHEN: start_level_calibration is called
-        THEN: It fails with a not-connected message and never touches the backend
-        """
-        model = AccelerometerCalibrationDataModel(disconnected_flight_controller)
-
-        success, message = model.start_level_calibration()
-
-        assert success is False
-        assert message == "Flight controller not connected"
-        disconnected_flight_controller.start_accel_calibration_level.assert_not_called()
-
-    def test_level_calibration_succeeds_when_backend_confirms(self, connected_flight_controller) -> None:
-        """
-        A successful level-trim is reported as success to the user.
-
-        GIVEN: A connected flight controller whose level calibration succeeds
-        WHEN: start_level_calibration is called
-        THEN: The backend is invoked and a success message is returned
-        """
-        connected_flight_controller.start_accel_calibration_level.return_value = (True, "")
-        model = AccelerometerCalibrationDataModel(connected_flight_controller)
-
-        success, message = model.start_level_calibration()
-
-        assert success is True
-        assert message == "Level calibration successful"
-        connected_flight_controller.start_accel_calibration_level.assert_called_once_with()
-
-    def test_level_calibration_surfaces_backend_error_message(self, connected_flight_controller) -> None:
-        """
-        A backend level-trim failure propagates its error message to the user.
-
-        GIVEN: A connected flight controller whose level calibration fails with a message
-        WHEN: start_level_calibration is called
-        THEN: The backend error message is returned
-        """
-        connected_flight_controller.start_accel_calibration_level.return_value = (False, "vehicle not level")
-        model = AccelerometerCalibrationDataModel(connected_flight_controller)
-
-        success, message = model.start_level_calibration()
-
-        assert success is False
-        assert message == "vehicle not level"
-
-    def test_level_calibration_provides_default_error_when_backend_is_silent(self, connected_flight_controller) -> None:
-        """
-        A silent level-trim failure still yields a meaningful failure text.
-
-        GIVEN: A connected flight controller whose level calibration fails without a message
-        WHEN: start_level_calibration is called
-        THEN: A default failure message is returned
-        """
-        connected_flight_controller.start_accel_calibration_level.return_value = (False, "")
-        model = AccelerometerCalibrationDataModel(connected_flight_controller)
-
-        success, message = model.start_level_calibration()
-
-        assert success is False
-        assert message == "Level calibration failed"
 
 
 class TestAccelerometerCalibrationDataModelFullCalibration:

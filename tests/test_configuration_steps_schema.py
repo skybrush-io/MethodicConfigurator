@@ -18,9 +18,13 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from jsonschema import ValidationError, exceptions, validate, validators
+
+from ardupilot_methodic_configurator.backend_filesystem_configuration_steps import ConfigurationSteps
+from ardupilot_methodic_configurator.data_model_par_dict import ParDict
 
 # Path to the schema file
 SCHEMA_FILE_PATH = os.path.join("ardupilot_methodic_configurator", "configuration_steps_schema.json")
@@ -28,6 +32,10 @@ SCHEMA_FILE_PATH = os.path.join("ardupilot_methodic_configurator", "configuratio
 # Load the schema
 with open(SCHEMA_FILE_PATH, encoding="utf-8") as schema_file:
     schema = json.load(schema_file)
+
+# The template values are six-decimal exports of these gains applied to this learned hover-thrust
+# fixture: 0.2 * 0.200263 -> 0.040053 and 0.1 * 0.200263 -> 0.020026.
+PLANE_47_TEMPLATE_HOVER_THRUST = 0.200263
 
 
 def test_schema_validity() -> None:
@@ -133,6 +141,295 @@ def test_arducopter_configuration_steps_bin_messages_each_have_a_required_messag
         assert has_required, f"Step '{step_name}' has no required message in related_bin_messages"
 
 
+@pytest.mark.parametrize("vehicle_type", ["ArduCopter", "ArduPlane", "Heli", "Rover"])
+def test_serial_rc_receiver_derives_rcin_protocol_for_each_vehicle_type(vehicle_type: str) -> None:
+    """Selecting a serial RC Receiver connection assigns RCIN to every supported vehicle type."""
+    configuration_steps_file = (
+        Path(__file__).parent.parent / "ardupilot_methodic_configurator" / f"configuration_steps_{vehicle_type}.json"
+    )
+    with open(configuration_steps_file, encoding="utf-8") as file:
+        config = json.load(file)
+
+    step_file = "06_remote_controller_receiver.param"
+    step_info = config["steps"][step_file]
+    config_steps = ConfigurationSteps("vehicle_dir", vehicle_type)
+
+    for serial_port in range(1, 10):
+        serial_name = f"SERIAL{serial_port}"
+        variables = {
+            "vehicle_components": {"RC Receiver": {"FC Connection": {"Type": serial_name, "Protocol": "CRSF"}}},
+            "doc_dict": {"RC_PROTOCOLS": {"values": {}, "Bitmask": {9: "CRSF"}}},
+        }
+
+        error = config_steps.compute_parameters(step_file, step_info, "derived", variables)
+
+        assert error == ""
+        assert config_steps.derived_parameters[step_file][f"{serial_name}_PROTOCOL"].value == 23.0
+
+    non_serial_variables = {
+        "vehicle_components": {"RC Receiver": {"FC Connection": {"Type": "RCin/SBUS", "Protocol": "CRSF"}}},
+        "doc_dict": {"RC_PROTOCOLS": {"values": {}, "Bitmask": {9: "CRSF"}}},
+    }
+    error = config_steps.compute_parameters(step_file, step_info, "derived", non_serial_variables)
+
+    assert error == ""
+    assert not any(
+        name.startswith("SERIAL") and name.endswith("_PROTOCOL") for name in config_steps.derived_parameters[step_file]
+    )
+
+
+def test_arduplane_configuration_steps_do_not_write_copter_only_parameters() -> None:
+    """ArduPlane configuration steps must use QuadPlane Q_A_, Q_M_, and Q_P_ parameter groups."""
+    configuration_steps_file = (
+        Path(__file__).parent.parent / "ardupilot_methodic_configurator" / "configuration_steps_ArduPlane.json"
+    )
+    with open(configuration_steps_file, encoding="utf-8") as file:
+        config = json.load(file)
+
+    copter_only_parameter_names = {
+        parameter_name
+        for step in config["steps"].values()
+        for section in ("add_parameters", "delete_parameters", "derived_parameters", "forced_parameters")
+        for parameter_name in step.get(section, {})
+        if parameter_name.startswith(("ATC_", "MOT_", "PSC_"))
+    }
+
+    assert not copter_only_parameter_names
+
+
+def test_arduplane_configuration_steps_use_plane_parameter_names() -> None:
+    """Plane configuration steps use the names exposed by ArduPlane firmware."""
+    configuration_steps_file = (
+        Path(__file__).parent.parent / "ardupilot_methodic_configurator" / "configuration_steps_ArduPlane.json"
+    )
+    with open(configuration_steps_file, encoding="utf-8") as file:
+        config = json.load(file)
+
+    steps = config["steps"]
+    rc_step = steps["06_remote_controller_receiver.param"]
+    attitude_step = steps["13_initial_atc.param"]
+    throttle_step = steps["20_esc.param"]
+
+    assert "THR_FS_VALUE" in rc_step["autoimport_nondefault_regexp"]
+    assert "FS_THR_VALUE" not in rc_step["autoimport_nondefault_regexp"]
+    assert "FRAME_CLASS" not in steps["05_board_orientation.param"]["derived_parameters"]
+    expected_acceleration_parameters = {
+        "Q_A_ACCEL_P_MAX",
+        "Q_A_ACCEL_R_MAX",
+        "Q_A_ACCEL_Y_MAX",
+        "Q_A_ACC_P_MAX",
+        "Q_A_ACC_R_MAX",
+        "Q_A_ACC_Y_MAX",
+    }
+    assert expected_acceleration_parameters <= set(attitude_step["derived_parameters"])
+    assert "Q_A_ACC(EL)?_[PRY]_MAX$" in attitude_step["autoimport_nondefault_regexp"]
+    assert "TKOFF_RPM_MIN" not in throttle_step["add_parameters"]
+    assert "Q_TKOFF_RPM_MIN" in throttle_step["add_parameters"]
+
+
+def test_arduplane_4_7_throttle_controller_uses_scaled_quadplane_acceleration_gains() -> None:
+    """The renamed Plane 4.7 throttle gains retain the firmware conversion scale."""
+    parameter_file = (
+        Path(__file__).parent.parent
+        / "ardupilot_methodic_configurator"
+        / "vehicle_templates"
+        / "ArduPlane"
+        / "empty_4.7.x"
+        / "24_throttle_controller.param"
+    )
+    values = {
+        name: float(value)
+        for line in parameter_file.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+        for name, value in [line.split(",", maxsplit=1)]
+    }
+
+    assert values["Q_P_D_ACC_I"] == pytest.approx(round(0.2 * PLANE_47_TEMPLATE_HOVER_THRUST, 6))
+    assert values["Q_P_D_ACC_P"] == pytest.approx(round(0.1 * PLANE_47_TEMPLATE_HOVER_THRUST, 6))
+
+
+def test_arduplane_4_7_throttle_controller_formulas_scale_hover_thrust() -> None:
+    """The Plane 4.7 configuration formulas apply the documented 0.2/0.1 gains."""
+    configuration_steps_file = (
+        Path(__file__).parent.parent / "ardupilot_methodic_configurator" / "configuration_steps_ArduPlane.json"
+    )
+    config = json.loads(configuration_steps_file.read_text(encoding="utf-8"))
+    config_steps = ConfigurationSteps("vehicle_dir", "ArduPlane")
+    variables = {
+        "fc_parameters": {"Q_M_THST_HOVER": PLANE_47_TEMPLATE_HOVER_THRUST},
+        "vehicle_components": {"Flight Controller": {"Firmware": {"Version": "4.7.0"}}},
+    }
+
+    error = config_steps.compute_parameters(
+        "24_throttle_controller.param",
+        config["steps"]["24_throttle_controller.param"],
+        "derived",
+        variables,
+    )
+
+    assert error == ""
+    derived = config_steps.derived_parameters["24_throttle_controller.param"]
+    assert derived["Q_P_D_ACC_I"].value == pytest.approx(0.2 * PLANE_47_TEMPLATE_HOVER_THRUST)
+    assert derived["Q_P_D_ACC_P"].value == pytest.approx(0.1 * PLANE_47_TEMPLATE_HOVER_THRUST)
+
+
+def test_arduplane_4_7_throttle_controller_exports_six_decimal_gains(tmp_path: Path) -> None:
+    """Computed Plane 4.7 gains retain their six-decimal parameter-file representation."""
+    configuration_steps_file = (
+        Path(__file__).parent.parent / "ardupilot_methodic_configurator" / "configuration_steps_ArduPlane.json"
+    )
+    config = json.loads(configuration_steps_file.read_text(encoding="utf-8"))
+    config_steps = ConfigurationSteps("vehicle_dir", "ArduPlane")
+    variables = {
+        "fc_parameters": {"Q_M_THST_HOVER": PLANE_47_TEMPLATE_HOVER_THRUST},
+        "vehicle_components": {"Flight Controller": {"Firmware": {"Version": "4.7.0"}}},
+    }
+
+    assert (
+        config_steps.compute_parameters(
+            "24_throttle_controller.param",
+            config["steps"]["24_throttle_controller.param"],
+            "derived",
+            variables,
+        )
+        == ""
+    )
+    derived = config_steps.derived_parameters["24_throttle_controller.param"]
+    output_file = tmp_path / "24_throttle_controller.param"
+    ParDict({name: derived[name] for name in ("Q_P_D_ACC_I", "Q_P_D_ACC_P")}).export_to_param(str(output_file))
+
+    parameter_lines = [line.split("  #", maxsplit=1)[0] for line in output_file.read_text(encoding="utf-8").splitlines()]
+    assert parameter_lines == [
+        "Q_P_D_ACC_I,0.040053",
+        "Q_P_D_ACC_P,0.020026",
+    ]
+
+
+@pytest.mark.parametrize(
+    "parameter_names",
+    [
+        {"Q_A_ACCEL_P_MAX", "Q_A_ACCEL_R_MAX", "Q_A_ACCEL_Y_MAX"},
+        {"Q_A_ACC_P_MAX", "Q_A_ACC_R_MAX", "Q_A_ACC_Y_MAX"},
+    ],
+)
+def test_arduplane_initial_attitude_formulas_evaluate_for_both_parameter_generations(
+    parameter_names: set[str],
+) -> None:
+    """Both Plane acceleration parameter generations compute without expression errors."""
+    configuration_steps_file = (
+        Path(__file__).parent.parent / "ardupilot_methodic_configurator" / "configuration_steps_ArduPlane.json"
+    )
+    with open(configuration_steps_file, encoding="utf-8") as file:
+        config = json.load(file)
+
+    step_file = "13_initial_atc.param"
+    config_steps = ConfigurationSteps("vehicle_dir", "ArduPlane")
+    error = config_steps.compute_parameters(
+        step_file,
+        config["steps"][step_file],
+        "derived",
+        {
+            "fc_parameters": dict.fromkeys(parameter_names, 0),
+            "vehicle_components": {"Propellers": {"Specifications": {"Diameter_inches": 3}}},
+        },
+    )
+
+    assert error == ""
+    assert parameter_names <= set(config_steps.derived_parameters[step_file])
+
+
+@pytest.mark.parametrize(
+    ("firmware_version", "expected_parameter_names"),
+    [
+        ("4.6.3", {"Q_A_THR_MIX_MAN", "Q_P_ACCZ_I", "Q_P_ACCZ_P"}),
+        ("4.7.0", {"Q_A_THR_MIX_MAN", "Q_P_D_ACC_I", "Q_P_D_ACC_P"}),
+    ],
+)
+def test_arduplane_throttle_controller_uses_quadplane_parameters(
+    firmware_version: str, expected_parameter_names: set[str]
+) -> None:
+    """Throttle-controller gains target the matching QuadPlane parameters for each firmware generation."""
+    configuration_steps_file = (
+        Path(__file__).parent.parent / "ardupilot_methodic_configurator" / "configuration_steps_ArduPlane.json"
+    )
+    with open(configuration_steps_file, encoding="utf-8") as file:
+        config = json.load(file)
+
+    config_steps = ConfigurationSteps("vehicle_dir", "ArduPlane")
+    throttle_step_file = "24_throttle_controller.param"
+    throttle_step = config["steps"][throttle_step_file]
+    variables = {
+        "fc_parameters": {"Q_M_THST_HOVER": 0.2},
+        "vehicle_components": {"Flight Controller": {"Firmware": {"Version": firmware_version}}},
+    }
+    error = config_steps.compute_parameters(throttle_step_file, throttle_step, "derived", variables)
+
+    assert error == ""
+    assert set(config_steps.derived_parameters[throttle_step_file]) == expected_parameter_names
+
+
+def test_arduplane_quadplane_only_steps_skip_missing_hover_thrust_without_warnings() -> None:
+    """QuadPlane-only steps must not warn while evaluating a fixed-wing Plane without Q_M_THST_HOVER."""
+    configuration_steps_file = (
+        Path(__file__).parent.parent / "ardupilot_methodic_configurator" / "configuration_steps_ArduPlane.json"
+    )
+    with open(configuration_steps_file, encoding="utf-8") as file:
+        config = json.load(file)
+
+    fixed_wing_variables = {
+        "fc_parameters": {},
+        "vehicle_components": {"Flight Controller": {"Firmware": {"Version": "4.7.0"}}},
+    }
+    with patch("ardupilot_methodic_configurator.backend_filesystem_configuration_steps.logging_warning") as logging_warning:
+        config_steps = ConfigurationSteps("vehicle_dir", "ArduPlane")
+        error = config_steps.compute_parameters(
+            "24_throttle_controller.param",
+            config["steps"]["24_throttle_controller.param"],
+            "derived",
+            fixed_wing_variables,
+        )
+        motor_notch_error = config_steps.compute_parameters(
+            "22_motor_notch_logging.param",
+            config["steps"]["22_motor_notch_logging.param"],
+            "forced",
+            fixed_wing_variables,
+        )
+
+    assert error == ""
+    assert motor_notch_error == ""
+    logging_warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("template_name", "expected_parameter_names"),
+    [
+        (
+            "normal_plane",
+            {"Q_A_THR_MIX_MAN", "Q_P_ACCZ_I", "Q_P_ACCZ_P"},
+        ),
+        (
+            "empty_4.7.x",
+            {"Q_A_THR_MIX_MAN", "Q_P_D_ACC_I", "Q_P_D_ACC_P"},
+        ),
+    ],
+)
+def test_arduplane_throttle_controller_templates_use_quadplane_parameters(
+    template_name: str, expected_parameter_names: set[str]
+) -> None:
+    """Plane throttle-controller templates use the parameter spelling matching their firmware generation."""
+    parameter_file = (
+        Path(__file__).parent.parent
+        / "ardupilot_methodic_configurator"
+        / "vehicle_templates"
+        / "ArduPlane"
+        / template_name
+        / "24_throttle_controller.param"
+    )
+    parameter_names = {line.partition(",")[0] for line in parameter_file.read_text(encoding="utf-8").splitlines() if line}
+
+    assert parameter_names == expected_parameter_names
+
+
 def find_json_files(directory) -> list[str]:
     """Find all configuration_steps_*.json files in the specified directory and its subdirectories."""
     json_files = []
@@ -175,3 +472,83 @@ def test_json_schema(json_file) -> None:
         error_path = e.path  # This gives the path in the JSON that caused the error
         pytest.fail(f"Validation error in {json_file} - Error Type: {error_type}, Path: {error_path}")
         # pytest.fail(f"Validation error in {json_file}: {e.message}")
+
+
+@pytest.mark.parametrize("json_file", git_tracked_json_files())
+def test_file_transfers_use_lists(json_file) -> None:
+    """Bundled configuration steps consistently use the multi-file format."""
+    with open(json_file, encoding="utf-8") as file:
+        steps = json.load(file)["steps"]
+
+    for step_name, step in steps.items():
+        for field in ("download_file", "upload_file"):
+            if field in step:
+                assert isinstance(step[field], list), f"{json_file}: {step_name}.{field}"
+                assert step[field], f"{json_file}: {step_name}.{field} is empty"
+
+
+@pytest.mark.parametrize(
+    ("field", "entry"),
+    [
+        ("download_file", {"source_url": "https://example.com/file.lua", "dest_local": "file.lua"}),
+        ("upload_file", {"source_local": "file.lua", "dest_on_fc": "/APM/Scripts/file.lua"}),
+    ],
+)
+@pytest.mark.parametrize("use_array", [True, False])
+def test_user_can_validate_legacy_and_array_file_transfers(field: str, entry: dict[str, str], use_array: bool) -> None:
+    """Both single-file formats are accepted by standalone schema validation."""
+    step = {
+        "why": "demo",
+        "why_now": "demo",
+        "blog_text": "demo",
+        "blog_url": "https://example.com",
+        "wiki_text": "demo",
+        "wiki_url": "https://example.com",
+        "external_tool_text": "demo",
+        "external_tool_url": "https://example.com",
+        "mandatory_text": "100% mandatory (0% optional)",
+        field: [entry] if use_array else entry,
+    }
+    document = {"steps": {"01_demo.param": step}}
+
+    validate(instance=document, schema=schema)
+
+
+@pytest.mark.parametrize("field", ["download_file", "upload_file"])
+@pytest.mark.parametrize("invalid_transfer", [None, "file.lua", 42, [], {}, [{}], [[{}]]])
+def test_schema_rejects_invalid_file_transfers_in_both_formats(field: str, invalid_transfer: object) -> None:
+    """Supporting legacy objects must not accept missing properties or malformed transfer values."""
+    transfer_schema = {
+        "$defs": schema["$defs"],
+        **schema["properties"]["steps"]["patternProperties"]["^[0-9]+_.+\\.param$"]["properties"][field],
+    }
+    with pytest.raises(ValidationError):
+        validate(instance=invalid_transfer, schema=transfer_schema)
+
+
+@pytest.mark.parametrize("vehicle_type", ["ArduCopter", "ArduPlane", "Heli", "Rover"])
+def test_waypoint_advance_script_is_transferred_during_magfit_setup(vehicle_type) -> None:
+    """Install advance-wp alongside the MAGFit helper in step 31, not quick-tune step 29."""
+    path = os.path.join("ardupilot_methodic_configurator", f"configuration_steps_{vehicle_type}.json")
+    with open(path, encoding="utf-8") as file:
+        steps = json.load(file)["steps"]
+
+    quick_tune_step = steps["29_quick_tune_setup.param"]
+    assert quick_tune_step["download_file"][0]["source_url"] == (
+        "https://raw.githubusercontent.com/ArduPilot/ardupilot/Copter-4.5/libraries/AP_Scripting/applets/VTOL-quicktune.lua"
+    )
+    assert {entry["dest_local"] for entry in quick_tune_step["download_file"]} == {"VTOL-quicktune.lua"}
+    assert {entry["dest_on_fc"] for entry in quick_tune_step["upload_file"]} == {"/APM/Scripts/VTOL-quicktune.lua"}
+
+    magfit_step = steps["31_inflight_magnetometer_fit_setup.param"]
+    assert {entry["dest_local"] for entry in magfit_step["download_file"]} == {
+        "copter-magfit-helper.lua",
+        "advance-wp.lua",
+    }
+    assert {entry["dest_on_fc"] for entry in magfit_step["upload_file"]} == {
+        "/APM/Scripts/copter-magfit-helper.lua",
+        "/APM/Scripts/advance-wp.lua",
+    }
+    assert {entry["source_local"] for entry in magfit_step["upload_file"]} == {
+        entry["dest_local"] for entry in magfit_step["download_file"]
+    }

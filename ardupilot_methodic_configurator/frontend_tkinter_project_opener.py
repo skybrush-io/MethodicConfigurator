@@ -12,10 +12,10 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 import tkinter as tk
 from argparse import ArgumentParser, Namespace
+from contextlib import suppress
 from logging import basicConfig as logging_basicConfig
 from logging import debug as logging_debug
 from logging import error as logging_error
-from logging import getLevelName as logging_getLevelName
 from logging import warning as logging_warning
 from os import path as os_path
 from sys import exit as sys_exit
@@ -31,12 +31,13 @@ from ardupilot_methodic_configurator.frontend_tkinter_directory_selection import
     BinLogSelectionWidgets,
     VehicleDirectorySelectionWidgets,
 )
+from ardupilot_methodic_configurator.frontend_tkinter_firmware_upload import FirmwareUploadWindow
 from ardupilot_methodic_configurator.frontend_tkinter_progress_window import ProgressWindow
 from ardupilot_methodic_configurator.frontend_tkinter_project_creator import VehicleProjectCreatorWindow
 from ardupilot_methodic_configurator.frontend_tkinter_show import show_tooltip
 
 
-class VehicleProjectOpenerWindow(BaseWindow):
+class VehicleProjectOpenerWindow(BaseWindow):  # pylint: disable=too-many-instance-attributes
     """
     A window for selecting a vehicle directory with intermediate parameter files.
 
@@ -57,7 +58,7 @@ class VehicleProjectOpenerWindow(BaseWindow):
             + _(" - Select vehicle configuration directory")
         )
 
-        self.root.geometry(self.calculate_scaled_geometry(600, 450))  # Set the window size
+        self.root.geometry(self.calculate_scaled_geometry(600, 510))  # Set the window size
         self.center_window_on_screen(self.root)
 
         # Explain why we are here
@@ -74,12 +75,59 @@ class VehicleProjectOpenerWindow(BaseWindow):
         self.create_option1_widgets()
         self.create_option2_widgets(vehicle_dir)
         self.create_option3_widgets()
+        self.firmware_upload_button = ttk.Button(
+            self.main_frame, text=_("Upload ArduPilot firmware"), command=self.open_firmware_upload
+        )
+        self.firmware_upload_button.pack(fill=tk.X, padx=26, pady=6)
+        show_tooltip(
+            self.firmware_upload_button,
+            _("Open the firmware upload window to install ArduPilot on a flight controller connected by USB."),
+        )
 
         # Bind the close_connection_and_quit function to the window close event
         self.root.protocol("WM_DELETE_WINDOW", self.close_and_quit)
 
     def close_and_quit(self) -> None:
         sys_exit(0)
+
+    def open_firmware_upload(self) -> None:
+        """Return after safe use; exit AMC after an upload, Connect or idle disconnect requires restart."""
+        window = FirmwareUploadWindow(self.project_manager.flight_controller, parent=self.root)
+        previous_grab = self.root.grab_current()  # type: ignore[no-untyped-call] # Tk stubs omit this return type.
+        is_windows = self.root.tk.call("tk", "windowingsystem") == "win32"
+        was_disabled = self.root.attributes("-disabled") if is_windows else False
+        try:
+            if is_windows:
+                self.root.attributes("-disabled", 1)
+            window.root.grab_set()
+            window.root.focus_set()
+            self.root.wait_window(window.root)
+        finally:
+            if window.restart_required:
+                controller = self.project_manager.flight_controller
+                try:
+                    if controller is not None:
+                        controller.disconnect()
+                finally:
+                    with suppress(tk.TclError):
+                        self.root.destroy()
+                    self.close_and_quit()
+            elif self.root.winfo_exists():
+                if is_windows:
+                    self.root.attributes("-disabled", was_disabled)
+                with suppress(tk.TclError):
+                    if window.root.winfo_exists():
+                        window.root.grab_release()
+                    if previous_grab is not None and previous_grab.winfo_exists():
+                        previous_grab.grab_set()
+                    self.root.focus_set()
+                self.create_vehicle_from_fc_button.configure(
+                    state=(
+                        tk.NORMAL
+                        if self.project_manager.is_flight_controller_connected() and self.project_manager.fc_parameters()
+                        else tk.DISABLED
+                    )
+                )
 
     def create_option1_widgets(self) -> None:
         # Option 1 - Create a new vehicle configuration directory based on an existing template
@@ -89,13 +137,32 @@ class VehicleProjectOpenerWindow(BaseWindow):
 
         create_vehicle_directory_from_template_button = ttk.Button(
             option1_label_frame,
-            text=_("Create a vehicle configuration directory from template"),
+            text=_("Create a vehicle project from a template"),
             command=self.create_new_vehicle_from_template,
         )
         create_vehicle_directory_from_template_button.pack(expand=False, fill=tk.X, padx=20, pady=5, anchor=tk.CENTER)
         show_tooltip(
             create_vehicle_directory_from_template_button,
             _("Create a new vehicle configuration directory, choose this option when using the software for the first time"),
+        )
+
+        self.create_vehicle_from_fc_button = ttk.Button(
+            option1_label_frame,
+            text=_("Create a vehicle project from an already configured flight controller"),
+            command=self.create_new_vehicle_from_flight_controller,
+            state=(
+                tk.NORMAL
+                if self.project_manager.is_flight_controller_connected() and self.project_manager.fc_parameters()
+                else tk.DISABLED
+            ),
+        )
+        self.create_vehicle_from_fc_button.pack(expand=False, fill=tk.X, padx=20, pady=5, anchor=tk.CENTER)
+        show_tooltip(
+            self.create_vehicle_from_fc_button,
+            _(
+                "Create a new vehicle configuration directory using the connected flight controller's "
+                "parameters and component information."
+            ),
         )
 
         def on_bin_log_selected(bin_file: str) -> None:
@@ -105,9 +172,8 @@ class VehicleProjectOpenerWindow(BaseWindow):
                 _("Parsing .bin log file: {}% complete"),
             )
             try:
-                self.project_manager.create_new_vehicle_from_bin_log(
-                    bin_file,
-                    progress_callback=progress_window.update_progress_bar,
+                progress_window.run_task(
+                    lambda report: self.project_manager.create_new_vehicle_from_bin_log(bin_file, progress_callback=report)
                 )
             finally:
                 progress_window.destroy()
@@ -246,6 +312,11 @@ class VehicleProjectOpenerWindow(BaseWindow):
         self.root.destroy()
         VehicleProjectCreatorWindow(self.project_manager)
 
+    def create_new_vehicle_from_flight_controller(self) -> None:
+        """Open the minimal project creator for a connected, already configured FC."""
+        self.root.destroy()
+        VehicleProjectCreatorWindow(self.project_manager, from_flight_controller=True)
+
     def open_last_vehicle_directory(self, last_vehicle_dir: str) -> None:
         # Attempt to open the last opened vehicle configuration directory
         try:
@@ -279,7 +350,7 @@ def argument_parser() -> Namespace:  # pragma: no cover
 def main() -> None:  # pragma: no cover
     args = argument_parser()
 
-    logging_basicConfig(level=logging_getLevelName(args.loglevel), format="%(asctime)s - %(levelname)s - %(message)s")
+    logging_basicConfig(level=args.loglevel, format="%(asctime)s - %(levelname)s - %(message)s")
 
     logging_warning(
         _(

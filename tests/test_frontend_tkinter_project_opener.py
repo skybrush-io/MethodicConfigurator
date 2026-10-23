@@ -10,14 +10,29 @@ SPDX-FileCopyrightText: 2024-2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+import sys
 import tkinter as tk
 from collections.abc import Generator
+from queue import SimpleQueue
+from threading import Event, get_ident
+from tkinter import ttk
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ardupilot_methodic_configurator import frontend_tkinter_firmware_upload as firmware_upload
+from ardupilot_methodic_configurator.data_model_firmware_upload import (
+    BootloaderInfo,
+    FirmwareBootloaderRecoveryError,
+    FirmwareCompatibilityError,
+    FirmwareIdentityError,
+    FirmwareReconnectError,
+    FirmwareUploadCancelledError,
+)
 from ardupilot_methodic_configurator.data_model_vehicle_project_opener import VehicleProjectOpenError
 from ardupilot_methodic_configurator.frontend_tkinter_base_window import BaseWindow
+from ardupilot_methodic_configurator.frontend_tkinter_progress_window import ProgressWindow
 from ardupilot_methodic_configurator.frontend_tkinter_project_opener import VehicleProjectOpenerWindow
 
 # pylint: disable=redefined-outer-name, duplicate-code
@@ -107,7 +122,169 @@ def mock_sys_exit() -> Generator[MagicMock, None, None]:
         yield mock
 
 
+@pytest.fixture
+def mocked_option1_widget_construction() -> Generator[MagicMock, None, None]:
+    """Fixture that captures option-one buttons without requiring real Tk widgets."""
+    with (
+        patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.ttk.Label"),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.ttk.LabelFrame"),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.ttk.Button") as mock_button,
+        patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.BinLogSelectionWidgets"),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.show_tooltip"),
+    ):
+        yield mock_button
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [None, FirmwareCompatibilityError, FirmwareReconnectError, FirmwareIdentityError, FirmwareBootloaderRecoveryError],
+)
+def test_completed_or_failed_upload_exits_amc_only_when_modal_closes(
+    configured_opener_window: VehicleProjectOpenerWindow, mock_sys_exit: MagicMock, error_type: type[Exception] | None
+) -> None:
+    """
+    Completing or failing an upload requires a fresh application session.
+
+    GIVEN: An upload worker completes or fails, including before erase.
+    WHEN: The user closes its modal window.
+    THEN: AMC disconnects and exits without downloading parameters or refreshing project state.
+    """
+    # pylint: disable=protected-access
+    child = firmware_upload.FirmwareUploadWindow.__new__(firmware_upload.FirmwareUploadWindow)
+    child.root = MagicMock()
+    child.events = SimpleQueue()
+    child.cancelled = Event()
+    child.catalog_request_id = 0
+    child.restart_required = False
+    child.worker_launcher = lambda worker: worker()
+    child._reset_progress_bars = MagicMock()
+    child._finish = MagicMock()
+    child.status = MagicMock()
+    for name in ("refresh_button", "upload_button", "custom_button", "connect_button", "cancel_button"):
+        setattr(child, name, MagicMock())
+
+    def upload(_callbacks: object) -> BootloaderInfo:
+        if error_type is not None:
+            message = "upload failed"
+            raise error_type(message)
+        return BootloaderInfo(5, 9, 0, 2048)
+
+    child._start_upload("Plane", upload)
+    with patch.object(firmware_upload, "messagebox"):
+        child._poll_events()
+
+    owner = configured_opener_window
+    cast("MagicMock", owner.root).grab_current.return_value = None
+    manager = cast("MagicMock", owner.project_manager)
+    manager.fc_parameters.reset_mock()
+    mock_sys_exit.assert_not_called()
+    manager.flight_controller.disconnect.assert_not_called()
+    owner.root.destroy.assert_not_called()
+    mock_sys_exit.side_effect = SystemExit(0)
+    with (
+        patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.FirmwareUploadWindow", return_value=child),
+        pytest.raises(SystemExit, match="0"),
+    ):
+        owner.open_firmware_upload()
+
+    assert child.restart_required
+    manager.flight_controller.disconnect.assert_called_once_with()
+    manager.flight_controller.download_params.assert_not_called()
+    manager.fc_parameters.assert_not_called()
+    owner.root.destroy.assert_called_once_with()
+    mock_sys_exit.assert_called_once_with(0)
+
+
+def test_cancelled_upload_returns_to_project_selection(
+    configured_opener_window: VehicleProjectOpenerWindow, mock_sys_exit: MagicMock
+) -> None:
+    """
+    Safe cancellation keeps the existing AMC session usable.
+
+    GIVEN: A worker reports cancellation before erase.
+    WHEN: The user closes its upload window.
+    THEN: AMC remains open with no refresh, download, or disconnect.
+    """
+    # pylint: disable=protected-access
+    child = firmware_upload.FirmwareUploadWindow.__new__(firmware_upload.FirmwareUploadWindow)
+    child.root = MagicMock()
+    child.events = SimpleQueue()
+    child.restart_required = False
+    child._finish = MagicMock()
+    child.events.put(("error", FirmwareUploadCancelledError("cancelled")))
+    with patch.object(firmware_upload, "messagebox"):
+        child._poll_events()
+
+    owner = configured_opener_window
+    with patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.FirmwareUploadWindow", return_value=child):
+        owner.open_firmware_upload()
+
+    assert not child.restart_required
+    owner.root.destroy.assert_not_called()
+    owner.project_manager.flight_controller.disconnect.assert_not_called()
+    owner.project_manager.flight_controller.download_params.assert_not_called()
+    mock_sys_exit.assert_not_called()
+
+
 # ==================== TEST CLASSES ====================
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="Real event-loop regression runs under Xvfb; Aqua CI cannot render")
+def test_bin_import_displays_progress_before_parsing_finishes(configured_opener_window, tk_root: tk.Tk) -> None:
+    """
+    Importing a log must allow Tk to display progress before parsing finishes.
+
+    GIVEN: A parser waits for its intermediate progress to be displayed
+    WHEN: The user imports a log on older macOS
+    THEN: Parsing runs on a worker and idle rendering runs before parsing completes
+    """
+    window = configured_opener_window
+    window.root = tk_root
+    window.main_frame = ttk.Frame(tk_root)
+    window.create_option1_widgets()
+    rendered = Event()
+    observed: list[bool] = []
+    worker_threads: list[int] = []
+    progress: list[ProgressWindow] = []
+    timer: str | None = None
+
+    def create_progress(*args, **kwargs) -> ProgressWindow:
+        progress.append(ProgressWindow(*args, **kwargs))
+        return progress[-1]
+
+    def parse(_filename: str, progress_callback) -> str:
+        worker_threads.append(get_ident())
+        progress_callback(25, 100)
+        observed.append(rendered.wait(1))
+        return "/created/project"
+
+    def observe() -> None:
+        nonlocal timer
+        if progress and progress[-1].progress_bar["value"] == 25:
+            tk_root.after_idle(rendered.set)
+        else:
+            timer = tk_root.after(10, observe)
+
+    window.project_manager.create_new_vehicle_from_bin_log.side_effect = parse
+    with (
+        patch("ardupilot_methodic_configurator.frontend_tkinter_base_window.is_macos_sequoia_or_older", return_value=True),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_progress_window.is_macos_sequoia_or_older", return_value=True),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.ProgressWindow", side_effect=create_progress),
+        patch.object(tk_root, "destroy") as close_parent,
+    ):
+        timer = tk_root.after(10, observe)
+        try:
+            window.bin_log_selection_widgets.on_select_file_callback("flight.bin")
+            assert observed == [True]
+            assert worker_threads[0] != get_ident()
+            close_parent.assert_called_once()
+            assert not progress[-1].progress_window.winfo_exists()
+        finally:
+            if timer is not None:
+                tk_root.after_cancel(timer)
+            for item in progress:
+                item.destroy()
+            window.main_frame.destroy()
 
 
 class TestVehicleProjectOpenerWindow:
@@ -127,17 +304,101 @@ class TestVehicleProjectOpenerWindow:
 
         # Assert: Window properties are set correctly
         window.root.title.assert_called_once()
-        window.root.geometry.assert_called_once_with("600x450")
+        window.root.geometry.assert_called_once_with("600x510")
         window.root.protocol.assert_called_once_with("WM_DELETE_WINDOW", window.close_and_quit)
 
         # Assert: Project manager methods were called for initialization
         window.project_manager.get_introduction_message.assert_called_once()
         window.project_manager.get_recently_used_dirs.assert_called_once()
 
+    @pytest.mark.parametrize("parameters_available", [True, False])
+    def test_firmware_upload_keeps_project_opener_inactive_until_child_closes(
+        self, configured_opener_window, parameters_available: bool
+    ) -> None:
+        """
+        Firmware upload blocks project selection until its child closes.
+
+        GIVEN: A project opener with the application's shared controller.
+        WHEN: The user opens firmware upload.
+        THEN: The opener stays visible but disabled until the modal child closes.
+        AND: Configured-FC creation reflects whether cached parameters remain available.
+        """
+        window = configured_opener_window
+        window.root.tk.call.return_value = "win32"
+        window.root.attributes.return_value = False
+        window.root.grab_current.return_value = None
+        window.project_manager.fc_parameters.return_value = {"TEST": 1.0} if parameters_available else {}
+        window.root.wait_window.side_effect = lambda _child: window.root.attributes.assert_any_call("-disabled", 1)
+
+        with patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.FirmwareUploadWindow") as upload_window:
+            upload_window.return_value.restart_required = False
+            window.open_firmware_upload()
+
+        upload_window.assert_called_once_with(window.project_manager.flight_controller, parent=window.root)
+        child = upload_window.return_value.root
+        child.grab_set.assert_called_once_with()
+        window.root.wait_window.assert_called_once_with(child)
+        window.root.destroy.assert_not_called()
+        window.root.attributes.assert_any_call("-disabled", 0)
+        window.project_manager.flight_controller.download_params.assert_not_called()
+        window.create_vehicle_from_fc_button.configure.assert_called_once_with(
+            state=tk.NORMAL if parameters_available else tk.DISABLED
+        )
+
+    @pytest.mark.parametrize("failed_cleanup", ["disconnect", "destroy", "wait"])
+    def test_upload_result_still_exits_amc_if_cleanup_fails(
+        self, configured_opener_window: VehicleProjectOpenerWindow, mock_sys_exit: MagicMock, failed_cleanup: str
+    ) -> None:
+        """
+        Cleanup errors cannot allow use of invalid application state.
+
+        GIVEN: A completed upload and a failure while waiting or cleaning up.
+        WHEN: The modal closes.
+        THEN: AMC still destroys its owner and exits.
+        """
+        window = configured_opener_window
+        if failed_cleanup == "disconnect":
+            window.project_manager.flight_controller.disconnect.side_effect = OSError("port unavailable")
+        elif failed_cleanup == "destroy":
+            window.root.destroy.side_effect = tk.TclError("window destroyed")
+        else:
+            window.root.wait_window.side_effect = tk.TclError("window destroyed")
+        mock_sys_exit.side_effect = SystemExit(0)
+        with patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.FirmwareUploadWindow") as upload:
+            upload.return_value.restart_required = True
+            with pytest.raises(SystemExit, match="0"):
+                window.open_firmware_upload()
+
+        window.root.destroy.assert_called_once_with()
+        mock_sys_exit.assert_called_once_with(0)
+
+    def test_project_opener_is_reenabled_if_modal_wait_fails(self, configured_opener_window) -> None:
+        """
+        A failed modal wait restores the project opener.
+
+        GIVEN: A project opener that launches firmware upload.
+        WHEN: Waiting for the child raises a Tk error.
+        THEN: The opener's disabled state and the child's grab are released.
+        """
+        window = configured_opener_window
+        window.root.tk.call.return_value = "win32"
+        window.root.attributes.return_value = False
+        window.root.grab_current.return_value = None
+        window.root.wait_window.side_effect = tk.TclError("window destroyed")
+
+        with patch("ardupilot_methodic_configurator.frontend_tkinter_project_opener.FirmwareUploadWindow") as upload_window:
+            upload_window.return_value.restart_required = False
+            with pytest.raises(tk.TclError):
+                window.open_firmware_upload()
+
+        window.root.attributes.assert_any_call("-disabled", 0)
+        upload_window.return_value.root.grab_release.assert_called_once_with()
+
     def test_bin_log_import_displays_progress_while_parsing(self, configured_opener_window) -> None:
         """Selecting a .bin log creates a progress window and forwards its callback."""
         window = configured_opener_window
         progress_window = MagicMock()
+        progress_window.run_task.side_effect = lambda task: task(progress_window.update_progress_bar)
 
         with patch(
             "ardupilot_methodic_configurator.frontend_tkinter_project_opener.ProgressWindow",
@@ -194,6 +455,71 @@ class TestVehicleProjectOpenerWindow:
 
         # Assert: New project window is created with project manager
         mock_create_new_project_window.assert_called_once_with(window.project_manager)
+
+    def test_user_can_create_new_vehicle_from_flight_controller(
+        self, configured_opener_window, mock_create_new_project_window
+    ) -> None:
+        """The FC project option opens the minimal creator window."""
+        window = configured_opener_window
+
+        window.create_new_vehicle_from_flight_controller()
+
+        window.root.destroy.assert_called_once()
+        mock_create_new_project_window.assert_called_once_with(window.project_manager, from_flight_controller=True)
+
+    def test_user_sees_vehicle_creation_options_in_requested_order(
+        self, configured_opener_window, mocked_option1_widget_construction
+    ) -> None:
+        """
+        User sees template, configured-flight-controller, and bin-log options in order.
+
+        GIVEN: The vehicle opener window is displayed
+        WHEN: The vehicle creation options are rendered
+        THEN: The configured-flight-controller option appears between template and bin-log controls
+        """
+        window = configured_opener_window
+        window.project_manager.is_flight_controller_connected.return_value = True
+        window.project_manager.fc_parameters.return_value = {"PARAM1": 1.0}
+
+        window.create_option1_widgets()
+
+        button_texts = [call.kwargs["text"] for call in mocked_option1_widget_construction.call_args_list]
+        assert button_texts == [
+            "Create a vehicle project from a template",
+            "Create a vehicle project from an already configured flight controller",
+        ]
+
+    @pytest.mark.parametrize(
+        ("fc_connected", "fc_parameters", "expected_state"),
+        [
+            (False, {"PARAM1": 1.0}, tk.DISABLED),
+            (True, {}, tk.DISABLED),
+            (True, {"PARAM1": 1.0}, tk.NORMAL),
+        ],
+    )
+    def test_user_sees_flight_controller_option_only_when_fc_is_configured(
+        self,
+        configured_opener_window,
+        mocked_option1_widget_construction,
+        fc_connected: bool,
+        fc_parameters: dict[str, float],
+        expected_state: str,
+    ) -> None:
+        """
+        User can select the configured-flight-controller option only when FC data is ready.
+
+        GIVEN: The opener reports a flight-controller connection and parameter state
+        WHEN: The vehicle creation options are rendered
+        THEN: The configured-flight-controller button has the expected enabled state
+        """
+        window = configured_opener_window
+        window.project_manager.is_flight_controller_connected.return_value = fc_connected
+        window.project_manager.fc_parameters.return_value = fc_parameters
+
+        window.create_option1_widgets()
+
+        fc_button_call = mocked_option1_widget_construction.call_args_list[1]
+        assert fc_button_call.kwargs["state"] == expected_state
 
     def test_user_can_open_last_vehicle_directory_successfully(self, configured_opener_window) -> None:
         """
@@ -334,12 +660,13 @@ class TestVehicleProjectOpenerWindow:
             window.main_frame = MagicMock()
 
             # Assert: Button creation was called with disabled state
-            # Find the call that creates the "Open Last Used" button (it's the last Button call)
+            # Find the recent-directory action independently of other available actions.
             button_calls = mock_button.call_args_list
             assert len(button_calls) >= 2  # At least template button and last-used button
 
-            # The last button call should have state=tk.DISABLED
-            last_button_call = button_calls[-1]
+            last_button_call = next(
+                call for call in button_calls if call.kwargs.get("text") == "Open selected vehicle configuration directory"
+            )
             assert "state" in last_button_call.kwargs
             assert last_button_call.kwargs["state"] == tk.DISABLED
 
@@ -383,8 +710,9 @@ class TestVehicleProjectOpenerWindow:
             button_calls = mock_button.call_args_list
             assert len(button_calls) >= 2  # At least template button and last-used button
 
-            # The last button call should have state=tk.NORMAL
-            last_button_call = button_calls[-1]
+            last_button_call = next(
+                call for call in button_calls if call.kwargs.get("text") == "Open selected vehicle configuration directory"
+            )
             assert "state" in last_button_call.kwargs
             assert last_button_call.kwargs["state"] == tk.NORMAL
 

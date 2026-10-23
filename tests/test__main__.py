@@ -13,9 +13,14 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import argparse
+import importlib
+import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import ModuleType
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -24,11 +29,12 @@ from ardupilot_methodic_configurator.__main__ import (
     ApplicationState,
     backup_fc_parameters,
     check_updates,
-    component_editor,
     connect_to_fc_and_set_vehicle_type,
     create_and_configure_component_editor,
     create_argument_parser,
+    create_vehicle_project_from_bin_log,
     display_first_use_documentation,
+    edit_vehicle_components,
     get_preferred_vehicle_dir,
     initialize_filesystem,
     initialize_flight_controller,
@@ -38,12 +44,23 @@ from ardupilot_methodic_configurator.__main__ import (
     process_component_editor_results,
     register_plugins,
     resolve_writable_vehicle_dir_for_initial_download,
+    run_initial_component_editor,
     should_open_firmware_documentation,
     vehicle_directory_selection,
     write_parameter_defaults,
 )
+from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.backend_flightcontroller import DEVICE_FC_PARAM_FROM_FILE
 from ardupilot_methodic_configurator.data_model_par_dict import ParamFileError
+from ardupilot_methodic_configurator.data_model_parameter_editor import ParameterEditor
+from ardupilot_methodic_configurator.data_model_vehicle_components import ComponentDataModel
+from ardupilot_methodic_configurator.data_model_vehicle_components_json_schema import VehicleComponentsJsonSchema
+from ardupilot_methodic_configurator.data_model_vehicle_project_creator import VehicleProjectCreationError
+from ardupilot_methodic_configurator.frontend_tkinter_component_editor_base import (
+    ComponentEditorCloseAction,
+    ComponentEditorCloseResult,
+)
+from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorAction
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_window import PopupWindow
 from ardupilot_methodic_configurator.plugins.plugin_constants import (
     PLUGIN_BATTERY_MONITOR,
@@ -71,9 +88,10 @@ def mock_args() -> MagicMock:
     args.save_component_to_system_templates = False
     args.reboot_time = 10.0
     args.baudrate = 115200
-    args.skip_component_editor = False
     args.n = 0
     args.export_fc_params_missing_or_different = False
+    args.bin_log = ""
+    args.template_dir = ""
     return args
 
 
@@ -652,6 +670,451 @@ class TestArgumentParser:
         test_args = parser.parse_args(["--skip-check-for-updates"])
         assert test_args.skip_check_for_updates is True
 
+    def test_bin_log_project_creation_options_are_available(self) -> None:
+        """The CLI accepts a log file and an optional template-directory override."""
+        parser = create_argument_parser()
+
+        args = parser.parse_args(
+            [
+                "--bin-log",
+                "C:/logs/flight.bin",
+                "--template-dir",
+                "C:/templates/Holybro_X500",
+            ]
+        )
+
+        assert args.bin_log == "C:/logs/flight.bin"
+        assert args.template_dir == "C:/templates/Holybro_X500"
+
+    def test_bin_log_help_explains_pseudo_vehicle_types(self) -> None:
+        """The CLI explains that SITL and AP_Periph are not .bin-import vehicle types."""
+        parser = create_argument_parser()
+
+        assert "SITL and AP_Periph cannot be used" in parser.format_help()
+
+    @pytest.mark.parametrize("vehicle_type", ["SITL", "AP_Periph"])
+    def test_bin_log_rejects_pseudo_vehicle_types_explicitly(self, vehicle_type: str) -> None:
+        """The CLI rejects pseudo vehicle types before starting offline import."""
+        parser = create_argument_parser()
+        args = argparse.Namespace(
+            bin_log="C:/logs/flight.bin",
+            template_dir="",
+            device="",
+            vehicle_type=vehicle_type,
+            loglevel="INFO",
+        )
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.create_argument_parser", return_value=parser),
+            patch.object(parser, "parse_args", return_value=args),
+            patch.object(parser, "error", side_effect=SystemExit) as parser_error,
+            pytest.raises(SystemExit),
+        ):
+            main()
+
+        parser_error.assert_called_once_with(f"--vehicle-type {vehicle_type} cannot be used together with --bin-log")
+
+    def test_frozen_bin_log_validator_dispatches_without_starting_the_gui(self) -> None:
+        """The frozen validator command exits before normal application startup."""
+        with (
+            patch.object(amc_main.sys, "argv", ["amc.exe", "--validate-bin-log", "flight.bin"]),
+            patch.object(amc_main, "_run_bin_log_validation") as validate,
+            patch.object(amc_main, "create_argument_parser") as create_parser,
+        ):
+            main()
+
+        validate.assert_called_once_with("flight.bin")
+        create_parser.assert_not_called()
+
+    def test_bin_log_validator_entry_point_validates_a_real_fixture(self) -> None:
+        """The validation entry point works in a child process, as a frozen build invokes it."""
+        logfile = Path(__file__).parent / "fixtures" / "backend_log_80k.bin"
+
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "ardupilot_methodic_configurator", "--validate-bin-log", str(logfile)],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize("input_kind", ["directory", "empty_file"])
+    def test_bin_log_validator_entry_point_reports_one_line_errors(self, tmp_path: Path, input_kind: str) -> None:
+        """The child validator reports invalid input without leaking a traceback."""
+        logfile = tmp_path
+        if input_kind == "empty_file":
+            logfile = tmp_path / "empty.bin"
+            logfile.touch()
+
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "ardupilot_methodic_configurator", "--validate-bin-log", str(logfile)],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "Traceback" not in result.stderr
+        assert len(result.stderr.strip().splitlines()) == 1
+
+    def test_bin_log_documentation_describes_continuing_into_gui_editors(self) -> None:
+        """The user manual explains that CLI imports continue through the GUI editors."""
+        manual = (Path(__file__).resolve().parents[1] / "USERMANUAL.md").read_text(encoding="utf-8")
+
+        assert "After the project is created from the log, AMC continues through the normal GUI workflow" in manual
+        assert "the parameter editor and uploader" in manual
+
+    def test_bin_log_documentation_lists_the_bundled_empty_templates(self) -> None:
+        """The manual states which firmware-specific defaults are bundled for automatic selection."""
+        manual = (Path(__file__).resolve().parents[1] / "USERMANUAL.md").read_text(encoding="utf-8")
+
+        assert "Bundled empty templates currently include:" in manual
+        for template in (
+            "ArduCopter/empty_4.5.x",
+            "ArduCopter/empty_4.6.x",
+            "ArduCopter/empty_4.7.x",
+            "ArduPlane/empty_4.7.x",
+        ):
+            assert template in manual
+        assert "use `--template-dir`" in manual
+
+    def test_bin_log_accepts_an_explicit_vehicle_directory_destination(self) -> None:
+        """The CLI remembers when --vehicle-dir explicitly selects an import destination."""
+        parser = create_argument_parser()
+
+        args = parser.parse_args(["--bin-log", "C:/logs/flight.bin", "--vehicle-dir", "C:/vehicles/renamed"])
+
+        assert args.vehicle_dir == "C:/vehicles/renamed"
+        assert args.vehicle_dir_explicit is True
+
+    def test_template_directory_requires_bin_log(self) -> None:
+        """A template override alone is rejected before startup begins."""
+        parser = create_argument_parser()
+        args = argparse.Namespace(bin_log="", template_dir="C:/templates/Holybro_X500")
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.create_argument_parser", return_value=parser),
+            patch.object(parser, "parse_args", return_value=args),
+            patch.object(parser, "error", side_effect=SystemExit) as parser_error,
+            patch.object(amc_main, "_", side_effect=lambda message: f"translated:{message}"),
+            pytest.raises(SystemExit),
+        ):
+            main()
+
+        parser_error.assert_called_once_with("translated:--template-dir can only be used together with --bin-log")
+
+    def test_device_requires_normal_connected_workflow(self) -> None:
+        """An explicit device option is rejected for offline log import."""
+        parser = create_argument_parser()
+        args = argparse.Namespace(bin_log="C:/logs/flight.bin", template_dir="", device="/dev/ttyACM0")
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.create_argument_parser", return_value=parser),
+            patch.object(parser, "parse_args", return_value=args),
+            patch.object(parser, "error", side_effect=SystemExit) as parser_error,
+            pytest.raises(SystemExit),
+        ):
+            main()
+
+        parser_error.assert_called_once_with("--device cannot be used together with --bin-log")
+
+
+class TestBinLogProjectCreation:
+    """Test the command-line .bin log project-creation workflow."""
+
+    def test_bin_log_initialization_does_not_touch_the_current_vehicle_directory(self) -> None:
+        """Offline import starts with an empty filesystem instead of the current project."""
+        args = argparse.Namespace(
+            bin_log="C:/logs/flight.bin",
+            vehicle_dir="C:/existing/project",
+            vehicle_type="",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        state = ApplicationState(args)
+        state.flight_controller = MagicMock()
+        state.flight_controller.info.flight_sw_version = "4.6.3"
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.migrate_vehicle_project_if_needed") as migrate,
+            patch("ardupilot_methodic_configurator.__main__.LocalFilesystem") as filesystem_class,
+        ):
+            initialize_filesystem(state)
+
+        migrate.assert_not_called()
+        filesystem_class.assert_called_once()
+        assert filesystem_class.call_args.args == (None, "", "4.6.3", False, False)
+
+    def test_creates_project_with_optional_template_override(self) -> None:
+        """The CLI forwards the supplied template directory to the project manager."""
+        args = argparse.Namespace(bin_log="C:/logs/flight.bin", template_dir="C:/templates/Holybro_X500")
+        state = ApplicationState(args)
+        state.local_filesystem = MagicMock()
+        state.flight_controller = MagicMock()
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.VehicleProjectManager") as manager_class,
+            patch("ardupilot_methodic_configurator.__main__.logging_info") as log_info,
+        ):
+            manager_class.return_value.create_new_vehicle_from_bin_log.return_value = "C:/vehicles/flight"
+
+            result = create_vehicle_project_from_bin_log(state)
+
+        assert result == "C:/vehicles/flight"
+        manager_class.return_value.create_new_vehicle_from_bin_log.assert_called_once_with(
+            "C:/logs/flight.bin",
+            template_dir="C:/templates/Holybro_X500",
+            vehicle_dir=None,
+            expected_vehicle_type=None,
+        )
+        log_info.assert_called_once_with("Created vehicle project at %s", "C:/vehicles/flight")
+
+    def test_bin_log_creation_uses_one_stable_manager_call_shape(self) -> None:
+        """The CLI passes all optional import values through one manager call contract."""
+        args = argparse.Namespace(bin_log="C:/logs/flight.bin", template_dir="")
+        state = ApplicationState(args)
+        state.local_filesystem = MagicMock()
+        state.flight_controller = MagicMock()
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.VehicleProjectManager") as manager_class,
+            patch("ardupilot_methodic_configurator.__main__.logging_info"),
+        ):
+            manager_class.return_value.create_new_vehicle_from_bin_log.return_value = "C:/vehicles/flight"
+
+            create_vehicle_project_from_bin_log(state)
+
+        manager_class.return_value.create_new_vehicle_from_bin_log.assert_called_once_with(
+            "C:/logs/flight.bin",
+            template_dir=None,
+            vehicle_dir=None,
+            expected_vehicle_type=None,
+        )
+
+    def test_creates_project_in_explicit_vehicle_directory(self) -> None:
+        """The CLI forwards an explicit --vehicle-dir destination to the project manager."""
+        args = argparse.Namespace(
+            bin_log="C:/logs/flight.bin",
+            template_dir="",
+            vehicle_dir="C:/vehicles/renamed",
+            vehicle_dir_explicit=True,
+        )
+        state = ApplicationState(args)
+        state.local_filesystem = MagicMock()
+        state.flight_controller = MagicMock()
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.VehicleProjectManager") as manager_class,
+            patch("ardupilot_methodic_configurator.__main__.logging_info"),
+        ):
+            manager_class.return_value.create_new_vehicle_from_bin_log.return_value = "C:/vehicles/renamed"
+
+            result = create_vehicle_project_from_bin_log(state)
+
+        assert result == "C:/vehicles/renamed"
+        manager_class.return_value.create_new_vehicle_from_bin_log.assert_called_once_with(
+            "C:/logs/flight.bin",
+            template_dir=None,
+            vehicle_dir="C:/vehicles/renamed",
+            expected_vehicle_type=None,
+        )
+
+    def test_bin_log_vehicle_type_is_forwarded_for_validation(self) -> None:
+        """The CLI forwards an explicit vehicle type to offline import validation."""
+        args = argparse.Namespace(
+            bin_log="C:/logs/flight.bin",
+            template_dir="",
+            vehicle_dir="C:/vehicles/flight",
+            vehicle_dir_explicit=True,
+            vehicle_type="Rover",
+        )
+        state = ApplicationState(args)
+        state.local_filesystem = MagicMock()
+        state.flight_controller = MagicMock()
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.VehicleProjectManager") as manager_class,
+            patch("ardupilot_methodic_configurator.__main__.logging_info"),
+        ):
+            manager_class.return_value.create_new_vehicle_from_bin_log.return_value = "C:/vehicles/flight"
+
+            create_vehicle_project_from_bin_log(state)
+
+        manager_class.return_value.create_new_vehicle_from_bin_log.assert_called_once_with(
+            "C:/logs/flight.bin",
+            template_dir=None,
+            vehicle_dir="C:/vehicles/flight",
+            expected_vehicle_type="Rover",
+        )
+
+    def test_explicit_bin_log_vehicle_directory_expands_user_home(self) -> None:
+        """A quoted ``~`` in --vehicle-dir is expanded before project creation."""
+        args = argparse.Namespace(
+            bin_log="C:/logs/flight.bin",
+            template_dir="",
+            vehicle_dir="~/myproj",
+            vehicle_dir_explicit=True,
+        )
+        state = ApplicationState(args)
+        state.local_filesystem = MagicMock()
+        state.flight_controller = MagicMock()
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.VehicleProjectManager") as manager_class,
+            patch(
+                "ardupilot_methodic_configurator.__main__.os.path.expanduser", return_value="/home/user/myproj"
+            ) as expanduser,
+            patch("ardupilot_methodic_configurator.__main__.logging_info"),
+        ):
+            manager_class.return_value.create_new_vehicle_from_bin_log.return_value = "/home/user/myproj"
+
+            create_vehicle_project_from_bin_log(state)
+
+        expanduser.assert_called_once_with("~/myproj")
+        manager_class.return_value.create_new_vehicle_from_bin_log.assert_called_once_with(
+            "C:/logs/flight.bin",
+            template_dir=None,
+            vehicle_dir="/home/user/myproj",
+            expected_vehicle_type=None,
+        )
+
+    def test_implicit_bin_log_vehicle_directory_expands_user_home(self) -> None:
+        """Manually constructed CLI state gets the same home expansion without the explicit marker."""
+        args = argparse.Namespace(
+            bin_log="C:/logs/flight.bin",
+            template_dir="",
+            vehicle_dir="~/myproj",
+        )
+        state = ApplicationState(args)
+        state.local_filesystem = MagicMock()
+        state.flight_controller = MagicMock()
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.VehicleProjectManager") as manager_class,
+            patch(
+                "ardupilot_methodic_configurator.__main__.os.path.expanduser", return_value="/home/user/myproj"
+            ) as expanduser,
+            patch("ardupilot_methodic_configurator.__main__.logging_info"),
+        ):
+            manager_class.return_value.create_new_vehicle_from_bin_log.return_value = "/home/user/myproj"
+
+            create_vehicle_project_from_bin_log(state)
+
+        expanduser.assert_called_once_with("~/myproj")
+        manager_class.return_value.create_new_vehicle_from_bin_log.assert_called_once_with(
+            "C:/logs/flight.bin",
+            template_dir=None,
+            vehicle_dir="/home/user/myproj",
+            expected_vehicle_type=None,
+        )
+
+    def test_bin_log_initialization_does_not_connect_to_a_flight_controller(self) -> None:
+        """A CLI log import initializes the offline FC model without calling connect()."""
+        args = argparse.Namespace(bin_log="C:/logs/flight.bin", reboot_time=10, baudrate=115200)
+        state = ApplicationState(args)
+
+        with patch("ardupilot_methodic_configurator.__main__.FlightController") as flight_controller_class:
+            initialize_flight_controller(state)
+
+        flight_controller_class.assert_called_once_with(reboot_time=10, baudrate=115200)
+        flight_controller_class.return_value.connect.assert_not_called()
+
+    def test_bin_log_creation_logs_a_clean_error_and_exits_nonzero(self) -> None:
+        """Project-creation errors do not expose a traceback to command-line users."""
+        args = argparse.Namespace(bin_log="C:/logs/bad.bin", template_dir="")
+        state = ApplicationState(args)
+        state.local_filesystem = MagicMock()
+        state.flight_controller = MagicMock()
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.VehicleProjectManager") as manager_class,
+            patch("ardupilot_methodic_configurator.__main__.logging_error") as log_error,
+            patch("ardupilot_methodic_configurator.__main__.logging_debug") as log_debug,
+        ):
+            manager_class.return_value.create_new_vehicle_from_bin_log.side_effect = VehicleProjectCreationError(
+                ".bin log import",
+                "The log could not be read.",
+            )
+
+            with pytest.raises(SystemExit, match="1"):
+                create_vehicle_project_from_bin_log(state)
+
+        log_error.assert_called_once_with("%s: %s", ".bin log import", "The log could not be read.")
+        error = manager_class.return_value.create_new_vehicle_from_bin_log.side_effect
+        log_debug.assert_called_once_with("", exc_info=error)
+
+    def test_main_bin_log_import_bypasses_vehicle_directory_selection(self) -> None:
+        """The command-line log-import workflow bypasses the project-selection window."""
+        args = argparse.Namespace(
+            bin_log="C:/logs/flight.bin",
+            template_dir="C:/templates/Holybro_X500",
+            loglevel="INFO",
+            skip_check_for_updates=False,
+            vehicle_dir=None,
+            vehicle_type=None,
+            device=None,
+            reboot_time=5,
+            baudrate=115200,
+            n=0,
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+            export_fc_params_missing_or_different=False,
+        )
+        flight_controller = MagicMock()
+        flight_controller.fc_parameters = {}
+
+        def initialize_flight_controller_for_test(state: ApplicationState) -> None:
+            state.flight_controller = flight_controller
+
+        local_filesystem = MagicMock()
+        local_filesystem.configuration_steps = {}
+        local_filesystem.doc_dict = {}
+        local_filesystem.vehicle_dir = "C:/vehicles/flight"
+        local_filesystem.get_fc_fw_version_from_vehicle_components_json.return_value = "4.6.3"
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.create_argument_parser") as parser_class,
+            patch("ardupilot_methodic_configurator.__main__.register_plugins"),
+            patch("ardupilot_methodic_configurator.__main__.FreeDesktop.create_desktop_icon_if_needed"),
+            patch("ardupilot_methodic_configurator.__main__.setup_logging"),
+            patch("ardupilot_methodic_configurator.__main__.ProgramSettings.migrate_settings_to_latest_version"),
+            patch("ardupilot_methodic_configurator.__main__.check_updates", return_value=False),
+            patch("ardupilot_methodic_configurator.__main__.PopupWindow.should_display", return_value=False),
+            patch("ardupilot_methodic_configurator.__main__.ProgramSettings.get_setting", return_value=False),
+            patch(
+                "ardupilot_methodic_configurator.__main__.initialize_flight_controller",
+                side_effect=initialize_flight_controller_for_test,
+            ),
+            patch(
+                "ardupilot_methodic_configurator.__main__.LocalFilesystem", return_value=local_filesystem
+            ) as filesystem_class,
+            patch("ardupilot_methodic_configurator.__main__.migrate_vehicle_project_if_needed") as migrate,
+            patch("ardupilot_methodic_configurator.__main__.create_vehicle_project_from_bin_log") as create_project,
+            patch("ardupilot_methodic_configurator.__main__.vehicle_directory_selection") as select_directory,
+            patch("ardupilot_methodic_configurator.__main__.plugin_factory.validate_configuration_steps"),
+            patch("ardupilot_methodic_configurator.__main__.run_initial_component_editor"),
+            patch("ardupilot_methodic_configurator.__main__.process_component_editor_results"),
+            patch("ardupilot_methodic_configurator.__main__.backup_fc_parameters"),
+            patch("ardupilot_methodic_configurator.__main__.parameter_editor_and_uploader"),
+            patch("ardupilot_methodic_configurator.__main__.sys_exit"),
+        ):
+            parser_class.return_value.parse_args.return_value = args
+
+            main()
+
+        create_project.assert_called_once()
+        select_directory.assert_not_called()
+        migrate.assert_not_called()
+        filesystem_class.assert_called_once()
+        assert filesystem_class.call_args.args == (
+            None,
+            "",
+            flight_controller.info.flight_sw_version,
+            False,
+            False,
+        )
+
 
 class TestFlightControllerConnectionLogic:
     """Test flight controller connection logic in detail."""
@@ -678,6 +1141,7 @@ class TestFlightControllerConnectionLogic:
             patch("ardupilot_methodic_configurator.__main__.logging_info") as mock_log,
         ):
             mock_progress = MagicMock()
+            mock_progress.progress_window.run_task.side_effect = lambda task: task(mock_progress.update_progress_bar)
             mock_progress_class.return_value.__enter__.return_value = mock_progress
 
             mock_fc = MagicMock()
@@ -718,6 +1182,7 @@ class TestFlightControllerConnectionLogic:
             patch("ardupilot_methodic_configurator.__main__.logging_debug") as mock_log,
         ):
             mock_progress = MagicMock()
+            mock_progress.progress_window.run_task.side_effect = lambda task: task(mock_progress.update_progress_bar)
             mock_progress_class.return_value.__enter__.return_value = mock_progress
 
             mock_fc = MagicMock()
@@ -1026,6 +1491,7 @@ class TestParameterEditorStartup:
             patch("ardupilot_methodic_configurator.__main__.ParameterEditor") as mock_param_editor,
         ):
             # Act: Start parameter editor
+            mock_editor.return_value.run.return_value = ParameterEditorAction.FINISHED
             parameter_editor_and_uploader(application_state)
 
             # Assert: Advanced mode with IMU calibration considered
@@ -1058,11 +1524,140 @@ class TestParameterEditorStartup:
             patch("ardupilot_methodic_configurator.__main__.ParameterEditor") as mock_param_editor,
         ):
             # Act: Start in simple mode
+            mock_editor.return_value.run.return_value = ParameterEditorAction.FINISHED
             parameter_editor_and_uploader(application_state)
 
             # Assert: IMU calibration disabled in simple mode
             mock_fs.get_start_file.assert_called_once_with(0, False)  # noqa: FBT003 Simple GUI disables IMU tcal
             mock_editor.assert_called_once_with(mock_param_editor.return_value)
+
+    @pytest.mark.parametrize("visited_steps", [("12_step.param",), ("12_step.param", "20_step.param")])
+    def test_user_returns_to_latest_parameter_step_after_editing_components(
+        self, application_state: ApplicationState, visited_steps: tuple[str, ...]
+    ) -> None:
+        """Each visit processes component changes and rebuilds the model at the user's latest step."""
+        application_state.flight_controller = MagicMock(fc_parameters={})
+        application_state.local_filesystem = MagicMock()
+        application_state.local_filesystem.get_start_file.return_value = "08_step.param"
+        application_state.args.n = 0
+        events: list[str] = []
+        models = [MagicMock(current_file=step) for step in ("08_step.param", *visited_steps)]
+        model_iterator = iter(models)
+
+        def create_model(current_file: str, *_args: object, **_kwargs: object) -> MagicMock:
+            events.append(f"load {current_file}")
+            return next(model_iterator)
+
+        def run_session(index: int) -> ParameterEditorAction:
+            events.append(f"parameters {index}")
+            if index == len(visited_steps):
+                return ParameterEditorAction.FINISHED
+            models[index].current_file = visited_steps[index]
+            return ParameterEditorAction.EDIT_COMPONENTS
+
+        windows = [MagicMock() for _ in models]
+        for index, window in enumerate(windows):
+            window.run.side_effect = lambda index=index: run_session(index)
+        component_windows = [MagicMock() for _ in visited_steps]
+        for window in component_windows:
+            window.root.mainloop.side_effect = lambda: events.append("components")
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.ProgramSettings.get_setting", return_value="normal"),
+            patch(
+                "ardupilot_methodic_configurator.__main__.ParameterEditor",
+                side_effect=create_model,
+            ) as mock_param_editor,
+            patch(
+                "ardupilot_methodic_configurator.__main__.ParameterEditorWindow",
+                side_effect=windows,
+            ) as mock_window,
+            patch(
+                "ardupilot_methodic_configurator.__main__.create_and_configure_component_editor",
+                side_effect=component_windows,
+            ),
+            patch(
+                "ardupilot_methodic_configurator.__main__.process_component_editor_results",
+                side_effect=lambda *_args: events.append("process components"),
+            ) as mock_process,
+        ):
+            parameter_editor_and_uploader(application_state)
+
+        assert mock_param_editor.call_args_list == [
+            call(
+                step,
+                application_state.flight_controller,
+                application_state.local_filesystem,
+                export_fc_params_missing_or_different=False,
+            )
+            for step in ("08_step.param", *visited_steps)
+        ]
+        assert mock_window.call_args_list == [call(model) for model in models]
+        assert mock_process.call_count == len(visited_steps)
+        assert events == ["load 08_step.param"] + [
+            event
+            for index, step in enumerate(visited_steps)
+            for event in (f"parameters {index}", "components", "process components", f"load {step}")
+        ] + [f"parameters {len(visited_steps)}"]
+
+    def test_component_edit_rebuilds_parameters_from_saved_component_data(self, tmp_path: Path) -> None:
+        """A saved battery capacity is used by the rebuilt parameter model after returning."""
+        template_dir = Path("ardupilot_methodic_configurator/vehicle_templates/ArduCopter/Holybro_X500_V2")
+        vehicle_dir = tmp_path / "vehicle"
+        shutil.copytree(template_dir, vehicle_dir)
+        filesystem = LocalFilesystem(
+            str(vehicle_dir),
+            "ArduCopter",
+            "",
+            allow_editing_template_files=True,
+            save_component_to_system_templates=False,
+        )
+        flight_controller = MagicMock(fc_parameters={})
+        state = ApplicationState(argparse.Namespace(n=0, export_fc_params_missing_or_different=False))
+        state.flight_controller = flight_controller
+        state.local_filesystem = filesystem
+        observed_capacities: list[float] = []
+
+        class ParameterWindow:
+            """Run the real parameter model while standing in for its Tk window."""
+
+            def __init__(self, parameter_editor: ParameterEditor) -> None:
+                self.parameter_editor = parameter_editor
+
+            def run(self) -> ParameterEditorAction:
+                self.parameter_editor._repopulate_configuration_step_parameters()  # pylint: disable=protected-access
+                capacity = self.parameter_editor.current_step_parameters["BATT_CAPACITY"].get_new_value()
+                observed_capacities.append(float(capacity))
+                return (
+                    ParameterEditorAction.EDIT_COMPONENTS if len(observed_capacities) == 1 else ParameterEditorAction.FINISHED
+                )
+
+        def open_component_editor(*_args: object) -> MagicMock:
+            schema = VehicleComponentsJsonSchema(filesystem.load_schema())
+            component_model = ComponentDataModel(
+                filesystem.load_vehicle_components_json_data(filesystem.vehicle_dir),
+                schema.get_all_value_datatypes(),
+                schema,
+            )
+            component_model.set_component_value(("Battery", "Specifications", "Capacity mAh"), 4200)
+            assert component_model.save_to_filesystem(filesystem) == (False, "")
+            component_window = MagicMock()
+            component_window.close_result = ComponentEditorCloseResult()
+            return component_window
+
+        with (
+            patch.object(filesystem, "get_start_file", return_value="11_battery.param"),
+            patch("ardupilot_methodic_configurator.__main__.ProgramSettings.get_setting", return_value="normal"),
+            patch("ardupilot_methodic_configurator.__main__.ParameterEditorWindow", ParameterWindow),
+            patch(
+                "ardupilot_methodic_configurator.__main__.create_and_configure_component_editor",
+                side_effect=open_component_editor,
+            ),
+            patch("ardupilot_methodic_configurator.__main__.show_warning_message"),
+        ):
+            parameter_editor_and_uploader(state)
+
+        assert observed_capacities == [5000.0, 4200.0]
 
 
 # ====== Component Editor Helper Function Tests ======
@@ -1346,39 +1941,71 @@ class TestComponentEditorHelperFunctions:
 class TestComponentEditorIntegration:
     """Test the integrated component editor workflow."""
 
-    def test_component_editor_workflow_with_skip(self, application_state: ApplicationState) -> None:
-        """
-        User can skip component editor for automated workflows.
+    def test_existing_project_processes_startup_derived_parameter_changes(self) -> None:
+        """Existing projects still check whether saved parameter files need updating."""
+        state = ApplicationState(argparse.Namespace())
+        state.flight_controller = MagicMock()
+        state.local_filesystem = MagicMock()
+        state.vehicle_project_manager = MagicMock(is_new_project=False)
 
-        GIVEN: User wants to skip component editor
-        WHEN: Component editor workflow runs
-        THEN: GUI should close automatically without user interaction
-        """
-        # Note: component_editor is already imported at the top of the file
+        with (
+            patch("ardupilot_methodic_configurator.__main__.create_and_configure_component_editor") as mock_create,
+            patch("ardupilot_methodic_configurator.__main__.process_component_editor_results") as mock_process,
+        ):
+            run_initial_component_editor(state)
 
-        # Arrange: Mock arguments with skip option
-        application_state.args.skip_component_editor = True
+        mock_create.assert_not_called()
+        mock_process.assert_called_once_with(state.flight_controller, state.local_filesystem)
 
-        # Mock vehicle_dir_window to ensure skip condition is met
-        # The skip condition requires that NOT(vehicle_dir_window AND configuration_template AND blank_component_data.get())
-        # So we need to set vehicle_dir_window to None or make one of the other conditions False
-        application_state.vehicle_dir_window = None
+    @pytest.mark.parametrize("is_new_project", [None, False, True])
+    def test_only_new_projects_require_initial_component_setup(
+        self, application_state: ApplicationState, is_new_project: bool | None
+    ) -> None:
+        """Existing projects bypass initial setup, while new projects always open the editor."""
+        application_state.flight_controller = MagicMock()
+        application_state.local_filesystem = MagicMock()
+        application_state.vehicle_project_manager = (
+            None if is_new_project is None else MagicMock(is_new_project=is_new_project, blank_component_data=True)
+        )
+        with (
+            patch("ardupilot_methodic_configurator.__main__.create_and_configure_component_editor") as mock_create,
+            patch("ardupilot_methodic_configurator.__main__.should_open_firmware_documentation", return_value=False),
+            patch("ardupilot_methodic_configurator.__main__.process_component_editor_results") as mock_process,
+        ):
+            run_initial_component_editor(application_state)
 
-        # Mock local filesystem with vehicle_type
-        mock_filesystem = MagicMock()
-        mock_filesystem.vehicle_type = "ArduCopter"
-        application_state.local_filesystem = mock_filesystem
+        if is_new_project:
+            mock_create.assert_called_once_with(
+                amc_main.__version__,
+                application_state.local_filesystem,
+                application_state.flight_controller,
+                application_state.local_filesystem.vehicle_type,
+                application_state.vehicle_project_manager,
+            )
+            mock_create.return_value.root.after.assert_not_called()
+            mock_process.assert_called_once_with(application_state.flight_controller, application_state.local_filesystem)
+        else:
+            mock_create.assert_not_called()
+            mock_process.assert_called_once_with(application_state.flight_controller, application_state.local_filesystem)
 
-        with patch("ardupilot_methodic_configurator.__main__.create_and_configure_component_editor") as mock_create:
-            mock_window = MagicMock()
-            mock_create.return_value = mock_window
+    def test_initial_editor_close_ends_startup_before_processing(self, application_state: ApplicationState) -> None:
+        """A user close during initial setup asks the application to exit startup."""
+        application_state.vehicle_project_manager = MagicMock(is_new_project=True, blank_component_data=False)
+        application_state.flight_controller = MagicMock()
+        application_state.local_filesystem = MagicMock()
+        window = MagicMock()
+        window.close_result = ComponentEditorCloseResult(ComponentEditorCloseAction.QUIT_WORKFLOW, 0)
 
-            # Act: Run component editor with skip
-            component_editor(application_state)
+        with (
+            patch("ardupilot_methodic_configurator.__main__.create_and_configure_component_editor", return_value=window),
+            patch("ardupilot_methodic_configurator.__main__.should_open_firmware_documentation", return_value=False),
+            patch("ardupilot_methodic_configurator.__main__.process_component_editor_results") as mock_process,
+            patch("ardupilot_methodic_configurator.__main__.sys_exit") as mock_exit,
+        ):
+            run_initial_component_editor(application_state)
 
-            # Assert: Window configured to auto-close
-            mock_window.root.after.assert_called_once_with(10, mock_window.root.destroy)
-            mock_window.root.mainloop.assert_called_once()
+        mock_exit.assert_called_once_with(0)
+        mock_process.assert_not_called()
 
     def test_component_editor_workflow_with_documentation(self, application_state: ApplicationState) -> None:
         """
@@ -1388,16 +2015,13 @@ class TestComponentEditorIntegration:
         WHEN: Component editor workflow runs
         THEN: Firmware documentation should open automatically
         """
-        # Note: component_editor is already imported at the top of the file
-
         # Arrange: Mock for documentation opening
-        application_state.args.skip_component_editor = False
+        application_state.vehicle_project_manager = MagicMock(is_new_project=True, blank_component_data=False)
 
         # Mock flight controller with proper structure
         mock_fc = MagicMock()
         mock_fc.info.firmware_type = "CubeOrange"
         application_state.flight_controller = mock_fc
-        application_state.vehicle_dir_window = None
 
         # Mock local filesystem with vehicle_type
         mock_filesystem = MagicMock()
@@ -1408,12 +2032,13 @@ class TestComponentEditorIntegration:
             patch("ardupilot_methodic_configurator.__main__.create_and_configure_component_editor") as mock_create,
             patch("ardupilot_methodic_configurator.__main__.should_open_firmware_documentation", return_value=True),
             patch("ardupilot_methodic_configurator.__main__.open_firmware_documentation") as mock_open_doc,
+            patch("ardupilot_methodic_configurator.__main__.process_component_editor_results"),
         ):
             mock_window = MagicMock()
             mock_create.return_value = mock_window
 
             # Act: Run component editor
-            component_editor(application_state)
+            run_initial_component_editor(application_state)
 
             # Assert: Documentation opened
             mock_open_doc.assert_called_once_with("CubeOrange")
@@ -1445,6 +2070,12 @@ class TestRegisterPluginsInternals:
             patch(
                 "ardupilot_methodic_configurator.plugins.frontend_tkinter_esc_rpm_scale.register_esc_rpm_scale_plugin"
             ) as mock_esc_rpm_scale,
+            patch(
+                "ardupilot_methodic_configurator.plugins.frontend_tkinter_level_calibration.register_level_calibration_plugin"
+            ) as mock_level_calibration,
+            patch(
+                "ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.register_servo_out_plugin"
+            ) as mock_servo_out,
         ):
             register_plugins()
 
@@ -1453,6 +2084,41 @@ class TestRegisterPluginsInternals:
             mock_battery.assert_called_once()
             mock_compass.assert_called_once()
             mock_esc_rpm_scale.assert_called_once()
+            mock_level_calibration.assert_called_once()
+            mock_servo_out.assert_called_once()
+
+    def test_plugin_registration_continues_after_one_plugin_import_fails(self) -> None:
+        """A broken optional plugin does not prevent later plugins from registering."""
+        original_import_module = importlib.import_module
+        attempted_modules: list[str] = []
+
+        def import_module(module_name: str) -> ModuleType:
+            attempted_modules.append(module_name)
+            if module_name.endswith("frontend_tkinter_accelerometer_calibration"):
+                error_message = "optional plugin dependency unavailable"
+                raise ImportError(error_message)
+            return original_import_module(module_name)
+
+        with (
+            patch.object(amc_main.importlib, "import_module", side_effect=import_module),
+            patch.object(amc_main, "logging_error") as mock_log,
+            patch(
+                "ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.register_servo_out_plugin"
+            ) as mock_servo_registration,
+        ):
+            register_plugins()
+
+        accelerometer_index = next(
+            index
+            for index, name in enumerate(attempted_modules)
+            if name.endswith("frontend_tkinter_accelerometer_calibration")
+        )
+        servo_out_index = max(
+            index for index, name in enumerate(attempted_modules) if name.endswith("frontend_tkinter_servo_out")
+        )
+        assert servo_out_index > accelerometer_index
+        mock_log.assert_called_once()
+        mock_servo_registration.assert_called_once_with()
 
 
 class TestValidatePluginRegistry:
@@ -1765,48 +2431,47 @@ class TestConnectionAndFilesystemBranches:
 class TestEditorBackupAndMainOrchestration:
     """Feature: Component editor branches, backup error handling, GPS upgrade and main() flow."""
 
-    def test_component_editor_skip_schedules_window_destruction(self) -> None:
-        """
-        component_editor schedules immediate window destruction when skip flag is set.
-
-        GIVEN: skip_component_editor=True and blank_component_data=False
-        WHEN: component_editor is called
-        THEN: root.after(10, root.destroy) is called and root.mainloop runs
-        """
-        # Arrange
-        state = ApplicationState(argparse.Namespace(skip_component_editor=True, vehicle_dir=None))
+    def test_reopened_component_editor_returns_without_creation_only_behavior(self) -> None:
+        """Manual component editing returns to the parameter editor without startup-only behavior."""
+        state = ApplicationState(argparse.Namespace())
         state.flight_controller = MagicMock()
         state.local_filesystem = MagicMock()
-        mock_vpm = MagicMock()
-        mock_vpm.blank_component_data = False
-        state.vehicle_project_manager = mock_vpm
+        state.vehicle_project_manager = MagicMock()
         mock_cew = MagicMock()
         mock_cew.root = MagicMock()
+        mock_cew.close_result = ComponentEditorCloseResult(ComponentEditorCloseAction.QUIT_WORKFLOW, 0)
 
-        with patch(
-            "ardupilot_methodic_configurator.__main__.create_and_configure_component_editor",
-            return_value=mock_cew,
+        with (
+            patch(
+                "ardupilot_methodic_configurator.__main__.create_and_configure_component_editor",
+                return_value=mock_cew,
+            ) as mock_create,
+            patch("ardupilot_methodic_configurator.__main__.should_open_firmware_documentation") as mock_should_open_docs,
+            patch("ardupilot_methodic_configurator.__main__.process_component_editor_results") as mock_process,
         ):
-            # Act
-            component_editor(state)
+            edit_vehicle_components(state)
 
-        # Assert
-        mock_cew.root.after.assert_called_once_with(10, mock_cew.root.destroy)
-        mock_cew.root.mainloop.assert_called_once()
+        mock_create.assert_called_once_with(
+            amc_main.__version__, state.local_filesystem, state.flight_controller, state.local_filesystem.vehicle_type, None
+        )
+        mock_cew.root.after.assert_not_called()
+        mock_cew.root.mainloop.assert_called_once_with()
+        mock_should_open_docs.assert_not_called()
+        mock_process.assert_called_once_with(state.flight_controller, state.local_filesystem)
 
     def test_component_editor_opens_firmware_doc_when_auto_open_enabled(self) -> None:
         """
-        component_editor opens firmware documentation when auto-open is enabled.
+        run_initial_component_editor opens firmware documentation when auto-open is enabled.
 
-        GIVEN: skip_component_editor=False and should_open_firmware_documentation returns True
-        WHEN: component_editor is called
+        GIVEN: should_open_firmware_documentation returns True
+        WHEN: run_initial_component_editor is called
         THEN: open_firmware_documentation is called with the firmware type
         """
         # Arrange
-        state = ApplicationState(argparse.Namespace(skip_component_editor=False, vehicle_dir=None))
+        state = ApplicationState(argparse.Namespace(vehicle_dir=None))
         state.flight_controller = MagicMock()
         state.local_filesystem = MagicMock()
-        state.vehicle_project_manager = None
+        state.vehicle_project_manager = MagicMock(is_new_project=True, blank_component_data=False)
         mock_cew = MagicMock()
         mock_cew.root = MagicMock()
 
@@ -1821,9 +2486,10 @@ class TestEditorBackupAndMainOrchestration:
             ),
             patch("ardupilot_methodic_configurator.__main__.open_firmware_documentation") as mock_open_doc,
             patch("ardupilot_methodic_configurator.__main__.FreeDesktop.setup_startup_notification"),
+            patch("ardupilot_methodic_configurator.__main__.process_component_editor_results"),
         ):
             # Act
-            component_editor(state)
+            run_initial_component_editor(state)
 
         # Assert
         mock_open_doc.assert_called_once_with(state.flight_controller.info.firmware_type)
@@ -1920,21 +2586,96 @@ class TestEditorBackupAndMainOrchestration:
             # Assert
             mock_err.assert_called()
 
-    def test_main_disconnect_and_exit_0_on_normal_completion(self) -> None:
+    def test_main_processes_component_results_before_parameter_editor_starts(self) -> None:
         """
-        main() calls flight_controller.disconnect and sys_exit(0) on normal completion.
+        Component changes are processed before the parameter editor starts.
 
-        GIVEN: All sub-steps succeed without error
-        WHEN: main is called
-        THEN: flight_controller.disconnect is called once and sys_exit(0) is the final call
+        WHEN: The application completes component editing
+        THEN: process_component_editor_results runs before parameter_editor_and_uploader
+        """
+        fc_mock = MagicMock()
+        fc_mock.fc_parameters = {}
+        local_filesystem = MagicMock()
+        events: list[str] = []
+
+        def _init_fs(state: object) -> None:
+            state.flight_controller = fc_mock  # type: ignore[union-attr]
+            state.local_filesystem = local_filesystem  # type: ignore[union-attr]
+            state.local_filesystem.file_parameters = {}
+            state.local_filesystem.doc_dict = {}
+            state.local_filesystem.vehicle_dir = "/fake"
+            state.local_filesystem.get_fc_fw_version_from_vehicle_components_json.return_value = "4.7.0"
+            state.param_default_values_dirty = False  # type: ignore[union-attr]
+            state.vehicle_project_manager = MagicMock(is_new_project=True)  # type: ignore[union-attr]
+
+        with (
+            patch("ardupilot_methodic_configurator.__main__.create_argument_parser") as mock_parser,
+            patch("ardupilot_methodic_configurator.__main__.register_plugins"),
+            patch("ardupilot_methodic_configurator.__main__.FreeDesktop.create_desktop_icon_if_needed"),
+            patch("ardupilot_methodic_configurator.__main__.setup_logging"),
+            patch("ardupilot_methodic_configurator.__main__.ProgramSettings.migrate_settings_to_latest_version"),
+            patch("ardupilot_methodic_configurator.__main__.check_updates", return_value=False),
+            patch("ardupilot_methodic_configurator.__main__.PopupWindow.should_display", return_value=False),
+            patch(
+                "ardupilot_methodic_configurator.__main__.ProgramSettings.get_setting",
+                side_effect=lambda key: False if key != "gui_complexity" else "normal",
+            ),
+            patch("ardupilot_methodic_configurator.__main__.initialize_flight_controller"),
+            patch("ardupilot_methodic_configurator.__main__.initialize_filesystem", side_effect=_init_fs),
+            patch("ardupilot_methodic_configurator.__main__.vehicle_directory_selection"),
+            patch("ardupilot_methodic_configurator.__main__.plugin_factory.validate_configuration_steps"),
+            patch(
+                "ardupilot_methodic_configurator.__main__.create_and_configure_component_editor",
+            ) as mock_create,
+            patch("ardupilot_methodic_configurator.__main__.process_component_editor_results") as mock_process,
+            patch("ardupilot_methodic_configurator.__main__.backup_fc_parameters"),
+            patch("ardupilot_methodic_configurator.__main__.upgrade_parameters_for_firmware_version"),
+            patch(
+                "ardupilot_methodic_configurator.__main__.parameter_editor_and_uploader",
+                side_effect=lambda _state: events.append("parameter_editor"),
+            ),
+            patch("ardupilot_methodic_configurator.__main__.sys_exit"),
+        ):
+            mock_create.return_value.root.mainloop.side_effect = lambda: events.append("run_initial_component_editor")
+            mock_process.side_effect = lambda *_args, **_kwargs: events.append("process_components")
+            mock_parser.return_value.parse_args.return_value = argparse.Namespace(
+                loglevel="INFO",
+                skip_check_for_updates=False,
+                vehicle_dir=None,
+                vehicle_type=None,
+                device=None,
+                reboot_time=5,
+                baudrate=115200,
+                n=0,
+                allow_editing_template_files=False,
+                export_fc_params_missing_or_different=False,
+            )
+
+            main()
+
+        mock_process.assert_called_once()
+        assert events == ["run_initial_component_editor", "process_components", "parameter_editor"]
+        local_filesystem.set_fc_fw_version_and_type_in_components_json.assert_not_called()
+
+    def test_main_saves_fc_version_for_directly_opened_project(self) -> None:
+        """
+        main() saves connected FC metadata for an existing project opened directly.
+
+        GIVEN: An existing project is selected directly with --vehicle-dir
+        WHEN: main starts with newer firmware connected
+        THEN: It saves the connected FC metadata and compares upgrades against the previously stored version
         """
         # Arrange
         fc_mock = MagicMock()
         fc_mock.fc_parameters = {MagicMock(): MagicMock()}
+        fc_mock.info.flight_sw_version = "4.7.1"
+        fc_mock.info.vehicle_type = "Heli"  # A coax frame can be detected as Heli.
+        local_filesystem = MagicMock()
+        local_filesystem.vehicle_type = "ArduCopter"  # Preserve the user's -t choice.
 
         def _init_fs(state: object) -> None:
             state.flight_controller = fc_mock  # type: ignore[union-attr]
-            state.local_filesystem = MagicMock()  # type: ignore[union-attr]
+            state.local_filesystem = local_filesystem  # type: ignore[union-attr]
             state.local_filesystem.file_parameters = {"01.param": {}}
             state.local_filesystem.doc_dict = {}
             state.local_filesystem.vehicle_dir = "/fake"
@@ -1961,23 +2702,24 @@ class TestEditorBackupAndMainOrchestration:
                 "ardupilot_methodic_configurator.__main__.initialize_filesystem",
                 side_effect=_init_fs,
             ),
-            patch("ardupilot_methodic_configurator.__main__.component_editor"),
-            patch("ardupilot_methodic_configurator.__main__.process_component_editor_results"),
+            patch("ardupilot_methodic_configurator.__main__.create_and_configure_component_editor") as mock_component_editor,
+            patch(
+                "ardupilot_methodic_configurator.__main__.process_component_editor_results"
+            ) as mock_process_component_results,
             patch("ardupilot_methodic_configurator.__main__.backup_fc_parameters"),
-            patch("ardupilot_methodic_configurator.__main__.upgrade_parameters_for_firmware_version"),
+            patch("ardupilot_methodic_configurator.__main__.upgrade_parameters_for_firmware_version") as mock_upgrade,
             patch("ardupilot_methodic_configurator.__main__.parameter_editor_and_uploader"),
             patch("ardupilot_methodic_configurator.__main__.sys_exit") as mock_exit,
         ):
             mock_parser.return_value.parse_args.return_value = argparse.Namespace(
                 loglevel="INFO",
                 skip_check_for_updates=False,
-                vehicle_dir=None,
-                vehicle_type=None,
+                vehicle_dir="/fake",
+                vehicle_type="ArduCopter",
                 device=None,
                 reboot_time=5,
                 baudrate=115200,
                 n=0,
-                skip_component_editor=False,
                 allow_editing_template_files=False,
                 save_component_to_system_templates=False,
                 export_fc_params_missing_or_different=False,
@@ -1989,3 +2731,9 @@ class TestEditorBackupAndMainOrchestration:
         # Assert: disconnect
         fc_mock.disconnect.assert_called_once()
         mock_exit.assert_called_with(0)
+        local_filesystem.set_fc_fw_version_and_type_in_components_json.assert_called_once_with("4.7.1", "ArduCopter", "/fake")
+        # Metadata is updated after its old version was captured for this startup's comparison.
+        assert mock_upgrade.call_args.args[0] == "4.6.0"
+        assert mock_upgrade.call_args.args[1] == "4.7.1"
+        mock_component_editor.assert_not_called()
+        mock_process_component_results.assert_called_once_with(fc_mock, local_filesystem)

@@ -179,6 +179,17 @@ class TestComponentDataModelImportInternals:
             result = realistic_model._verify_dict_is_uptodate(sample_doc_dict, dict_mismatch, "SERIAL1_PROTOCOL", "values")
             assert result is False
 
+    def test_verify_dict_accepts_arduplane_47_ina2xx_label(self, realistic_model) -> None:
+        """Accept the expanded INA2XX label introduced in ArduPilot 4.7.x metadata."""
+        doc = {
+            "BATT_MONITOR": {
+                "values": {"21": "INA2XX (INA226 INA228 INA238 INA231 INA260)"},
+            }
+        }
+        dict_to_check = {"21": {"protocol": "INA2XX"}}
+
+        assert realistic_model._verify_dict_is_uptodate(doc, dict_to_check, "BATT_MONITOR", "values") is True
+
     def test_verify_dict_handles_empty_documentation(self, realistic_model) -> None:
         """
         Internal dictionary verification handles empty documentation.
@@ -422,6 +433,58 @@ class TestComponentDataModelImportInternals:
         fc_parameters = {"BATT_CAPACITY": "invalid"}
         with patch("ardupilot_methodic_configurator.data_model_vehicle_components_import.logging_error"):
             realistic_model._set_battery_type_from_fc_parameters(fc_parameters)
+
+    def test_plane_battery_import_preserves_template_values_when_import_file_is_sparse(self, realistic_model) -> None:
+        """
+        Sparse Plane imports preserve battery values already supplied by the template.
+
+        ArduPlane does not define Copter's MOT_BAT_VOLT_MAX parameter, and an imported
+        difference file may omit BATT_CAPACITY and all voltage thresholds when they match
+        the template. The component editor must not clear the existing battery data.
+        """
+        realistic_model.set_component_value(("Flight Controller", "Firmware", "Type"), "ArduPlane")
+        battery_specs = realistic_model.get_component_data()["Components"]["Battery"]["Specifications"]
+        initial_specs = battery_specs.copy()
+
+        realistic_model._set_battery_type_from_fc_parameters({"BATT_MONITOR": 0})
+
+        assert realistic_model.get_component_data()["Components"]["Battery"]["Specifications"] == initial_specs
+
+    def test_copter_battery_import_preserves_template_values_when_import_file_is_sparse(self, realistic_model) -> None:
+        """
+        Sparse Copter imports preserve battery values already supplied by the template.
+
+        GIVEN: A Copter template with a validated battery specification
+        WHEN: An imported difference file omits all battery voltage thresholds
+        THEN: The existing battery specification remains unchanged
+        """
+        battery_specs = realistic_model.get_component_data()["Components"]["Battery"]["Specifications"]
+        initial_specs = battery_specs.copy()
+
+        realistic_model._set_battery_type_from_fc_parameters({"BATT_MONITOR": 0})
+
+        assert realistic_model.get_component_data()["Components"]["Battery"]["Specifications"] == initial_specs
+
+    def test_plane_battery_import_uses_batt_thresholds_without_copter_motor_voltage_parameters(self, realistic_model) -> None:
+        """ArduPlane battery thresholds import correctly without MOT_BAT_VOLT_MAX/MIN."""
+        realistic_model.set_component_value(("Battery", "Specifications", "Chemistry"), "Lipo")
+
+        realistic_model._set_battery_type_from_fc_parameters(
+            {
+                "BATT_MONITOR": 0,
+                "BATT_CAPACITY": 3300,
+                "BATT_ARM_VOLT": 23.2998,
+                "BATT_LOW_VOLT": 22.8,
+                "BATT_CRT_VOLT": 21.0,
+            }
+        )
+
+        battery_specs = realistic_model.get_component_data()["Components"]["Battery"]["Specifications"]
+        assert battery_specs["Number of cells"] == 6
+        assert battery_specs["Capacity mAh"] == 3300
+        assert battery_specs["Volt per cell arm"] == pytest.approx(3.8833)
+        assert battery_specs["Volt per cell low"] == pytest.approx(3.8)
+        assert battery_specs["Volt per cell crit"] == pytest.approx(3.5)
 
     def test_estimate_cell_count_from_mot_bat_volt_max(self, realistic_model) -> None:
         """

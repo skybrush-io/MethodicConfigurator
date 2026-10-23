@@ -14,6 +14,28 @@ from typing import Any
 from ardupilot_methodic_configurator import _
 from ardupilot_methodic_configurator.data_model_par_dict import MANUAL_OVERRIDE_PREFIX, Par, is_within_tolerance
 
+MULTIPLE_CHOICE_BLACKLIST = frozenset(
+    {
+        "MOT_SPIN_ARM",
+        "MOT_SPIN_MAX",
+        "MOT_SPIN_MIN",
+        "MOT_THST_EXPO",
+        "ACRO_RP_EXPO",
+        "ACRO_RP_RATE_TC",
+        "ACRO_Y_EXPO",
+        "ACRO_Y_RATE_TC",
+        "PILOT_Y_EXPO",
+        "PILOT_Y_RATE_TC",
+        "ATC_ACCEL_P_MAX",
+        "ATC_ACCEL_R_MAX",
+        "ATC_ACCEL_Y_MAX",
+        "ATC_RATE_P_MAX",
+        "ATC_RATE_R_MAX",
+        "ATC_RATE_Y_MAX",
+        "ATC_INPUT_TC",
+    }
+)
+
 
 class ParameterUnchangedError(Exception):
     """
@@ -32,6 +54,10 @@ class ParameterOutOfRangeError(Exception):
     before proceeding. If the caller passes `ignore_out_of_range=True` to
     `set_new_value`, the value will be accepted despite being out of range.
     """
+
+
+class ParameterForcedOrDerivedError(ValueError):
+    """Raised when attempting to change a forced or derived parameter without a manual override."""
 
 
 class ArduPilotParameter:  # pylint: disable=too-many-instance-attributes, too-many-public-methods
@@ -143,20 +169,11 @@ class ArduPilotParameter:  # pylint: disable=too-many-instance-attributes, too-m
         """Return True if this parameter uses a multiple choice representation."""
         # these parameters do have choices defined in their metadata, the handful of discrete choices
         #  is limitative and most usecases require the use of a continuous range instead
-        multiple_choice_blacklist = {
-            "MOT_SPIN_ARM",
-            "MOT_SPIN_MAX",
-            "MOT_SPIN_MIN",
-            "MOT_THST_EXPO",
-            "ATC_ACCEL_P_MAX",
-            "ATC_ACCEL_R_MAX",
-            "ATC_ACCEL_Y_MAX",
-        }
         return (
             self.choices_dict is not None
             and len(self.choices_dict) > 0
             and self.is_in_values_dict
-            and self._name not in multiple_choice_blacklist
+            and self._name not in MULTIPLE_CHOICE_BLACKLIST
         )
 
     @property
@@ -365,17 +382,18 @@ class ArduPilotParameter:  # pylint: disable=too-many-instance-attributes, too-m
         """Return an error message if the FC value has unknown bits set."""
         return self.has_unknown_bits_set(int(self._fc_value)) if self._fc_value is not None else ""
 
-    def set_fc_value(self, new_fc_value: float) -> None:
+    def set_fc_value(self, new_fc_value: float | None) -> None:
         """
         Update the flight controller value for this parameter.
 
         This method sets the FC value directly without validation because it receives
         data that has already been validated and confirmed by the flight controller itself.
-        The value comes from the FC's parameter download/refresh after an upload operation,
-        so it represents the actual state stored in the flight controller.
+        The value comes from the FC's parameter download/refresh, so it represents
+        the actual state stored in the flight controller. None clears a stale FC
+        value when the parameter is absent from the refreshed download.
 
         Args:
-            new_fc_value: The new FC value to set (already validated by the FC)
+            new_fc_value: The new FC value (already validated by the FC), or None if absent
 
         """
         self._fc_value = new_fc_value
@@ -397,6 +415,8 @@ class ArduPilotParameter:  # pylint: disable=too-many-instance-attributes, too-m
 
         Raises:
             TypeError: if the provided value is not a string.
+            ParameterForcedOrDerivedError: if the parameter is forced or derived and
+                has no manual override.
             ValueError: if the value is invalid for this parameter (not in choices,
                         invalid bitmask bits, invalid numeric format, etc.).
             ParameterOutOfRangeError: if the value is outside min/max limits and
@@ -406,7 +426,7 @@ class ArduPilotParameter:  # pylint: disable=too-many-instance-attributes, too-m
 
         """
         if (self._is_forced or self._is_derived) and not self._is_manual_override:
-            raise ValueError(_("This parameter is forced or derived and cannot be changed."))
+            raise ParameterForcedOrDerivedError(_("This parameter is forced or derived and cannot be changed."))
 
         if not isinstance(value, str):
             raise TypeError(_("Parameter value must be provided as a string."))

@@ -11,15 +11,20 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import tkinter as tk
+from collections.abc import Callable
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from ardupilot_methodic_configurator.backend_flightcontroller import SUPPORTED_BAUDRATES
+from ardupilot_methodic_configurator.backend_flightcontroller_connection import FlightControllerConnection
+from ardupilot_methodic_configurator.backend_flightcontroller_factory_serial import FakeSerialPortDiscovery
+from ardupilot_methodic_configurator.data_model_flightcontroller_info import FlightControllerInfo
 from ardupilot_methodic_configurator.frontend_tkinter_connection_selection import (
     ConnectionSelectionWidgets,
     ConnectionSelectionWindow,
 )
+from ardupilot_methodic_configurator.frontend_tkinter_firmware_upload import FirmwareUploadWindow, _FirmwareConnectionSelector
 
 # pylint: disable=too-many-lines, protected-access, redefined-outer-name
 
@@ -28,6 +33,11 @@ from ardupilot_methodic_configurator.frontend_tkinter_connection_selection impor
 # ---------------------------------------------------------------------------
 
 _MOD = "ardupilot_methodic_configurator.frontend_tkinter_connection_selection"
+
+
+def _configure_progress_task(window: MagicMock) -> None:
+    """Execute worker tasks inline in tests of connection choices and error handling."""
+    window.run_task.side_effect = lambda task: task(window.update_progress_bar)
 
 
 def _mock_basewindow_init(self, root_tk=None) -> None:  # noqa: ARG001 # pylint: disable=unused-argument
@@ -149,6 +159,48 @@ def connection_window(mock_fc: MagicMock):  # noqa: ANN201  # yields; complex re
 
 class TestConnectionSelectionWidgets:
     """ConnectionSelectionWidgets test class."""
+
+    @pytest.mark.parametrize("device", ["udpin:0.0.0.0:14550", "tcp:127.0.0.1:5761", "COM9"])
+    def test_explicit_device_survives_initial_discovery_and_refresh(self, mock_parent: MagicMock, device: str) -> None:
+        """
+        A command-line endpoint remains selectable after an unsuccessful connection.
+
+        GIVEN: An explicit device not present in discovery or saved history
+        WHEN: The selector opens and refreshes its available ports
+        THEN: The device remains in the list without being saved to settings
+        """
+        connection = FlightControllerConnection(
+            info=FlightControllerInfo(),
+            network_ports=[],
+            serial_port_discovery=FakeSerialPortDiscovery(),
+        )
+        with patch.object(connection, "create_connection_with_retry", return_value="No heartbeat"):
+            assert connection.connect(device) == "No heartbeat"
+        mock_fc = MagicMock()
+        mock_fc.comport = connection.comport
+        mock_fc.master = None
+        mock_fc.discover_connections.side_effect = connection.discover_connections
+        mock_fc.get_connection_tuples.side_effect = connection.get_connection_tuples
+        with (
+            patch("tkinter.ttk.Frame"),
+            patch("tkinter.ttk.Label"),
+            patch("tkinter.ttk.Combobox"),
+            patch("tkinter.StringVar"),
+            patch(f"{_MOD}.PairTupleCombobox") as combobox,
+            patch(f"{_MOD}.show_tooltip"),
+            patch(f"{_MOD}.ProgramSettings.get_connection_history", return_value=[]),
+            patch(f"{_MOD}.ProgramSettings.store_connection") as store_connection,
+        ):
+            combobox.return_value.get_selected_key.return_value = device
+            widget = ConnectionSelectionWidgets(
+                mock_parent, MagicMock(), mock_fc, destroy_parent_on_connect=True, download_params_on_connect=False
+            )
+            assert (device, device) in combobox.call_args.args[1]
+            assert combobox.call_args.args[2] == device
+            widget._refresh_ports()
+        assert (device, device) in connection.get_connection_tuples()
+        assert widget._connection_history_cache == []
+        store_connection.assert_not_called()
 
     def test_init_with_no_comport(self, basic_widget: tuple[ConnectionSelectionWidgets, MagicMock, MagicMock]) -> None:
         """Test the initialization of ConnectionSelectionWidgets when comport is None."""
@@ -325,13 +377,14 @@ class TestConnectionSelectionWidgets:
             patch(f"{_MOD}.ProgressWindow", return_value=mock_progress_instance) as mock_progress_window,
             patch(f"{_MOD}.show_no_connection_error") as mock_show_error,
         ):
+            _configure_progress_task(mock_progress_window.return_value)
             result = widget.reconnect("COM1")
 
         mock_progress_window.assert_called_once()
         mock_fc.connect.assert_called_once_with("COM1", mock_progress_instance.update_progress_bar, baudrate=115200)
         mock_show_error.assert_called_once_with("Connection error")
         assert result
-        mock_progress_instance.destroy.assert_not_called()
+        mock_progress_instance.destroy.assert_called_once()
 
     def test_reconnect_success_destroy_parent(
         self,
@@ -352,6 +405,7 @@ class TestConnectionSelectionWidgets:
             patch(f"{_MOD}.show_no_connection_error") as mock_show_error,
             patch(f"{_MOD}.ProgramSettings.store_connection", return_value="COM1"),
         ):
+            _configure_progress_task(mock_progress_window.return_value)
             result = widget.reconnect("COM1")
 
         mock_progress_window.assert_called_once()
@@ -378,9 +432,10 @@ class TestConnectionSelectionWidgets:
         mock_parent.download_flight_controller_parameters = MagicMock()
 
         with (
-            patch(f"{_MOD}.ProgressWindow", return_value=mock_progress_instance),
+            patch(f"{_MOD}.ProgressWindow", return_value=mock_progress_instance) as mock_progress_window,
             patch(f"{_MOD}.ProgramSettings.store_connection", return_value="COM1"),
         ):
+            _configure_progress_task(mock_progress_window.return_value)
             result = widget.reconnect("COM1")
 
         mock_parent.download_flight_controller_parameters.assert_called_once_with(redownload=False)
@@ -394,6 +449,64 @@ class TestConnectionSelectionWidgets:
 
 class TestConnectionSelectionWindow:
     """ConnectionSelectionWindow test class."""
+
+    def test_firmware_window_opens_selector_under_its_root(self) -> None:
+        """The connection button reuses the firmware window's Tk interpreter."""
+        firmware_window = FirmwareUploadWindow.__new__(FirmwareUploadWindow)
+        firmware_window.root = MagicMock()
+        firmware_window.flight_controller = MagicMock()
+        firmware_window.connect_button = MagicMock()
+        firmware_window.uploading = False
+        firmware_window.connecting = False
+        with (
+            patch(
+                "ardupilot_methodic_configurator.frontend_tkinter_firmware_upload._FirmwareConnectionSelector"
+            ) as selector_class,
+            patch.object(FirmwareUploadWindow, "_refresh_board") as refresh_board,
+        ):
+            firmware_window.connect()
+
+        selector_class.assert_called_once_with(
+            firmware_window.root,
+            firmware_window.flight_controller,
+        )
+        firmware_window.root.wait_window.assert_called_once_with(selector_class.return_value.root)
+        refresh_board.assert_called_once()
+
+    def test_embedded_close_keeps_firmware_window_and_connection(self, mock_fc: MagicMock) -> None:
+        """Dismissing the child selector leaves the firmware window running."""
+        window = _FirmwareConnectionSelector.__new__(_FirmwareConnectionSelector)
+        window.root = MagicMock()
+        window.connection_selection_widgets = MagicMock()
+        window.connection_selection_widgets.flight_controller = mock_fc
+        window.close()
+
+        window.connection_selection_widgets.stop_periodic_refresh.assert_called_once()
+        window.root.destroy.assert_called_once()
+        mock_fc.disconnect.assert_not_called()
+
+    def test_embedded_selector_uses_parent_tk_and_returns_on_close(self, mock_fc: MagicMock) -> None:
+        """A firmware window can open and dismiss the selector without losing its Tk root."""
+        try:
+            parent = tk.Tk()
+        except tk.TclError:
+            pytest.skip("Tk display is unavailable")
+        parent.withdraw()
+        try:
+            with (
+                patch("ardupilot_methodic_configurator.frontend_tkinter_firmware_upload.ConnectionSelectionWidgets"),
+                patch("ardupilot_methodic_configurator.frontend_tkinter_firmware_upload.show_tooltip"),
+                patch(f"{_MOD}.sys_exit") as mock_exit,
+            ):
+                window = _FirmwareConnectionSelector(parent, mock_fc)
+                assert isinstance(window.root, tk.Toplevel)
+                assert window.root.tk is parent.tk
+                window.close()
+                assert parent.winfo_exists()
+                mock_fc.disconnect.assert_not_called()
+                mock_exit.assert_not_called()
+        finally:
+            parent.destroy()
 
     def test_window_has_connection_selection_widgets(
         self, connection_window: tuple[ConnectionSelectionWindow, MagicMock]
@@ -598,9 +711,10 @@ class TestBaudrateSelectionBehavior:
         baudrate_widget._mock_fc.connect.return_value = None  # type: ignore[attr-defined]
 
         with (
-            patch(f"{_MOD}.ProgressWindow"),
+            patch(f"{_MOD}.ProgressWindow") as mock_progress_window,
             patch(f"{_MOD}.messagebox.showerror"),
         ):
+            _configure_progress_task(mock_progress_window.return_value)
             baudrate_widget.reconnect("COM1")
 
         baudrate_widget._mock_fc.connect.assert_called_once()  # type: ignore[attr-defined]
@@ -621,7 +735,8 @@ class TestBaudrateSelectionBehavior:
         baudrate_widget._mock_baudrate_var.get.return_value = custom_baudrate  # type: ignore[attr-defined]
         baudrate_widget._mock_fc.connect.return_value = None  # type: ignore[attr-defined]
 
-        with patch(f"{_MOD}.ProgressWindow"):
+        with patch(f"{_MOD}.ProgressWindow") as mock_progress_window:
+            _configure_progress_task(mock_progress_window.return_value)
             baudrate_widget.reconnect("COM1")
 
         baudrate_widget._mock_fc.connect.assert_called_once()  # type: ignore[attr-defined]
@@ -646,7 +761,8 @@ class TestBaudrateSelectionBehavior:
         mock_comport.device = selected_port
         baudrate_widget._mock_fc.comport = mock_comport  # type: ignore[attr-defined]
 
-        with patch(f"{_MOD}.ProgressWindow"):
+        with patch(f"{_MOD}.ProgressWindow") as mock_progress_window:
+            _configure_progress_task(mock_progress_window.return_value)
             result = baudrate_widget.reconnect(selected_port)
 
         baudrate_widget._mock_fc.connect.assert_called_once()  # type: ignore[attr-defined]
@@ -858,6 +974,7 @@ class TestPeriodicPortRefresh:
             patch(f"{_MOD}.show_no_connection_error"),
             patch(f"{_MOD}.ProgramSettings.store_connection", return_value="COM1") as mock_store,
         ):
+            _configure_progress_task(mock_progress_window.return_value)
             mock_progress_window.return_value.destroy = MagicMock()
             result = periodic_widget.reconnect("COM1")
 
@@ -1227,9 +1344,10 @@ class TestPersistAndCacheConnectionBehavior:
         mock_fc.connect.return_value = ""
 
         with (
-            patch(f"{_MOD}.ProgressWindow"),
+            patch(f"{_MOD}.ProgressWindow") as mock_progress_window,
             patch(f"{_MOD}.ProgramSettings.store_connection", return_value="COM3"),
         ):
+            _configure_progress_task(mock_progress_window.return_value)
             widget.reconnect("  COM3  ")
 
         assert widget.previous_selection == "COM3"
@@ -1253,9 +1371,10 @@ class TestPersistAndCacheConnectionBehavior:
         mock_fc.add_connection.reset_mock()
 
         with (
-            patch(f"{_MOD}.ProgressWindow"),
+            patch(f"{_MOD}.ProgressWindow") as mock_progress_window,
             patch(f"{_MOD}.ProgramSettings.store_connection", return_value="COM3"),
         ):
+            _configure_progress_task(mock_progress_window.return_value)
             widget.reconnect("  COM3  ")
 
         mock_fc.add_connection.assert_called_with("COM3")
@@ -1387,10 +1506,11 @@ class TestReconnectBaudrateValidation:
 
         with (
             patch(f"{_MOD}.logging_warning") as mock_warn,
-            patch(f"{_MOD}.ProgressWindow"),
+            patch(f"{_MOD}.ProgressWindow") as mock_progress_window,
             patch.object(periodic_widget._mock_fc, "connect", return_value="") as mock_connect,  # type: ignore[attr-defined]
             patch(f"{_MOD}.messagebox"),
         ):
+            _configure_progress_task(mock_progress_window.return_value)
             periodic_widget.reconnect("COM1")
 
         # Warning should have been emitted for unsupported baudrate
@@ -1414,11 +1534,12 @@ class TestReconnectBaudrateValidation:
         periodic_widget.default_baudrate = 115200
 
         with (
-            patch(f"{_MOD}.ProgressWindow"),
+            patch(f"{_MOD}.ProgressWindow") as mock_progress_window,
             patch(f"{_MOD}.messagebox") as mock_msgbox,
             patch.object(periodic_widget._mock_fc, "connect", return_value="") as mock_connect,  # type: ignore[attr-defined]
             patch(f"{_MOD}.logging_error"),
         ):
+            _configure_progress_task(mock_progress_window.return_value)
             periodic_widget.reconnect("COM1")
 
         # baudrate_var should be reset to the default
@@ -1545,3 +1666,36 @@ class TestConnectionSelectionWindowColonBranch:
         assert any(label == "Connection successful" for label in captured_labels), (
             f"Plain text label not found. Labels: {captured_labels}"
         )
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_nested_reconnect_is_ignored_and_next_attempt_is_allowed(
+    basic_widget: tuple[ConnectionSelectionWidgets, MagicMock, MagicMock], raises: bool
+) -> None:
+    """Nested events cannot create another worker, and failure releases the reconnect guard."""
+    widget, _, _ = basic_widget
+    widget.destroy_parent_on_connect = False
+    widget.download_params_on_connect = False
+    with patch(f"{_MOD}.ProgressWindow") as progress, patch(f"{_MOD}.show_no_connection_error"):
+        window = progress.return_value
+
+        def connect_once(_task: Callable[..., object]) -> str:
+            assert widget.reconnect("COM2") is True
+            if raises:
+                message = "Connection failed"
+                raise RuntimeError(message)
+            return "No heartbeat"
+
+        window.run_task.side_effect = connect_once
+        if raises:
+            with pytest.raises(RuntimeError, match="Connection failed"):
+                widget.reconnect("COM1")
+        else:
+            assert widget.reconnect("COM1") is True
+        progress.assert_called_once()
+        window.destroy.assert_called_once()
+
+        window.run_task.side_effect = None
+        window.run_task.return_value = ""
+        assert widget.reconnect("COM1") is False
+        assert progress.call_count == 2

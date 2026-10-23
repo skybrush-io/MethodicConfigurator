@@ -1,0 +1,263 @@
+# MAVFTP File Browser Architecture
+
+**Status:** Implemented
+**Entry point:** Parameter Editor → **Download .bin log file(s)**
+
+> **User-facing documentation:** [USERMANUAL_MAVFTP.md](USERMANUAL_MAVFTP.md)
+> is the authoritative description of the browser's interface, workflows,
+> shortcuts, confirmations, and troubleshooting. This document describes the
+> implementation boundaries and technical contracts.
+
+## Scope
+
+`FileBrowserWindow` is a modal two-panel browser for MAVFTP files on a
+connected flight controller and files on the local PC. It is implemented in
+`ardupilot_methodic_configurator/frontend_tkinter_file_browser.py`.
+
+The window does not access MAVFTP directly. It coordinates user-interface
+state, background work, and local filesystem operations while the data model
+and backend own flight-controller communication.
+
+## Layered design
+
+```text
+ParameterEditorWindow
+        |
+        v
+FileBrowserWindow(BaseWindow)
+        |  FileBrowserUiServices
+        v
+ParameterEditor
+        v
+FlightController
+        v
+FlightControllerFiles
+        v
+MAVFTP
+```
+
+### Frontend
+
+`FileBrowserWindow` owns:
+
+- modal lifecycle and widget state;
+- Treeview population, stable item IDs, selection, and sorting;
+- local directory enumeration;
+- dialogs, confirmations, summaries, and progress display;
+- dispatch of blocking remote work to background threads; and
+- post-refresh selection of newly created directories.
+
+`frontend_tkinter_file_browser_operations.py` contains the Tk-independent
+recursive transfer plans, path/conflict checks, batch workers, and local entry
+types. The window
+supplies model callbacks and applies results on the Tk thread.
+This boundary lets the file-operation policies be tested without constructing a
+window.
+
+`FileBrowserUiServices` injects file/directory/name dialogs, messages,
+confirmations, and the standard `ProgressWindow` factory. This permits
+unit-level testing without a live Tk desktop.
+
+Single local `.bin` entries expose eight ArduPilot analysis websites from the
+PC context menu. `backend_web_log_tools.py` validates the destination against
+an allowlist, opens a Selenium-managed Chrome browser (new tab for subsequent
+tools), and sets each site's log-file input directly to the selected local path.
+The task runs on the local background runner so browser startup and uploads do
+not block Tk. It does not attach to the user's existing browser profile; the
+Selenium Manager driver/browser must be available at runtime.
+
+The backend serializes driver access and discards closed sessions before one
+bounded retry. Cleanup forgets the session even if driver shutdown fails.
+If only the active tab closes, recovery switches to a surviving tab and opens
+the requested log in a new tab without closing existing analyses. Tabs that
+close during recovery are skipped. Invalid sessions or sessions without usable
+tabs are replaced; repeated tab closure reports failure after the single retry
+without destroying surviving analyses.
+Navigation has a 30-second page-load timeout; locating the input has its own
+30-second timeout. The approved origin and exact tool path are checked both
+after navigation and immediately before handing over the file, allowing query
+and fragment state. This is a destination check, not a sandbox for website
+JavaScript or a guarantee about subsequent network use by that website.
+
+The local runner accepts one task at a time. A second web-tool request reports
+that it is busy rather than silently disappearing. Local navigation during
+browser work invalidates the current listing; the completion callback schedules
+the pending refresh after the runner becomes available.
+
+The standalone module creates its own `FlightController`, `LocalFilesystem`,
+and `ParameterEditor`; it connects the controller before opening the window.
+
+### Model and backend
+
+`ParameterEditor` exposes the frontend-facing operations and delegates to
+`FlightController` and `FlightControllerFiles`. The relevant interface is:
+
+```python
+get_remote_files(remote_directory)
+upload_file_to_fc(local_filename, remote_filename, progress_callback)
+download_remote_file(remote_path, local_filename, progress_callback)
+make_remote_directory(remote_directory)
+delete_remote_path(remote_path, is_directory=False)
+rename_remote_path(remote_path, new_remote_path)
+download_last_flight_log(local_filename, progress_callback)
+```
+
+`FlightControllerFiles` serializes MAVFTP access with its `_mavftp_lock`.
+Its `_mavftp_operation()` guard also rejects same-thread callback re-entry
+before another client can reset the active session. Internal locked helpers
+do not acquire this guard again; it is released on success and failure.
+It implements remote listing, file transfer, directory creation, deletion,
+rename, and the existing LASTLOG/fallback workflow.
+
+For configured setup-step uploads, `ParameterEditor` retains one
+`FileUploadWorkflow` for its lifetime. The workflow rejects nested batch requests
+across confirmation and progress callbacks and releases batch ownership even
+when a callback raises. Recoverable filesystem and transport exceptions become
+per-file outcomes, allowing later files to proceed without treating an
+unverifiable target as permission to overwrite it.
+
+The workflow accepts an injected `UploadExecutor` for confirmed transfers.
+`ParameterEditorWindow` runs the transport with `BackgroundTaskRunner` and waits
+for completion with Tk's modal variable wait, keeping timers and UI delivery
+active. Confirmation and result dialogs remain on the Tk thread. The popup
+clock starts before transport execution, including the delay before the first
+ACK. The outgoing plugin view is destroyed before the step-change workflow starts.
+Navigation remains locked until the worker finishes, and application close
+requests are deferred until then. The popup closes before reporting failure
+or asking about a retry.
+
+## Data contracts
+
+Remote entries are represented by `FlightControllerLogFile`:
+
+```python
+@dataclass(frozen=True)
+class FlightControllerLogFile:
+    name: str
+    remote_path: str
+    size_bytes: int
+    is_directory: bool = False
+    modified_at: int | None = None
+```
+
+The local panel uses `LocalFileEntry`, which additionally retains a local
+`Path` and a local modification timestamp.
+
+MAVFTP `DirectoryEntry` values can optionally include a Unix modification
+timestamp. `backend_mavftp.py` probes timestamp-capable directory listings and
+falls back to the baseline listing request when firmware does not support that
+metadata. The frontend receives `None` for unsupported remote timestamps.
+
+## Concurrency and operation lifecycle
+
+Directory listing and remote download planning use `_start_remote_task`.
+Transfer, delete, rename, and remote-directory creation use
+`_start_background_operation`. These are thin UI adapters over one
+`BackgroundTaskRunner` in `frontend_tkinter_file_browser_tasks.py`, which
+serializes work, runs blocking calls in a worker thread, and delivers progress,
+results, and errors on the Tk thread.
+Unit tests inject an immediate runner instead of relying on a production
+code path that runs without Tk.
+
+While a remote operation is active, relevant controls are disabled
+using the ttk state API. The browser cannot close until that operation finishes.
+
+Download and upload progress use immutable `TransferProgress` snapshots from
+`data_model_transfer_progress.py`: cumulative transferred bytes, an optional total,
+and an explicit `TRANSFERRING`, `VERIFYING`, or `FINISHED` phase. `None` denotes
+an unknown total; zero denotes a known empty transfer. Failed files remove only
+their untransferred remainder from the batch total. Upload counts use acknowledged
+payload bytes, including short final blocks;
+zero-byte local files have known sizes. Snapshots carry their transfer direction
+so the popup uses download or upload labels.
+
+`TransferBatchAccounting` and `TransferFileAccounting` own the listing-size,
+unknown-size, and partial-transfer accounting rules in the data model. They
+consume supplied counts and return snapshots without performing I/O. The
+batch worker owns transfer execution, result recording, and verification.
+Both transfer workers accept one `TransferProgress` callback; they derive totals
+from their plans through the shared accounting model. The browser does not
+calculate separate progress totals.
+
+The background runner coalesces complete snapshots, including phase changes,
+and delivers them on the Tk thread. Ordinary tasks retain their two-integer
+progress callbacks. `estimate_transfer` calculates average throughput and ETA
+from supplied counts and elapsed time without accessing a clock or widgets.
+The popup accepts an injected clock and refreshes the latest transferring
+snapshot every 500 ms, even when no new packets arrive. Phase transitions and
+popup destruction cancel the refresh timer.
+
+The runner uses `ParamSpec` to require matching worker and handler signatures.
+It transports callback arguments without knowing their transfer-specific
+meaning. The frontend supplies the matching popup callback directly for count
+or transfer progress. Completed tasks retain only snapshot values for
+deduplication, releasing their progress handlers and widgets.
+
+Optional CRC32 verification runs after all batch transfers finish via
+`FlightControllerFiles.verify_remote_file`. Generated `@SYS` files are marked
+not verified. The batch summary offers a single explicit retry of failed
+file transfers using a reduced plan; successful files and remote mutations
+are never retried.
+
+## Path and filesystem boundaries
+
+The frontend and backend enforce the following boundaries:
+
+- remote destinations are normalized absolute POSIX paths;
+- parent segments are rejected from remote paths;
+- names supplied for create and rename operations must be one path component;
+- malformed remote listing names are skipped, including names unsafe on a
+  supported local filesystem;
+- local symbolic links are excluded from recursive transfer planning; and
+- resolved local download targets must remain under the selected directory,
+  preventing symbolic-link ancestors from redirecting writes;
+- local and remote directory deletion is non-recursive.
+
+Paths are passed as MAVFTP values rather than through a shell command.
+
+## Test coverage
+
+`tests/test_frontend_tkinter_file_browser.py` covers real-Tk construction,
+panel behavior, navigation, sorting, context menus, transfers, and the
+busy-window lifecycle. `tests/test_frontend_tkinter_file_browser_operations.py`
+tests Tk-independent transfer planning, workers, and path boundaries.
+`tests/test_frontend_tkinter_file_browser_tasks.py` tests progress, errors, and
+task serialization. `tests/test_backend_flightcontroller_file_browser.py`
+tests the flight-controller file API used by the browser.
+
+`tests/test_data_model_transfer_progress.py` tests estimates with plain inputs.
+`tests/test_frontend_tkinter_transfer_progress.py` covers stalled transfers,
+empty-file verification, timer cleanup, and integration of the real background
+runner, controlled transfer callbacks, and actual Tk widgets.
+
+The backend file tests also exercise a real MAVFTP client through an in-memory
+transport, checking EOF publication and failed-session cleanup without hardware.
+Upload tests use real local files and the real MAVFTP state machine to verify
+short final blocks, duplicate ACKs, lost ACK retransmission, partial failure,
+remote payload contents, and session cleanup. Configured-upload tests use real
+Tk widgets, the runner, and the model workflow to check initial delay, stalled
+estimates, thread ownership, locked navigation, and cleanup on every outcome.
+The browser tests verify that retries reset bytes, throughput, and ETA after a
+long user decision. Run static callback-signature regression checks with:
+
+```text
+mypy --follow-imports=silent --warn-unused-ignores tests/test_typing_frontend_tkinter_file_browser_tasks.py
+```
+
+`tests/test_backend_mavftp.py` and
+`tests/test_backend_flightcontroller_files.py` cover MAVFTP and backend
+behavior, including listing and transfer details.
+
+Run the focused frontend tests with:
+
+```text
+python -m pytest tests/test_frontend_tkinter_file_browser.py -q -p no:cacheprovider
+```
+
+## Deferred technical work
+
+- structured remote-listing errors instead of an empty-list error channel;
+- preflight discovery of remote upload conflicts;
+- real-Tk/end-to-end MAVFTP integration tests; and
+- a standalone-window smoke test covering connection establishment and initial
+  panel rendering.

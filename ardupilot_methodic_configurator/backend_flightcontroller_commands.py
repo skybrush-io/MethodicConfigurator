@@ -9,12 +9,14 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from logging import debug as logging_debug
 from logging import error as logging_error
 from logging import info as logging_info
 from time import sleep as time_sleep
 from time import time as time_time
-from typing import ClassVar, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypedDict, cast  # pylint: disable=unused-import
 
 from pymavlink import mavutil
 
@@ -22,6 +24,7 @@ from ardupilot_methodic_configurator import _
 from ardupilot_methodic_configurator.backend_flightcontroller_business_logic import (
     calculate_voltage_thresholds,
     convert_battery_telemetry_units,
+    get_enabled_battery_ids,
     get_frame_info,
     is_battery_monitoring_enabled,
 )
@@ -30,6 +33,13 @@ from ardupilot_methodic_configurator.backend_flightcontroller_protocols import (
     FlightControllerParamsProtocol,
     MavlinkConnection,
 )
+from ardupilot_methodic_configurator.data_model_fc_diagnostics import StatusTextAssembler, decode_status_text, message_source
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+# pymavlink initializes this dialect module dynamically and types it as optional.
+mavlink = cast("Any", mavutil.mavlink)
 
 # pylint: disable=too-many-lines
 
@@ -49,6 +59,27 @@ class CompassCalibrationUpdate(TypedDict, total=False):
     text: str
 
 
+@dataclass(frozen=True, slots=True)
+class _CommandAckFailure:
+    """Terminal command result retained while queued STATUSTEXT is collected."""
+
+    result: int
+    error_message: str
+    grace_deadline: float
+
+
+@dataclass(slots=True)
+class _LevelCalibrationState:
+    """Mutable retry/ACK state for a non-blocking level-calibration exchange."""
+
+    active: bool = False
+    retry_count: int = 0
+    ack_deadline: float | None = None
+    retry_at: float | None = None
+    failure: _CommandAckFailure | None = None
+    status_texts: list[str] = field(default_factory=list)
+
+
 class FlightControllerCommands:  # pylint: disable=too-many-public-methods
     """
     Handles MAVLink command execution and status queries.
@@ -65,6 +96,7 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
 
     # Command timeout constants
     COMMAND_ACK_TIMEOUT: ClassVar[float] = 5.0
+    COMMAND_ACK_STATUS_TEXT_GRACE: ClassVar[float] = 0.5
     COMMAND_ACK_TIMEOUT_BATTERY: ClassVar[float] = 0.8
     MOTOR_TEST_COMMAND_DELAY: ClassVar[float] = 0.01
     BATTERY_STATUS_TIMEOUT: ClassVar[float] = 1.5
@@ -72,6 +104,11 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
     BATTERY_STATUS_REQUEST_ATTEMPTS: ClassVar[int] = 3
     BATTERY_STATUS_REQUEST_DELAY: ClassVar[float] = 0.3
     BATTERY_STATUS_ACTIVATION_WAIT: ClassVar[float] = 1.0
+    SIMPLE_ACCEL_CALIBRATION_ACK_TIMEOUT: ClassVar[float] = 30.0
+    LEVEL_CALIBRATION_RETRY_DELAY: ClassVar[float] = 5.0
+    LEVEL_CALIBRATION_LATE_ACK_GUARD: ClassVar[float] = 5.0
+    LEVEL_CALIBRATION_MAX_RETRIES: ClassVar[int] = 9
+    LEVEL_CALIBRATION_ACK_TIMEOUT: ClassVar[float] = 45.0
 
     def __init__(
         self,
@@ -94,16 +131,18 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             raise ValueError(msg)
         self._params_manager: FlightControllerParamsProtocol = params_manager
         self._connection_manager: FlightControllerConnectionProtocol = connection_manager
-        self._last_battery_status: tuple[float, float] | None = None
-        self._last_battery_message_time: float = 0.0
+        self._battery_status_connection: MavlinkConnection | None = None
+        self._last_battery_statuses: dict[int, tuple[float, float, float]] = {}
         self._last_accel_cal_vehicle_pos: int | None = None
+        self._level_calibration = _LevelCalibrationState()
+        self._abandoned_level_deadline: float | None = None
 
     @property
     def master(self) -> MavlinkConnection | None:
         """Get master connection - delegates to connection manager."""
         return self._connection_manager.master
 
-    def send_command_and_wait_ack(  # pylint: disable=too-many-arguments,too-many-positional-arguments, too-many-locals
+    def send_command_and_wait_ack(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         command: int,
         param1: float = 0,
@@ -134,12 +173,44 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
                              error_message is empty string on success or contains error description on failure
 
         """
+        success, error_msg, _result_code = self._send_command_and_wait_ack_with_result(
+            command,
+            param1=param1,
+            param2=param2,
+            param3=param3,
+            param4=param4,
+            param5=param5,
+            param6=param6,
+            param7=param7,
+            timeout=timeout,
+        )
+        return success, error_msg
+
+    def _send_command_and_wait_ack_with_result(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-return-statements,too-many-statements  # noqa: PLR0913, PLR0915, PLR0911
+        self,
+        command: int,
+        param1: float = 0,
+        param2: float = 0,
+        param3: float = 0,
+        param4: float = 0,
+        param5: float = 0,
+        param6: float = 0,
+        param7: float = 0,
+        timeout: float = 5.0,
+        *,
+        capture_status_text: bool = False,
+        start_confirmation: tuple[str, Callable[[object], bool]] | None = None,
+    ) -> tuple[bool, str, int | None]:
+        """Send a command and also return its MAV_RESULT for behavior-specific decisions."""
         if self.master is None:
             error_msg = _("No flight controller connection available for command")
-            logging_error(error_msg)
-            return False, error_msg
+            logging_debug(error_msg)
+            return False, error_msg, None
 
         try:
+            message_types = self._prepare_command_receive(capture_status_text, start_confirmation)
+            status_assembler = StatusTextAssembler()
+            start_confirmed = False
             # Send the command
             self.master.mav.command_long_send(  # pyright: ignore[reportAttributeAccessIssue]
                 self.master.target_system,  # pyright: ignore[reportAttributeAccessIssue]
@@ -155,29 +226,64 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
                 param7,
             )
 
-            # Wait for acknowledgment
+            # Wait for acknowledgment, retaining the receive window briefly after a
+            # failed ACK because ArduPilot queues STATUSTEXT separately.
             start_time = time_time()
-            while time_time() - start_time < timeout:
+            status_texts: list[str] = []
+            failure: _CommandAckFailure | None = None
+            while True:
+                now = time_time()
+                if failure is not None and now >= failure.grace_deadline:
+                    error_msg = self._command_error_with_status(failure.error_message, status_texts)
+                    logging_error(error_msg)
+                    return False, error_msg, failure.result
+                if failure is None and now - start_time >= timeout:
+                    break
                 msg = self.master.recv_match(  # pyright: ignore[reportAttributeAccessIssue]
-                    type="COMMAND_ACK", blocking=False
+                    type=message_types,
+                    blocking=False,
                 )
-                if msg and msg.command == command:
+                if msg is None:
+                    time_sleep(0.1)  # Sleep briefly to reduce CPU usage
+                    continue
+                get_message_type = getattr(msg, "get_type", None)
+                message_type = get_message_type() if callable(get_message_type) else None
+                if start_confirmation is not None and message_type == start_confirmation[0]:
+                    if failure is None and start_confirmation[1](msg):
+                        start_confirmed = True
+                    continue
+                if message_type == "STATUSTEXT":
+                    status_text = status_assembler.assemble(msg)
+                    if status_text and capture_status_text:
+                        status_texts.append(status_text)
+                    continue
+                if getattr(msg, "command", None) == command:
+                    if failure is not None:
+                        continue
                     # Map result codes to error messages
                     result_messages = {
-                        mavutil.mavlink.MAV_RESULT_ACCEPTED: ("", True),
-                        mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED: (_("Command temporarily rejected"), False),
-                        mavutil.mavlink.MAV_RESULT_DENIED: (_("Command denied"), False),
-                        mavutil.mavlink.MAV_RESULT_UNSUPPORTED: (_("Command unsupported"), False),
-                        mavutil.mavlink.MAV_RESULT_FAILED: (_("Command failed"), False),
+                        mavlink.MAV_RESULT_ACCEPTED: ("", True),
+                        mavlink.MAV_RESULT_TEMPORARILY_REJECTED: (_("Command temporarily rejected"), False),
+                        mavlink.MAV_RESULT_DENIED: (_("Command denied"), False),
+                        mavlink.MAV_RESULT_UNSUPPORTED: (_("Command unsupported"), False),
+                        mavlink.MAV_RESULT_FAILED: (_("Command failed"), False),
                     }
 
                     if msg.result in result_messages:
                         error_msg, success = result_messages[msg.result]
-                        if not success:
+                        if success:
+                            return True, error_msg, int(msg.result)
+                        if not capture_status_text:
                             logging_error(error_msg)
-                        return success, error_msg
+                            return False, error_msg, int(msg.result)
+                        failure = _CommandAckFailure(
+                            result=int(msg.result),
+                            error_message=error_msg,
+                            grace_deadline=time_time() + self.COMMAND_ACK_STATUS_TEXT_GRACE,
+                        )
+                        continue
 
-                    if msg.result == mavutil.mavlink.MAV_RESULT_IN_PROGRESS:
+                    if msg.result == mavlink.MAV_RESULT_IN_PROGRESS:
                         # Command is still in progress, continue waiting
                         if msg.progress is not None and msg.progress > 0:
                             logging_debug(_("Command in progress: %(progress)d%%"), {"progress": msg.progress})
@@ -185,20 +291,90 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
 
                     # Unknown result code
                     error_msg = _("Command acknowledgment with unknown result: %(result)d") % {"result": msg.result}
-                    logging_error(error_msg)
-                    return False, error_msg
+                    if not capture_status_text:
+                        logging_error(error_msg)
+                        return False, error_msg, int(msg.result)
+                    failure = _CommandAckFailure(
+                        result=int(msg.result),
+                        error_message=error_msg,
+                        grace_deadline=time_time() + self.COMMAND_ACK_STATUS_TEXT_GRACE,
+                    )
+                    continue
 
                 time_sleep(0.1)  # Sleep briefly to reduce CPU usage
 
             # Timeout occurred
+            if start_confirmed:
+                logging_debug("Command start confirmed by telemetry after acknowledgment timeout")
+                return True, "", mavlink.MAV_RESULT_ACCEPTED
             error_msg = _("Command acknowledgment timeout after %(timeout).1f seconds") % {"timeout": timeout}
-            logging_error(error_msg)
-            return False, error_msg
-
+            error_msg = self._command_error_with_status(error_msg, status_texts)
+            logging_debug(error_msg)
+            return False, error_msg, None
         except Exception as e:  # pylint: disable=broad-exception-caught
             error_msg = _("Failed to send command: %(error)s") % {"error": str(e)}
-            logging_error(error_msg)
-            return False, error_msg
+            logging_debug(error_msg)
+            return False, error_msg, None
+
+    @staticmethod
+    def _command_error_with_status(error_msg: str, status_texts: list[str]) -> str:
+        """Preserve received controller diagnostics for rejected commands and missing ACKs."""
+        return f"{error_msg}: {'; '.join(status_texts)}" if status_texts else error_msg
+
+    @staticmethod
+    def _extract_status_text(msg: object) -> str:
+        """Decode and normalize a MAVLink STATUSTEXT payload."""
+        return decode_status_text(msg)
+
+    def _prepare_command_receive(
+        self, capture_status_text: bool, start_confirmation: tuple[str, Callable[[object], bool]] | None
+    ) -> str | list[str]:
+        """Choose the response filter once, draining old replies before a telemetry-confirmed start."""
+        message_types = ["COMMAND_ACK"]
+        if capture_status_text:
+            message_types.append("STATUSTEXT")
+        if start_confirmation is not None and self.master is not None:
+            message_types.append(start_confirmation[0])
+            for _packet in range(1000):
+                response = self.master.recv_match(  # pyright: ignore[reportAttributeAccessIssue]
+                    type=message_types, blocking=False
+                )
+                if response is None:
+                    break
+        return message_types if len(message_types) > 1 else message_types[0]
+
+    def _compass_calibration_started(self, message: object) -> bool:
+        """Only active calibration telemetry from the selected controller can confirm startup."""
+        master = self.master
+        if master is None:
+            return False
+        # PyMAVLink learns the system from HEARTBEAT but leaves target_component at
+        # zero (broadcast). Discovery metadata identifies the selected autopilot.
+        info = self._connection_manager.info
+        system_id = getattr(info, "system_id", None)
+        component_id = getattr(info, "component_id", None)
+        target_system = int(system_id) if isinstance(system_id, str) and system_id else getattr(master, "target_system", None)
+        target_component = (
+            int(component_id) if isinstance(component_id, str) and component_id else getattr(master, "target_component", None)
+        )
+        source = message_source(message)
+        if source is None or not isinstance(target_system, int) or target_system <= 0 or source[0] != target_system:
+            return False
+        if isinstance(target_component, int) and target_component > 0 and source[1] != target_component:
+            return False
+        return getattr(message, "cal_status", None) in (
+            mavlink.MAG_CAL_WAITING_TO_START,
+            mavlink.MAG_CAL_RUNNING_STEP_ONE,
+            mavlink.MAG_CAL_RUNNING_STEP_TWO,
+        )
+
+    def reboot_to_bootloader(self) -> tuple[bool, str]:
+        """Request reboot into the bootloader and wait for its command acknowledgment."""
+        return self.send_command_and_wait_ack(
+            mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+            param1=3,
+            timeout=self.COMMAND_ACK_TIMEOUT,
+        )
 
     def reset_all_parameters_to_default(self) -> tuple[bool, str]:
         """
@@ -227,7 +403,7 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
         # https://mavlink.io/en/messages/common.html#MAV_CMD_PREFLIGHT_STORAGE
         # param1 = 2: Erase all parameters
         success, error_msg = self.send_command_and_wait_ack(
-            mavutil.mavlink.MAV_CMD_PREFLIGHT_STORAGE,
+            mavlink.MAV_CMD_PREFLIGHT_STORAGE,
             param1=2,  # Storage action (2 = erase all parameters)
             param2=0,  # Parameter reset (0 = No parameter reset)
             param3=0,  # Mission reset (not used)
@@ -248,7 +424,7 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
 
         return success, error_msg
 
-    def test_motor(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def test_motor(
         self, test_sequence_nr: int, motor_letters: str, motor_output_nr: int, throttle_percent: int, timeout_seconds: int
     ) -> tuple[bool, str]:
         """
@@ -274,9 +450,9 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
         # MAV_CMD_DO_MOTOR_TEST command
         # https://mavlink.io/en/messages/common.html#MAV_CMD_DO_MOTOR_TEST
         success, error_msg = self.send_command_and_wait_ack(
-            mavutil.mavlink.MAV_CMD_DO_MOTOR_TEST,
+            mavlink.MAV_CMD_DO_MOTOR_TEST,
             param1=test_sequence_nr + 1,  # motor test number, this is not the same as the output number!
-            param2=mavutil.mavlink.MOTOR_TEST_THROTTLE_PERCENT,  # throttle type
+            param2=mavlink.MOTOR_TEST_THROTTLE_PERCENT,  # throttle type
             param3=throttle_percent,  # throttle value
             param4=timeout_seconds,  # timeout
             param5=0,  # motor count (0=test just the motor specified in param1)
@@ -327,10 +503,10 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             self.master.mav.command_long_send(  # pyright: ignore[reportAttributeAccessIssue]
                 self.master.target_system,  # pyright: ignore[reportAttributeAccessIssue]
                 self.master.target_component,  # pyright: ignore[reportAttributeAccessIssue]
-                mavutil.mavlink.MAV_CMD_DO_MOTOR_TEST,
+                mavlink.MAV_CMD_DO_MOTOR_TEST,
                 0,  # confirmation
                 param1=i + 1,  # motor number (1-based)
-                param2=mavutil.mavlink.MOTOR_TEST_THROTTLE_PERCENT,  # throttle type
+                param2=mavlink.MOTOR_TEST_THROTTLE_PERCENT,  # throttle type
                 param3=throttle_percent,  # throttle value
                 param4=timeout_seconds,  # timeout
                 param5=0,  # motor count (0=all motors when param1=0)
@@ -365,13 +541,13 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
 
         # MAV_CMD_DO_MOTOR_TEST command for sequence test
         success, error_msg = self.send_command_and_wait_ack(
-            mavutil.mavlink.MAV_CMD_DO_MOTOR_TEST,
+            mavlink.MAV_CMD_DO_MOTOR_TEST,
             param1=start_motor,  # starting motor number (1-based)
-            param2=mavutil.mavlink.MOTOR_TEST_THROTTLE_PERCENT,  # throttle type
+            param2=mavlink.MOTOR_TEST_THROTTLE_PERCENT,  # throttle type
             param3=throttle_percent,  # throttle value
             param4=timeout_seconds,  # timeout per motor
             param5=motor_count,  # number of motors to test in sequence
-            param6=mavutil.mavlink.MOTOR_TEST_ORDER_SEQUENCE,  # test order (sequence)
+            param6=mavlink.MOTOR_TEST_ORDER_SEQUENCE,  # test order (sequence)
             param7=0,  # unused
         )
 
@@ -405,9 +581,9 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
 
         # Send motor test command with 0% throttle to stop all motors
         success, error_msg = self.send_command_and_wait_ack(
-            mavutil.mavlink.MAV_CMD_DO_MOTOR_TEST,
+            mavlink.MAV_CMD_DO_MOTOR_TEST,
             param1=0,  # motor number (0 = all motors)
-            param2=mavutil.mavlink.MOTOR_TEST_THROTTLE_PERCENT,  # throttle type
+            param2=mavlink.MOTOR_TEST_THROTTLE_PERCENT,  # throttle type
             param3=0,  # throttle value (0% = stop)
             param4=0,  # timeout (0 = immediate stop)
             param5=0,  # motor count (0 = all motors when param1=0)
@@ -444,10 +620,11 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             logging_error(error_msg)
             return False, error_msg
 
-        success, error_msg = self.send_command_and_wait_ack(
-            mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+        success, error_msg, _result = self._send_command_and_wait_ack_with_result(
+            mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
             param5=4.0,  # simple one-shot level calibration
-            timeout=30.0,
+            timeout=self.SIMPLE_ACCEL_CALIBRATION_ACK_TIMEOUT,
+            capture_status_text=True,
         )
         if success:
             logging_info(_("Simple accelerometer calibration completed successfully"))
@@ -470,16 +647,216 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             error_msg = _("No flight controller connection available for level calibration")
             logging_error(error_msg)
             return False, error_msg
+        if self._abandoned_level_deadline is not None:
+            self._drain_abandoned_level_messages()
+            if self._abandoned_level_deadline is not None:
+                return False, _("The previous level calibration is still finishing; try again shortly")
+        if self._level_calibration.active:
+            deadline = self._level_calibration.ack_deadline
+            if deadline is not None and time_time() < deadline:
+                return False, _("A level calibration is already in progress")
+            self._reset_level_calibration_state()
 
-        success, error_msg = self.send_command_and_wait_ack(
-            mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
-            param5=2.0,  # level trim / AHRS trim
-            timeout=15.0,
+        self._level_calibration.retry_count = 0
+        self._level_calibration.retry_at = None
+        self._level_calibration.failure = None
+        self._level_calibration.status_texts.clear()
+        return self._send_level_calibration_attempt()
+
+    def abort_level_calibration(self) -> None:
+        """Release an abandoned level calibration exchange when its view closes."""
+        if (
+            self._level_calibration.active
+            and self._level_calibration.failure is None
+            and self._level_calibration.retry_at is None
+        ):
+            self._abandoned_level_deadline = self._level_calibration.ack_deadline
+        self._reset_level_calibration_state()
+        self._drain_abandoned_level_messages()
+
+    def _drain_abandoned_level_messages(self) -> None:
+        """Discard queued old replies and wait for the old operation before starting another."""
+        if self.master is None:
+            self._abandoned_level_deadline = None
+            return
+        try:
+            while True:
+                msg = self.master.recv_match(  # pyright: ignore[reportAttributeAccessIssue]
+                    type=["COMMAND_ACK", "STATUSTEXT"], blocking=False
+                )
+                if msg is None:
+                    break
+                if (
+                    getattr(msg, "command", None) == mavlink.MAV_CMD_PREFLIGHT_CALIBRATION
+                    and msg.result != mavlink.MAV_RESULT_IN_PROGRESS
+                ):
+                    self._abandoned_level_deadline = None
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            logging_debug("Could not drain abandoned level calibration messages: %s", error)
+            self._abandoned_level_deadline = None
+        if self._abandoned_level_deadline is not None and time_time() >= self._abandoned_level_deadline:
+            self._abandoned_level_deadline = None
+
+    def _send_level_calibration_attempt(self) -> tuple[bool, str]:
+        """Send one level-trim attempt without waiting on the Tk event thread."""
+        if self.master is None:
+            return False, _("No flight controller connection available for level calibration")
+        try:
+            # pylint: disable=duplicate-code
+            self.master.mav.command_long_send(  # pyright: ignore[reportAttributeAccessIssue]
+                self.master.target_system,  # pyright: ignore[reportAttributeAccessIssue]
+                self.master.target_component,  # pyright: ignore[reportAttributeAccessIssue]
+                mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+                0,
+                0,
+                0,
+                0,
+                0,
+                2.0,
+                0,
+                0,
+            )
+            # pylint: enable=duplicate-code
+            self._level_calibration.active = True
+            self._level_calibration.ack_deadline = time_time() + self.LEVEL_CALIBRATION_ACK_TIMEOUT
+            return True, ""
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self._reset_level_calibration_state()
+            error_msg = _("Failed to send level calibration command: %(error)s") % {"error": str(e)}
+            logging_error(error_msg)
+            return False, error_msg
+
+    def poll_accel_calibration_level(self) -> tuple[bool, str] | None:
+        """Poll a level-trim attempt once; return None while the FC is still working."""
+        if not self._level_calibration.active:
+            return None
+        if self.master is None:
+            return self._finish_level_calibration(success=False, error_msg=_("No flight controller connection available"))
+        retry_handled, retry_result = self._send_due_level_calibration_retry(time_time())
+        if retry_handled:
+            return retry_result
+        try:
+            result = self._receive_level_calibration_ack()
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            error_msg = _("Failed to receive level calibration acknowledgment: %(error)s") % {"error": str(e)}
+            return self._finish_level_calibration(success=False, error_msg=error_msg)
+        if result is not None:
+            return result
+        return self._resolve_level_calibration_progress(time_time())
+
+    def _send_due_level_calibration_retry(self, now: float) -> tuple[bool, tuple[bool, str] | None]:
+        """Send a cooldown retry when due and report whether retry state handled this poll."""
+        retry_at = self._level_calibration.retry_at
+        if retry_at is None:
+            return False, None
+        if now < retry_at:
+            return True, None
+        self._level_calibration.retry_at = None
+        self._level_calibration.failure = None
+        self._level_calibration.status_texts.clear()
+        success, error_msg = self._send_level_calibration_attempt()
+        if not success:
+            return True, self._finish_level_calibration(success=False, error_msg=error_msg)
+        return True, None
+
+    def _receive_level_calibration_ack(self) -> tuple[bool, str] | None:
+        """Drain queued level-calibration ACK/STATUSTEXT messages once."""
+        if self.master is None:
+            return self._finish_level_calibration(success=False, error_msg=_("No flight controller connection available"))
+        while True:
+            msg = self.master.recv_match(  # pyright: ignore[reportAttributeAccessIssue]
+                type=["COMMAND_ACK", "STATUSTEXT"], blocking=False
+            )
+            if msg is None:
+                return None
+            message_type = getattr(msg, "get_type", None)
+            if callable(message_type) and message_type() == "STATUSTEXT":
+                raw_text = msg.text
+                status_text = (
+                    (raw_text.decode("utf-8", errors="replace") if isinstance(raw_text, bytes) else str(raw_text))
+                    .rstrip("\x00")
+                    .strip()
+                )
+                if status_text:
+                    self._level_calibration.status_texts.append(status_text)
+                continue
+            if getattr(msg, "command", None) != mavlink.MAV_CMD_PREFLIGHT_CALIBRATION:
+                continue
+            result = int(msg.result)
+            if result == mavlink.MAV_RESULT_ACCEPTED:
+                logging_info(_("Level calibration completed successfully"))
+                return self._finish_level_calibration(success=True, error_msg="")
+            if result == mavlink.MAV_RESULT_IN_PROGRESS or self._level_calibration.failure is not None:
+                continue
+            error_msg = self._level_calibration_result_message(result)
+            self._level_calibration.failure = _CommandAckFailure(
+                result=result,
+                error_message=error_msg,
+                grace_deadline=time_time() + self.COMMAND_ACK_STATUS_TEXT_GRACE,
+            )
+
+    @staticmethod
+    def _level_calibration_result_message(result: int) -> str:
+        """Translate a terminal MAV_RESULT returned for level calibration."""
+        result_messages = {
+            mavlink.MAV_RESULT_TEMPORARILY_REJECTED: _("Command temporarily rejected"),
+            mavlink.MAV_RESULT_DENIED: _("Command denied"),
+            mavlink.MAV_RESULT_UNSUPPORTED: _("Command unsupported"),
+            mavlink.MAV_RESULT_FAILED: _("Command failed"),
+        }
+        return result_messages.get(
+            result,
+            _("Command acknowledgment with unknown result: %(result)d") % {"result": result},
         )
-        if success:
-            logging_info(_("Level calibration completed successfully"))
-        else:
+
+    def _resolve_level_calibration_progress(self, now: float) -> tuple[bool, str] | None:
+        """Resolve a failed ACK after its text grace window, or return a timeout."""
+        failure = self._level_calibration.failure
+        if failure is not None:
+            if now < failure.grace_deadline:
+                return None
+            if (
+                failure.result == mavlink.MAV_RESULT_TEMPORARILY_REJECTED
+                and self._level_calibration.retry_count < self.LEVEL_CALIBRATION_MAX_RETRIES
+            ):
+                self._level_calibration.retry_count += 1
+                self._level_calibration.retry_at = now + self.LEVEL_CALIBRATION_RETRY_DELAY
+                logging_info(_("Level calibration was temporarily rejected; retrying after the calibration cooldown."))
+                return None
+            error_msg = self._level_calibration_error_with_status(failure.error_message)
+            return self._finish_level_calibration(success=False, error_msg=error_msg)
+
+        deadline = self._level_calibration.ack_deadline
+        if deadline is not None and now >= deadline:
+            self._abandoned_level_deadline = now + self.LEVEL_CALIBRATION_LATE_ACK_GUARD
+            error_msg = _("Command acknowledgment timeout after %(timeout).1f seconds") % {
+                "timeout": self.LEVEL_CALIBRATION_ACK_TIMEOUT
+            }
+            error_msg = self._level_calibration_error_with_status(error_msg)
+            return self._finish_level_calibration(success=False, error_msg=error_msg)
+        return None
+
+    def _level_calibration_error_with_status(self, error_msg: str) -> str:
+        """Append any STATUSTEXT messages received for the current level attempt."""
+        return (
+            f"{error_msg}: {'; '.join(self._level_calibration.status_texts)}"
+            if self._level_calibration.status_texts
+            else error_msg
+        )
+
+    def _reset_level_calibration_state(self) -> None:
+        """Clear all in-memory state for the current level-trim operation."""
+        self._level_calibration.active = False
+        self._level_calibration.ack_deadline = None
+        self._level_calibration.retry_at = None
+        self._level_calibration.failure = None
+        self._level_calibration.status_texts.clear()
+
+    def _finish_level_calibration(self, *, success: bool, error_msg: str) -> tuple[bool, str]:
+        """Finish and reset the current level-trim operation."""
+        if not success:
             logging_error(_("Level calibration failed: %(error)s"), {"error": error_msg})
+        self._reset_level_calibration_state()
         return success, error_msg
 
     def send_accel_calibration_full_start(self) -> tuple[bool, str]:
@@ -505,7 +882,7 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             self.master.mav.command_long_send(  # pyright: ignore[reportAttributeAccessIssue]
                 self.master.target_system,  # pyright: ignore[reportAttributeAccessIssue]
                 self.master.target_component,  # pyright: ignore[reportAttributeAccessIssue]
-                mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+                mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
                 # pylint: disable=duplicate-code
                 0,  # confirmation
                 0,  # param1: gyro (0 = no gyro cal)
@@ -552,7 +929,7 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
                 )
                 if msg is None:
                     break
-                if msg.command == mavutil.mavlink.MAV_CMD_ACCELCAL_VEHICLE_POS:
+                if msg.command == mavlink.MAV_CMD_ACCELCAL_VEHICLE_POS:
                     latest_pos = int(msg.param1)
 
             if latest_pos is None:
@@ -594,7 +971,7 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             self.master.mav.command_long_send(  # pyright: ignore[reportAttributeAccessIssue]
                 self.master.target_system,  # pyright: ignore[reportAttributeAccessIssue]
                 self.master.target_component,  # pyright: ignore[reportAttributeAccessIssue]
-                mavutil.mavlink.MAV_CMD_ACCELCAL_VEHICLE_POS,
+                mavlink.MAV_CMD_ACCELCAL_VEHICLE_POS,
                 0,  # confirmation
                 float(position),  # param1: position enum value
                 # pylint: disable=duplicate-code
@@ -610,46 +987,6 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             return True, ""
         except Exception as e:  # pylint: disable=broad-exception-caught
             error_msg = _("Failed to send position confirmation: %(error)s") % {"error": str(e)}
-            logging_error(error_msg)
-            return False, error_msg
-
-    def cancel_accel_calibration(self) -> tuple[bool, str]:
-        """
-        Cancel any ongoing accelerometer calibration.
-
-        Sends MAV_CMD_PREFLIGHT_CALIBRATION with all parameters set to 0,
-        which signals ArduPilot to abort an in-progress calibration.
-
-        Returns:
-            tuple[bool, str]: (success, error_message)
-
-        """
-        if self.master is None:
-            error_msg = _("No flight controller connection available to cancel accelerometer calibration")
-            logging_error(error_msg)
-            return False, error_msg
-
-        try:
-            self.master.mav.command_long_send(  # pyright: ignore[reportAttributeAccessIssue]
-                self.master.target_system,  # pyright: ignore[reportAttributeAccessIssue]
-                self.master.target_component,  # pyright: ignore[reportAttributeAccessIssue]
-                mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
-                # pylint: disable=duplicate-code
-                0,  # confirmation
-                0,  # param1: gyro
-                0,  # param2: mag
-                0,  # param3: pressure
-                0,  # param4: radio
-                0,  # param5: accel = 0 → cancel / no calibration
-                0,  # param6: reserved
-                0,  # param7: reserved
-                # pylint: enable=duplicate-code
-            )
-            self._last_accel_cal_vehicle_pos = None
-            logging_info(_("Accelerometer calibration cancel command sent"))
-            return True, ""
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            error_msg = _("Failed to send accelerometer calibration cancel command: %(error)s") % {"error": str(e)}
             logging_error(error_msg)
             return False, error_msg
 
@@ -701,8 +1038,8 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             return False, error_msg
 
         success, error_msg = self.send_command_and_wait_ack(
-            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-            param1=float(mavutil.mavlink.MAVLINK_MSG_ID_SCALED_IMU),
+            mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            param1=float(mavlink.MAVLINK_MSG_ID_SCALED_IMU),
             param2=float(interval_microseconds),
             timeout=self.COMMAND_ACK_TIMEOUT_BATTERY,
         )
@@ -714,6 +1051,20 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
         else:
             logging_debug(_("SCALED_IMU stream request failed: %(error)s"), {"error": error_msg})
         return success, error_msg
+
+    def request_rc_receiver_messages(self, interval_microseconds: int = 200_000) -> tuple[bool, str]:
+        """Request channel and receiver status streams; zero restores firmware defaults."""
+        errors = []
+        for message_id in (mavlink.MAVLINK_MSG_ID_RC_CHANNELS, mavlink.MAVLINK_MSG_ID_SYS_STATUS):
+            success, error = self.send_command_and_wait_ack(
+                mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                param1=float(message_id),
+                param2=float(interval_microseconds),
+                timeout=self.COMMAND_ACK_TIMEOUT_BATTERY,
+            )
+            if not success:
+                errors.append(error)
+        return not errors, "; ".join(errors)
 
     def request_periodic_battery_status(self, interval_microseconds: int = 1000000) -> tuple[bool, str]:
         """
@@ -736,8 +1087,8 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
         request_succeeded = False
         for attempt in range(self.BATTERY_STATUS_REQUEST_ATTEMPTS):
             success, error_msg = self.send_command_and_wait_ack(
-                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                param1=mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS,  # message ID (BATTERY_STATUS)
+                mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                param1=mavlink.MAVLINK_MSG_ID_BATTERY_STATUS,  # message ID (BATTERY_STATUS)
                 param2=interval_microseconds,  # interval in microseconds
                 param3=0,
                 param4=0,
@@ -772,51 +1123,48 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
         time_sleep(self.BATTERY_STATUS_ACTIVATION_WAIT)
         return True, ""
 
-    def get_battery_status(self) -> tuple[tuple[float, float] | None, str]:
-        """
-        Get current battery voltage and current.
-
-        Returns:
-            tuple[Union[tuple[float, float], None], str]: ((voltage, current), error_message) -
-                                                         voltage and current in volts and amps,
-                                                         or None if not available with error message
-
-        """
+    def get_battery_statuses(self) -> tuple[dict[int, tuple[float, float]] | None, str]:
+        """Get recent battery voltage and current readings, keyed by MAVLink battery ID."""
+        if self.master is not self._battery_status_connection:
+            self._last_battery_statuses.clear()
+            self._battery_status_connection = self.master
         if not self._params_manager.fc_parameters or self.master is None:
-            error_msg = _("No flight controller connection or parameters available")
-            return None, error_msg
-
-        # Check if battery monitoring is enabled
+            return None, _("No flight controller connection or parameters available")
         if not self.is_battery_monitoring_enabled():
-            error_msg = _("Battery monitoring is not enabled (BATT_MONITOR=0)")
-            return None, error_msg
+            self._last_battery_statuses.clear()
+            return None, _("Battery monitoring is not enabled")
 
         try:
-            # Try to get real telemetry data
-            battery_status = self.master.recv_match(  # pyright: ignore[reportAttributeAccessIssue]
+            while battery_status := self.master.recv_match(  # pyright: ignore[reportAttributeAccessIssue]
                 type="BATTERY_STATUS", blocking=False, timeout=self.BATTERY_STATUS_TIMEOUT
-            )
-            if battery_status:
-                # Convert from millivolts to volts, and centiamps to amps using pure business logic
+            ):
+                battery_id = int(battery_status.id)
+                voltages = cast("Sequence[int]", battery_status.voltages)
+                # Extension fields are absent from MAVLink 1 messages.
+                voltages_ext = cast("Sequence[int]", getattr(battery_status, "voltages_ext", ()))
                 voltage, current = convert_battery_telemetry_units(
-                    battery_status.voltages[0],
+                    sum(value for value in voltages if value != 65535)
+                    + sum(value for value in voltages_ext if value not in (0, 65535))
+                    if voltages[0] != 65535
+                    else -1,
                     battery_status.current_battery,
                 )
-                self._last_battery_status = (voltage, current)
-                self._last_battery_message_time = time_time()
-                return (voltage, current), ""
+                self._last_battery_statuses[battery_id] = (voltage, current, time_time())
         except Exception as e:  # pylint: disable=broad-exception-caught
-            logging_debug(_("Failed to get battery status from telemetry: %(error)s"), {"error": str(e)})
+            logging_debug(_("Failed to get battery statuses from telemetry: %(error)s"), {"error": str(e)})
 
-        if (
-            self._last_battery_message_time
-            and (time_time() - self._last_battery_message_time) < self.BATTERY_STATUS_CACHE_TIME
-        ):
-            # If we received a battery message recently, don't log an error
-            return self._last_battery_status, ""
-        self._last_battery_status = None
-        error_msg = _("Battery status not available from telemetry")
-        return None, error_msg
+        now = time_time()
+        enabled_battery_ids = get_enabled_battery_ids(self._params_manager.fc_parameters)
+        self._last_battery_statuses = {
+            battery_id: status
+            for battery_id, status in self._last_battery_statuses.items()
+            if battery_id in enabled_battery_ids and now - status[2] < self.BATTERY_STATUS_CACHE_TIME
+        }
+        if self._last_battery_statuses:
+            return {
+                battery_id: (voltage, current) for battery_id, (voltage, current, _time) in self._last_battery_statuses.items()
+            }, ""
+        return None, _("Battery status not available from telemetry")
 
     def get_voltage_thresholds(self) -> tuple[float, float]:
         """
@@ -833,7 +1181,7 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
         Check if battery monitoring is enabled.
 
         Returns:
-            bool: True if BATT_MONITOR != 0, False otherwise
+            bool: True if any battery monitor is enabled, False otherwise
 
         """
         return is_battery_monitoring_enabled(self._params_manager.fc_parameters)
@@ -875,8 +1223,8 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
                 "p3": 1,
             },
         )
-        success, error_msg = self.send_command_and_wait_ack(
-            mavutil.mavlink.MAV_CMD_DO_START_MAG_CAL,
+        success, error_msg, _result_code = self._send_command_and_wait_ack_with_result(
+            mavlink.MAV_CMD_DO_START_MAG_CAL,
             param1=0,  # All compasses
             param2=1,  # Retry
             param3=1,  # Autosave
@@ -885,6 +1233,8 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             param6=0,  # unused
             param7=0,  # unused
             timeout=5.0,
+            capture_status_text=True,
+            start_confirmation=("MAG_CAL_PROGRESS", self._compass_calibration_started),
         )
         if success:
             logging_info(_("Compass calibration start command confirmed"))
@@ -907,7 +1257,7 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
             return False, error_msg
 
         success, error_msg = self.send_command_and_wait_ack(
-            mavutil.mavlink.MAV_CMD_DO_CANCEL_MAG_CAL,
+            mavlink.MAV_CMD_DO_CANCEL_MAG_CAL,
             param1=0,  # Cancel all
             param2=0,  # unused
             param3=0,  # unused
@@ -987,7 +1337,7 @@ class FlightControllerCommands:  # pylint: disable=too-many-public-methods
                     continue
 
                 if msg_type == "STATUSTEXT":
-                    status_text = getattr(msg, "text", "")
+                    status_text = self._extract_status_text(msg)
                     status_severity = getattr(msg, "severity", None)
                     compass_match = re.search(r"Mag\((\d+)\)", status_text)
                     compass_id = int(compass_match.group(1)) if compass_match else None

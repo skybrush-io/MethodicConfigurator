@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+
+"""
+Behavior-driven tests for the servo-output Tkinter plugin.
+
+This file is part of ArduPilot Methodic Configurator.
+https://github.com/ArduPilot/MethodicConfigurator
+
+SPDX-FileCopyrightText: 2026 Amilcar do Carmo Lucas
+
+SPDX-License-Identifier: GPL-3.0-or-later
+"""
+
+from collections.abc import Generator
+from tkinter import ttk
+from types import MethodType, SimpleNamespace
+from typing import TYPE_CHECKING, cast
+from unittest.mock import MagicMock
+
+import pytest
+from pytest_mock import MockerFixture
+
+from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
+from ardupilot_methodic_configurator.plugins.data_model_servo_out import ServoOutDataModel, ServoOutRecommendationStatus
+from ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out import ServoOutView, register_servo_out_plugin
+from ardupilot_methodic_configurator.plugins.plugin_constants import PLUGIN_SERVO_OUT
+from ardupilot_methodic_configurator.plugins.plugin_factory import PluginFactory, PluginModelContext
+
+if TYPE_CHECKING:
+    from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
+    from ardupilot_methodic_configurator.data_model_parameter_editor import ParameterEditor
+
+# pytest injects fixtures by matching the test function parameter name.
+# pylint: disable=redefined-outer-name,protected-access
+
+
+@pytest.fixture
+def servo_out_view(tk_root, mocker) -> Generator[SimpleNamespace, None, None]:
+    """Provide a real servo-output view with modal dialogs isolated."""
+    model = MagicMock(spec=ServoOutDataModel)
+    model.get_recommendations.return_value = (
+        {"SERVO1_FUNCTION": 33},
+        "Recommended 1 motor output assignment.",
+        ServoOutRecommendationStatus.RECOMMENDATIONS_AVAILABLE,
+    )
+    showinfo = mocker.patch("ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.showinfo")
+    showerror = mocker.patch("ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.showerror")
+    parent = ttk.Frame(tk_root)
+    parameter_editor_table = MagicMock()
+    try:
+        yield SimpleNamespace(
+            view=ServoOutView(
+                parent,
+                model,
+                SimpleNamespace(
+                    root=tk_root,
+                    parameter_editor_table=parameter_editor_table,
+                    show_only_differences=SimpleNamespace(get=lambda: False),
+                    gui_complexity="simple",
+                ),
+            ),
+            model=model,
+            showinfo=showinfo,
+            showerror=showerror,
+            parameter_editor_table=parameter_editor_table,
+        )
+    finally:
+        parent.destroy()
+
+
+class TestServoOutputView:
+    """Test user feedback while applying servo-output recommendations."""
+
+    def test_connection_recovery_can_pause_and_resume_the_view(self, servo_out_view: SimpleNamespace) -> None:
+        """GIVEN a servo output view, WHEN recovery pauses it, THEN it can resume with its recommendation intact."""
+        view = servo_out_view.view
+        summary = view._summary.get()
+        editor = SimpleNamespace(current_plugin_view=view, root=view.winfo_toplevel())
+        editor._pause_plugin_receiver = MethodType(ParameterEditorWindow._pause_plugin_receiver, editor)
+
+        resume = ParameterEditorWindow._pause_connection_plugin(editor)
+
+        assert callable(resume)
+        resume()
+        assert view._summary.get() == summary
+
+    def test_registration_allows_offline_servo_output_editing(self, mocker) -> None:
+        """The real registration must mark this plugin as usable without an FC."""
+        factory = PluginFactory()
+        mocker.patch("ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.plugin_factory", factory)
+
+        register_servo_out_plugin()
+
+        assert factory.requires_flight_controller(PLUGIN_SERVO_OUT) is False
+
+    def test_activation_refreshes_summary_after_parameter_edits(self, servo_out_view) -> None:
+        """Returning to the step must show recommendations based on current parameters."""
+        servo_out_view.model.get_recommendations.return_value = (
+            {"SERVO2_FUNCTION": 34},
+            "Recommended 1 motor output assignment.",
+            ServoOutRecommendationStatus.RECOMMENDATIONS_AVAILABLE,
+        )
+
+        servo_out_view.view.on_activate()
+
+        assert "SERVO2_FUNCTION=34" in servo_out_view.view._summary.get()
+
+    def test_user_sees_applied_assignments_after_accepting_recommendation(self, servo_out_view) -> None:
+        """
+        Applied recommendations are acknowledged with a success dialog.
+
+        GIVEN: The model can apply a proposed motor assignment
+        WHEN: The user selects Apply Recommended Motor Outputs
+        THEN: The view shows a success dialog and refreshes the recommendation summary
+        """
+        # Arrange (Given)
+        servo_out_view.model.apply_recommendations.return_value = (
+            ["SERVO1_FUNCTION"],
+            "Applied 1 motor output assignment.",
+            ServoOutRecommendationStatus.APPLIED,
+        )
+
+        # Act (When)
+        servo_out_view.view._on_apply()
+
+        # Assert (Then)
+        servo_out_view.showinfo.assert_called_once_with("Servo Output Functions", "Applied 1 motor output assignment.")
+        servo_out_view.showerror.assert_not_called()
+        servo_out_view.parameter_editor_table.repopulate_table.assert_called_once_with(
+            show_only_differences=False, gui_complexity="simple"
+        )
+        assert "SERVO1_FUNCTION=33" in servo_out_view.view._summary.get()
+
+    def test_user_sees_reason_when_no_recommendation_can_be_applied(self, servo_out_view) -> None:
+        """
+        An unapplied recommendation provides an actionable error.
+
+        GIVEN: The model cannot apply any motor assignments
+        WHEN: The user selects Apply Recommended Motor Outputs
+        THEN: The view shows the model's reason without a success dialog
+        """
+        # Arrange (Given)
+        servo_out_view.model.apply_recommendations.return_value = (
+            [],
+            "No servo output assignments could be applied.",
+            ServoOutRecommendationStatus.ERROR,
+        )
+
+        # Act (When)
+        servo_out_view.view._on_apply()
+
+        # Assert (Then)
+        servo_out_view.showerror.assert_called_once_with(
+            "Servo Output Functions", "No servo output assignments could be applied."
+        )
+        servo_out_view.showinfo.assert_not_called()
+
+    def test_user_sees_information_when_outputs_are_already_complete(self, servo_out_view) -> None:
+        """
+        An already-complete output mapping is not shown as an error.
+
+        GIVEN: The model reports that all motor outputs are already assigned
+        WHEN: The user selects Apply Recommended Motor Outputs
+        THEN: The view shows an informational dialog instead of an error
+        """
+        # Arrange (Given)
+        servo_out_view.model.apply_recommendations.return_value = (
+            [],
+            "All motor output functions are already assigned; no changes are needed.",
+            ServoOutRecommendationStatus.NO_CHANGES,
+        )
+
+        # Act (When)
+        servo_out_view.view._on_apply()
+
+        # Assert (Then)
+        servo_out_view.showinfo.assert_called_once_with(
+            "Servo Output Functions", "All motor output functions are already assigned; no changes are needed."
+        )
+        servo_out_view.showerror.assert_not_called()
+
+    def test_user_sees_information_when_a_motor_is_not_assigned(self, servo_out_view) -> None:
+        """A homeless-motor warning is informational because this view cannot route it."""
+        message = "Motor1 is not assigned to any output."
+        servo_out_view.model.apply_recommendations.return_value = (
+            [],
+            message,
+            ServoOutRecommendationStatus.UNASSIGNED_MOTORS,
+        )
+
+        servo_out_view.view._on_apply()
+
+        servo_out_view.showinfo.assert_called_once_with("Servo Output Functions", message)
+        servo_out_view.showerror.assert_not_called()
+
+    def test_unassigned_motor_message_is_informational_without_tk(self, mocker) -> None:
+        """The dialog classification remains testable when a display is unavailable."""
+        message = "Motor1 is not assigned to any output."
+        model = MagicMock(spec=ServoOutDataModel)
+        model.apply_recommendations.return_value = ([], message, ServoOutRecommendationStatus.UNASSIGNED_MOTORS)
+        view = ServoOutView.__new__(ServoOutView)
+        view.model = model
+        mocker.patch.object(ServoOutView, "_refresh_summary")
+        showinfo = mocker.patch("ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.showinfo")
+        showerror = mocker.patch("ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.showerror")
+
+        view._on_apply()
+
+        showinfo.assert_called_once_with("Servo Output Functions", message)
+        showerror.assert_not_called()
+
+    def test_apply_failure_with_unassigned_warning_is_still_an_error(self, mocker) -> None:
+        """A failed apply is not hidden by a trailing unassigned-motor warning."""
+        message = "No servo output assignments could be applied. Motor1 is not assigned to any output."
+        model = MagicMock(spec=ServoOutDataModel)
+        model.apply_recommendations.return_value = ([], message, ServoOutRecommendationStatus.ERROR)
+        view = ServoOutView.__new__(ServoOutView)
+        view.model = model
+        mocker.patch.object(ServoOutView, "_refresh_summary")
+        showinfo = mocker.patch("ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.showinfo")
+        showerror = mocker.patch("ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.showerror")
+
+        view._on_apply()
+
+        showerror.assert_called_once_with("Servo Output Functions", message)
+        showinfo.assert_not_called()
+
+
+def test_registered_servo_plugin_offers_offline_motor_assignments(
+    servo_out_view: SimpleNamespace, mocker: MockerFixture
+) -> None:
+    """
+    Build a usable offline servo-output view through the application registry.
+
+    GIVEN: A Main Out quad template and no flight-controller connection
+    WHEN: The application creates the registered plugin model and view
+    THEN: Motor assignments are shown when the plugin is activated
+    """
+    # Given: Only application dependencies and registry access are isolated.
+    factory = PluginFactory()
+    mocker.patch("ardupilot_methodic_configurator.plugins.frontend_tkinter_servo_out.plugin_factory", factory)
+    filesystem = SimpleNamespace(
+        vehicle_components_fs=SimpleNamespace(data={"Components": {"ESC": {"FC->ESC Connection": {"Type": "Main Out"}}}})
+    )
+    editor = SimpleNamespace(fc_parameters={"FRAME_CLASS": 1}, current_step_parameters={})
+    context = PluginModelContext(MagicMock(master=None), cast("LocalFilesystem", filesystem), cast("ParameterEditor", editor))
+    # When: Create the real model and view through their registrations.
+    register_servo_out_plugin()
+    model = factory.create_model(PLUGIN_SERVO_OUT, context)
+    view = factory.create(PLUGIN_SERVO_OUT, servo_out_view.view.master, model, servo_out_view.view.base_window)
+    # Then: Offline recommendations are usable and visible.
+    assert isinstance(view, ServoOutView)
+    try:
+        view.on_activate()
+        assert "SERVO1_FUNCTION=33" in view._summary.get()
+        assert not factory.requires_flight_controller(PLUGIN_SERVO_OUT)
+    finally:
+        view.destroy()

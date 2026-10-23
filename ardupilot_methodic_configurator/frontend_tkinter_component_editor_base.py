@@ -14,13 +14,13 @@ import tkinter as tk
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
+from enum import Enum, auto
 
 # from logging import debug as logging_debug
 from logging import basicConfig as logging_basicConfig
-from logging import getLevelName as logging_getLevelName
 from logging import info as logging_info
 from platform import system as platform_system
-from sys import exit as sys_exit
 from tkinter import messagebox, ttk
 from typing import Any, cast
 from unittest.mock import patch
@@ -43,6 +43,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_windows import
     confirm_component_properties,
     display_component_editor_usage_popup,
 )
+from ardupilot_methodic_configurator.macos_utilities import is_macos_sequoia_or_older
 
 
 def argument_parser() -> Namespace:
@@ -93,6 +94,21 @@ class _EmbeddedScrollFrameStub:  # pylint: disable=too-few-public-methods
         """No-op: the embedded stub has no canvas to scroll."""
 
 
+class ComponentEditorCloseAction(Enum):
+    """Describe why the standalone component editor's event loop ended."""
+
+    CONTINUE_WORKFLOW = auto()
+    QUIT_WORKFLOW = auto()
+
+
+@dataclass(frozen=True)
+class ComponentEditorCloseResult:
+    """Outcome reported to the application after the component window closes."""
+
+    action: ComponentEditorCloseAction = ComponentEditorCloseAction.CONTINUE_WORKFLOW
+    exit_code: int = 0
+
+
 class ComponentEditorWindowBase(BaseWindow):  # pylint: disable=too-many-instance-attributes
     """
     A class for editing JSON files in the ArduPilot methodic configurator.
@@ -129,6 +145,7 @@ class ComponentEditorWindowBase(BaseWindow):  # pylint: disable=too-many-instanc
         """
         self._embedded_parent_frame = embedded_parent_frame
         self._on_component_change = on_component_change
+        self.close_result = ComponentEditorCloseResult()
 
         if embedded_parent_frame is None:
             # Standalone window mode — full BaseWindow initialisation
@@ -314,7 +331,8 @@ class ComponentEditorWindowBase(BaseWindow):  # pylint: disable=too-many-instanc
         self.populate_frames()
 
         # Update the UI
-        self.scroll_frame.view_port.update_idletasks()
+        if not is_macos_sequoia_or_older():
+            self.scroll_frame.view_port.update_idletasks()
 
     def _add_vehicle_image(self, parent: ttk.Frame) -> None:
         """Add the vehicle image to the parent frame."""
@@ -431,7 +449,10 @@ class ComponentEditorWindowBase(BaseWindow):  # pylint: disable=too-many-instanc
             components = self.data_model.get_all_components()
             for i, (key, value) in enumerate(components.items(), 1):
                 self.add_widget(self.scroll_frame.view_port, key, value, [])
-                if i % 5 == 0:  # yield to the event loop periodically to keep the UI responsive
+                if i % 5 == 0 and not is_macos_sequoia_or_older():
+                    # Yield periodically on platforms where Tk can safely process
+                    # idle callbacks while widgets are being built. Tcl/Tk 9 on
+                    # macOS can segfault during this re-entrant rendering path.
                     self.scroll_frame.view_port.update_idletasks()
         finally:
             self._populating = False
@@ -461,7 +482,8 @@ class ComponentEditorWindowBase(BaseWindow):  # pylint: disable=too-many-instanc
                     self._add_widget(self.scroll_frame.view_port, sub_key, sub_value, [component_name])
             else:
                 self.add_widget(self.scroll_frame.view_port, component_name, component_data, [])
-            self.scroll_frame.view_port.update_idletasks()
+            if not is_macos_sequoia_or_older():
+                self.scroll_frame.view_port.update_idletasks()
         finally:
             self._populating = False
         self.scroll_frame.scroll_to_top()
@@ -701,9 +723,9 @@ class ComponentEditorWindowBase(BaseWindow):  # pylint: disable=too-many-instanc
                     show_error_message(_("Error"), err_msg)
                     ret = True
             logging_info(_("Changes discarded. No data saved."))
-        # Close the window and exit. ret indicates if there was an error earlier (e.g. cleanup failed).
+        # Report this close decision; the application chooses whether to end the workflow.
         self.root.destroy()
-        sys_exit(int(ret))
+        self.close_result = ComponentEditorCloseResult(ComponentEditorCloseAction.QUIT_WORKFLOW, int(ret))
 
     # This function will be overwritten in child classes
     def add_entry_or_combobox(
@@ -720,15 +742,7 @@ class ComponentEditorWindowBase(BaseWindow):  # pylint: disable=too-many-instanc
 
     @staticmethod
     def add_argparse_arguments(parser: ArgumentParser) -> ArgumentParser:
-        """Add component editor specific arguments to the parser."""
-        parser.add_argument(
-            "--skip-component-editor",
-            action="store_true",
-            help=_(
-                "Skip the component editor window. Only use this if all components have been configured. "
-                "Default is %(default)s"
-            ),
-        )
+        """Keep the component editor's parser extension point available."""
         return parser
 
     @classmethod
@@ -775,6 +789,7 @@ class ComponentEditorWindowBase(BaseWindow):  # pylint: disable=too-many-instanc
             instance.version = version
             instance._embedded_parent_frame = None  # noqa: SLF001
             instance._on_component_change = None  # noqa: SLF001
+            instance.close_result = ComponentEditorCloseResult()
             instance._populating = False  # noqa: SLF001
 
             # Create mock UI elements to avoid Tkinter dependencies
@@ -799,7 +814,7 @@ class ComponentEditorWindowBase(BaseWindow):  # pylint: disable=too-many-instanc
 if __name__ == "__main__":  # pragma: no cover
     args = argument_parser()
 
-    logging_basicConfig(level=logging_getLevelName(args.loglevel), format="%(asctime)s - %(levelname)s - %(message)s")
+    logging_basicConfig(level=args.loglevel, format="%(asctime)s - %(levelname)s - %(message)s")
 
     filesystem = LocalFilesystem(
         args.vehicle_dir, args.vehicle_type, "", args.allow_editing_template_files, args.save_component_to_system_templates
@@ -807,9 +822,8 @@ if __name__ == "__main__":  # pragma: no cover
     component_editor_window = ComponentEditorWindowBase(__version__, filesystem, {})
 
     component_editor_window.populate_frames()
-    if args.skip_component_editor:
-        component_editor_window.root.after(10, component_editor_window.root.destroy)
-
     # component_editor_window.validate_data()
 
     component_editor_window.root.mainloop()
+    if component_editor_window.close_result.action is ComponentEditorCloseAction.QUIT_WORKFLOW:
+        raise SystemExit(component_editor_window.close_result.exit_code)

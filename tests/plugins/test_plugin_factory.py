@@ -10,15 +10,114 @@ SPDX-FileCopyrightText: 2024-2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+from types import MethodType, SimpleNamespace
+from typing import get_type_hints
 from unittest.mock import MagicMock, patch
 
+import pytest
+from pytest_mock import MockerFixture
+
+from ardupilot_methodic_configurator.__main__ import register_plugins
+from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
+from ardupilot_methodic_configurator.plugins import plugin_constants
 from ardupilot_methodic_configurator.plugins.plugin_factory import PluginFactory, PluginModelContext, plugin_factory
+from ardupilot_methodic_configurator.plugins.plugin_protocol import PluginPauseReason
 
 # pylint: disable=protected-access
 
 
 class TestPluginFactory:
     """Test plugin factory functionality for dependency injection."""
+
+    def test_every_registered_view_declares_a_connection_recovery_lifecycle(self, mocker: MockerFixture) -> None:
+        """
+        Every plugin declares a lifecycle that lets the editor recover its connection.
+
+        This is an interface check; real polling views separately exercise timer and receiver cleanup.
+
+        GIVEN: All plugins are registered through the application's startup path
+        WHEN: The editor pauses each view through its connection recovery entry point
+        THEN: Recovery receives a callable that resumes the same view exactly once
+        """
+        for registry in (
+            plugin_factory._creators,
+            plugin_factory._model_creators,
+            plugin_factory._flight_controller_requirements,
+        ):
+            mocker.patch.dict(registry, clear=True)
+        register_plugins()
+        expected = {
+            value for name, value in vars(plugin_constants).items() if name.startswith("PLUGIN_") and isinstance(value, str)
+        }
+        assert set(plugin_factory.available_plugins()) == expected
+
+        for name in plugin_factory.available_plugins():
+            # Enforce the real registered view's method surface without constructing its UI.
+            view_type = get_type_hints(plugin_factory._creators[name])["return"]
+            view = MagicMock(spec_set=view_type)
+            editor = SimpleNamespace(current_plugin_view=view, root=MagicMock())
+            editor._pause_plugin_receiver = MethodType(ParameterEditorWindow._pause_plugin_receiver, editor)
+
+            resume = ParameterEditorWindow._pause_connection_plugin(editor)
+
+            assert callable(resume), f"{name} blocks connection recovery"
+            resume()
+            resume()
+            if callable(getattr(view, "on_suspend", None)) and callable(getattr(view, "on_resume", None)):
+                view.on_suspend.assert_called_once_with(PluginPauseReason.CONNECTION_RECOVERY)
+                view.on_resume.assert_called_once_with()
+            else:
+                view.on_deactivate.assert_called_once_with()
+                view.on_activate.assert_called_once_with()
+
+    def test_user_is_told_once_about_each_unavailable_configured_plugin(self, caplog: pytest.LogCaptureFixture) -> None:
+        """
+        Identify unavailable plugins and suggest registered alternatives.
+
+        GIVEN: Configuration steps reference a registered plugin and repeated unavailable plugins
+        WHEN: Startup validates the configuration
+        THEN: Each unavailable name is logged once with the sorted available names
+        """
+        # Given: A real registry and realistic configuration-step metadata.
+        factory = PluginFactory()
+        factory.register("zeta", lambda _parent, _model, _window: object())
+        factory.register("alpha", lambda _parent, _model, _window: object())
+        steps: dict[str, dict[str, object]] = {
+            "01.param": {"plugin": {"name": "missing"}},
+            "02.param": {"plugin": {"name": "missing"}},
+            "03.param": {"plugin": {"name": "another"}},
+            "04.param": {"plugin": {"name": "alpha"}},
+            "05.param": {},
+            "06.param": {"plugin": {}},
+            "07.param": {"plugin": {"name": ""}},
+        }
+
+        # When: Validate all references.
+        factory.validate_configuration_steps(steps)
+
+        # Then: Repeated references produce one actionable error per missing name.
+        assert sorted(caplog.messages) == [
+            "Plugin 'another' is configured but not registered. Available plugins: alpha, zeta",
+            "Plugin 'missing' is configured but not registered. Available plugins: alpha, zeta",
+        ]
+        assert all(record.levelname == "ERROR" for record in caplog.records)
+
+    def test_user_is_told_when_no_plugins_are_available(self, caplog: pytest.LogCaptureFixture) -> None:
+        """
+        Diagnose a configured plugin when the registry is empty.
+
+        GIVEN: No plugins are registered
+        WHEN: A configuration step references a plugin
+        THEN: The diagnostic explicitly says that no plugins are available
+        """
+        # Given: An empty registry.
+        factory = PluginFactory()
+
+        # When: Validate an unavailable plugin reference.
+        factory.validate_configuration_steps({"01.param": {"plugin": {"name": "motor_test"}}})
+
+        # Then: The user gets a useful empty-registry diagnostic.
+        assert caplog.messages == ["Plugin 'motor_test' is configured but not registered. Available plugins: none"]
 
     def test_user_can_initialize_plugin_factory(self) -> None:
         """
@@ -136,6 +235,16 @@ class TestPluginFactory:
 
         assert result == "created_model"
         model_creator.assert_called_once_with(context)
+
+    def test_plugins_require_a_flight_controller_by_default_but_can_opt_out(self) -> None:
+        """Existing hardware-backed plugins stay gated while offline plugins can opt out."""
+        factory = PluginFactory()
+        factory.register("hardware_plugin", MagicMock())
+        factory.register("offline_plugin", MagicMock(), requires_flight_controller=False)
+
+        assert factory.requires_flight_controller("hardware_plugin") is True
+        assert factory.requires_flight_controller("offline_plugin") is False
+        assert factory.requires_flight_controller("unknown_plugin") is True
 
     def test_unregistered_model_factory_returns_none(self) -> None:
         factory = PluginFactory()
@@ -305,3 +414,25 @@ class TestPluginFactory:
         assert factory.is_registered("plugin-with-dashes") is True
         assert factory.is_registered("plugin_with_underscores") is True
         assert factory.is_registered("plugin.123") is True
+
+
+@pytest.mark.parametrize("steps", [{}, {"01.param": {}}, {"01.param": {"plugin": {"name": "available"}}}])
+def test_valid_configuration_does_not_report_unavailable_plugins(
+    caplog: pytest.LogCaptureFixture, steps: dict[str, dict[str, object]]
+) -> None:
+    """
+    Accept steps without plugins and steps with registered plugins.
+
+    GIVEN: Only available plugins or no plugin references
+    WHEN: Startup validates configuration steps
+    THEN: No plugin availability errors are logged
+    """
+    # Given: A registry containing every referenced plugin.
+    factory = PluginFactory()
+    factory.register("available", lambda _parent, _model, _window: object())
+
+    # When: Validate configuration.
+    factory.validate_configuration_steps(steps)
+
+    # Then: Startup diagnostics remain clear.
+    assert not caplog.records

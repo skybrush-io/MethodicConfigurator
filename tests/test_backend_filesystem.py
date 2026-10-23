@@ -14,19 +14,115 @@ import tempfile
 import unittest
 from argparse import ArgumentParser
 from os import path as os_path
+from pathlib import Path
 from subprocess import SubprocessError
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+from ardupilot_methodic_configurator.annotate_params import get_xml_dir
 from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.data_model_par_dict import Par, ParDict
 
-# pylint: disable=too-many-lines, too-many-arguments, too-many-positional-arguments, protected-access
+# pylint: disable=too-many-lines, protected-access
+
+
+def test_standalone_metadata_uses_connected_firmware_and_normalizes_reboot_field() -> None:
+    """A standalone editor receives the same parsed reboot metadata as an AMC project."""
+    filesystem = LocalFilesystem(None, "ArduPlane", "4.6.3", False, False)  # noqa: FBT003
+    metadata = {
+        "ROLL_P": {
+            "humanName": "Roll P",
+            "documentation": [],
+            "fields": {"RebootRequired": "True"},
+            "values": {},
+        }
+    }
+    with (
+        patch("ardupilot_methodic_configurator.backend_filesystem.download_file_from_url", return_value=True) as download,
+        patch("ardupilot_methodic_configurator.backend_filesystem.parse_parameter_metadata", return_value=metadata) as parse,
+    ):
+        source = filesystem.load_parameter_metadata_for_flight_controller("ArduPlane", "4.6.3")
+
+    assert source.endswith("/versioned/Plane/stable-4.6.3/apm.pdef.xml")
+    assert download.call_args.args[0] == source
+    assert parse.call_args.args[0] == ""
+    assert parse.call_args.args[3] == "ArduPlane"
+    assert filesystem.doc_dict["ROLL_P"]["RebootRequired"] is True
+
+
+def test_fc_metadata_fetch_ignores_unrelated_xml_in_current_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cached XML from another vehicle must not replace the connected FC metadata."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "apm.pdef.xml").write_text("<stale/>", encoding="utf-8")
+
+    def download_metadata(_url: str, destination: str) -> bool:
+        Path(destination).write_text(
+            '<parameters><param name="ArduPlane:ROLL_P" humanName="Roll P" documentation="">'
+            '<field name="RebootRequired">True</field></param></parameters>',
+            encoding="utf-8",
+        )
+        return True
+
+    with patch("ardupilot_methodic_configurator.backend_filesystem.download_file_from_url", side_effect=download_metadata):
+        filesystem = LocalFilesystem.for_external_parameter_file(str(tmp_path), "ArduPlane", "4.6.3", ParDict())
+
+    assert filesystem.doc_dict["ROLL_P"]["RebootRequired"] is True
+
+
+def test_standalone_metadata_rejects_generic_fallback() -> None:
+    """A failed exact-version download must stop before upload metadata is created."""
+    with (
+        patch("ardupilot_methodic_configurator.backend_filesystem.download_file_from_url", return_value=False) as download,
+        pytest.raises(ValueError, match=r"stable-4\.6\.3/apm\.pdef\.xml"),
+    ):
+        LocalFilesystem.for_external_parameter_file(".", "ArduPlane", "4.6.3", ParDict())
+
+    download.assert_called_once()
+
+
+def test_vehicle_configuration_file_size_distinguishes_missing_empty_and_ready_files(tmp_path: Path) -> None:
+    """The filesystem reports enough state to validate upload candidates without direct Path access."""
+    filesystem = LocalFilesystem(
+        str(tmp_path),
+        "ArduCopter",
+        "4.3.0",
+        allow_editing_template_files=False,
+        save_component_to_system_templates=False,
+        load_project=False,
+    )
+    empty_file = tmp_path / "empty.lua"
+    empty_file.touch()
+    ready_file = tmp_path / "ready.lua"
+    ready_file.write_bytes(b"return true")
+    directory = tmp_path / "directory"
+    directory.mkdir()
+
+    assert filesystem.vehicle_configuration_file_size("missing.lua") is None
+    assert filesystem.vehicle_configuration_file_size("empty.lua") == 0
+    assert filesystem.vehicle_configuration_file_size("ready.lua") == len(b"return true")
+    assert filesystem.vehicle_configuration_file_size("directory") is None
 
 
 class TestLocalFilesystem(unittest.TestCase):  # pylint: disable=too-many-public-methods
     """LocalFilesystem test class."""
+
+    def test_constructor_invalidates_mismatched_metadata_before_reinitializing(self) -> None:
+        """Opening a project invalidates stale metadata before it can be parsed."""
+        with (
+            patch.object(LocalFilesystem, "remove_cached_parameter_metadata_for_mismatched_firmware") as remove_metadata,
+            patch.object(LocalFilesystem, "re_init") as reinitialize,
+        ):
+            LocalFilesystem(
+                "/project",
+                "ArduCopter",
+                "4.7.0",
+                allow_editing_template_files=False,
+                save_component_to_system_templates=False,
+            )
+
+        remove_metadata.assert_called_once_with("/project")
+        reinitialize.assert_called_once_with("/project", "ArduCopter")
 
     def test_read_params_from_files(self) -> None:
         """Test reading parameters from files with proper filtering."""
@@ -92,6 +188,177 @@ class TestLocalFilesystem(unittest.TestCase):  # pylint: disable=too-many-public
             filesystem.re_init(mock_vehicle_dir, "ArduCopter")
             assert filesystem.vehicle_dir == mock_vehicle_dir
             assert filesystem.vehicle_type == "ArduCopter"
+
+    def test_re_init_refreshes_auto_detected_firmware_version_for_each_project(self) -> None:
+        """Opening another project refreshes a firmware version that was auto-detected."""
+        filesystem = LocalFilesystem(
+            None,
+            "",
+            "",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+
+        with (
+            patch.object(filesystem, "load_vehicle_components_json_data", return_value=True),
+            patch.object(filesystem, "get_fc_fw_version_from_vehicle_components_json", side_effect=["4.7.0", "4.6.3"]),
+            patch.object(filesystem, "get_fc_fw_type_from_vehicle_components_json", return_value="ArduCopter"),
+            patch.object(filesystem, "rename_parameter_files"),
+            patch.object(filesystem, "read_params_from_files", return_value={}),
+        ):
+            filesystem.re_init("/projects/4.7", "")
+            filesystem.re_init("/projects/4.6", "")
+
+        assert filesystem.fw_version == "4.6.3"
+
+    def test_re_init_reuses_metadata_for_the_same_vehicle_firmware(self) -> None:
+        """Reinitializing a new project does not download identical metadata again."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.6.3",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        metadata = {
+            "TEST_PARAM": {
+                "humanName": "Test parameter",
+                "documentation": [],
+                "fields": {},
+                "values": {},
+            }
+        }
+
+        with (
+            patch.object(filesystem, "load_vehicle_components_json_data", return_value=True),
+            patch.object(filesystem, "rename_parameter_files"),
+            patch.object(filesystem, "read_params_from_files", return_value={"01_setup.param": ParDict()}),
+            patch("ardupilot_methodic_configurator.backend_filesystem.load_default_param_file", return_value=ParDict()),
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem.parse_parameter_metadata",
+                return_value=metadata,
+            ) as parse_metadata,
+        ):
+            filesystem.re_init("/projects/source", "ArduCopter")
+            filesystem.re_init("/projects/new-project", "ArduCopter")
+
+        parse_metadata.assert_called_once()
+
+    def test_firmware_mismatch_removes_cached_parameter_metadata(self) -> None:
+        """Opening a project for another FC firmware removes stale parameter metadata."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.7.0",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        filesystem.vehicle_components_fs.data = {
+            "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}}
+        }
+
+        with tempfile.TemporaryDirectory() as vehicle_dir:
+            filesystem._parameter_metadata_cache[("ArduCopter", "4.7.0", get_xml_dir(vehicle_dir))] = {}
+            metadata_file = os_path.join(vehicle_dir, "apm.pdef.xml")
+            with open(metadata_file, "w", encoding="utf-8") as file:
+                file.write("<parameters />")
+
+            with patch.object(
+                filesystem,
+                "load_vehicle_components_json_data",
+                return_value=filesystem.vehicle_components_fs.data,
+            ):
+                assert filesystem.remove_cached_parameter_metadata_for_mismatched_firmware(vehicle_dir)
+
+            assert not os_path.exists(metadata_file)
+
+        assert ("ArduCopter", "4.7.0", get_xml_dir(vehicle_dir)) not in filesystem._parameter_metadata_cache
+
+    def test_firmware_patch_mismatch_removes_cached_parameter_metadata(self) -> None:
+        """A patch-level firmware mismatch also removes stale parameter metadata."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.6.4",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        filesystem.vehicle_components_fs.data = {
+            "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}}
+        }
+
+        with tempfile.TemporaryDirectory() as vehicle_dir:
+            filesystem._parameter_metadata_cache[("ArduCopter", "4.6.4", get_xml_dir(vehicle_dir))] = {}
+            metadata_file = os_path.join(vehicle_dir, "apm.pdef.xml")
+            with open(metadata_file, "w", encoding="utf-8") as file:
+                file.write("<parameters />")
+
+            with patch.object(
+                filesystem,
+                "load_vehicle_components_json_data",
+                return_value=filesystem.vehicle_components_fs.data,
+            ):
+                assert filesystem.remove_cached_parameter_metadata_for_mismatched_firmware(vehicle_dir)
+
+            assert not os_path.exists(metadata_file)
+
+        assert ("ArduCopter", "4.6.4", get_xml_dir(vehicle_dir)) not in filesystem._parameter_metadata_cache
+
+    def test_firmware_patch_match_keeps_cached_parameter_metadata(self) -> None:
+        """Matching major, minor, and patch versions keep cached metadata intact."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.6.3",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        filesystem.vehicle_components_fs.data = {
+            "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}}
+        }
+
+        with tempfile.TemporaryDirectory() as vehicle_dir:
+            cache_key = ("ArduCopter", "4.6.3", get_xml_dir(vehicle_dir))
+            filesystem._parameter_metadata_cache[cache_key] = {}
+            metadata_file = os_path.join(vehicle_dir, "apm.pdef.xml")
+            with open(metadata_file, "w", encoding="utf-8") as file:
+                file.write("<parameters />")
+
+            with patch.object(
+                filesystem,
+                "load_vehicle_components_json_data",
+                return_value=filesystem.vehicle_components_fs.data,
+            ):
+                assert not filesystem.remove_cached_parameter_metadata_for_mismatched_firmware(vehicle_dir)
+
+            assert os_path.exists(metadata_file)
+            assert cache_key in filesystem._parameter_metadata_cache
+
+    def test_metadata_cache_is_scoped_to_project_xml_directory(self) -> None:
+        """Projects with different local metadata do not share parsed documentation."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.7.0",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        metadata = {"TEST_PARAM": {"humanName": "Test", "documentation": [], "fields": {}, "values": {}}}
+
+        with (
+            patch.object(filesystem, "load_vehicle_components_json_data", return_value=True),
+            patch.object(filesystem, "rename_parameter_files"),
+            patch.object(filesystem, "read_params_from_files", return_value={"01_setup.param": ParDict()}),
+            patch("ardupilot_methodic_configurator.backend_filesystem.get_xml_dir", side_effect=["/one", "/two"]),
+            patch("ardupilot_methodic_configurator.backend_filesystem.load_default_param_file", return_value=ParDict()),
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem.parse_parameter_metadata", return_value=metadata
+            ) as parse,
+        ):
+            filesystem.re_init("/projects/one", "ArduCopter")
+            filesystem.re_init("/projects/two", "ArduCopter")
+
+        assert parse.call_count == 2
 
     def test_vehicle_configuration_files_exist(self) -> None:
         """Test checking if vehicle configuration files exist."""
@@ -908,6 +1175,18 @@ class TestLocalFilesystem(unittest.TestCase):  # pylint: disable=too-many-public
         assert args["n"] == 1
         assert args["allow_editing_template_files"] is True
 
+    def test_bin_log_help_explains_the_explicit_vehicle_directory_destination(self) -> None:
+        """The CLI help documents how --vehicle-dir changes a .bin-log project's destination."""
+        parser = ArgumentParser()
+        LocalFilesystem.add_argparse_arguments(parser)
+
+        help_text = " ".join(parser.format_help().split())
+
+        assert "an explicitly supplied value is the complete destination project directory" in help_text
+        assert "explicitly supplied --vehicle-dir" in help_text
+        assert "By default, the project is created in the default vehicles directory" in help_text
+        assert "validates the vehicle type reported by the log" in help_text
+
     def test_annotate_intermediate_comments_to_param_dict(self) -> None:
         lfs = LocalFilesystem(
             "vehicle_dir", "vehicle_type", None, allow_editing_template_files=False, save_component_to_system_templates=False
@@ -1040,7 +1319,7 @@ class TestLocalFilesystem(unittest.TestCase):  # pylint: disable=too-many-public
             )
             lfs.configuration_steps = {
                 "test_file.param": {
-                    "download_file": {"source_url": "https://example.com/file.bin", "dest_local": "local_file.bin"}
+                    "download_file": [{"source_url": "https://example.com/file.bin", "dest_local": "local_file.bin"}]
                 }
             }
 
@@ -1056,13 +1335,57 @@ class TestLocalFilesystem(unittest.TestCase):  # pylint: disable=too-many-public
             )
             lfs.configuration_steps = {
                 "test_file.param": {
-                    "upload_file": {"source_local": "local_file.bin", "dest_on_fc": "/fs/microsd/APM/file.bin"}
+                    "upload_file": [{"source_local": "local_file.bin", "dest_on_fc": "/fs/microsd/APM/file.bin"}]
                 }
             }
 
             local_path, remote_path = lfs.get_upload_local_and_remote_filenames("test_file.param")
             assert local_path == os_path.realpath(os_path.join(tmp_dir, "local_file.bin"))
             assert remote_path == "/fs/microsd/APM/file.bin"
+
+    def test_multiple_step_files_are_resolved_in_order(self) -> None:
+        """Both scripts are resolved relative to the vehicle directory."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lfs = LocalFilesystem(
+                tmp_dir, "vehicle_type", None, allow_editing_template_files=False, save_component_to_system_templates=False
+            )
+            lfs.configuration_steps = {
+                "step.param": {
+                    "download_file": [
+                        {"source_url": "https://example.com/a", "dest_local": "a.lua"},
+                        {"source_url": "https://example.com/b", "dest_local": "b.lua"},
+                    ],
+                    "upload_file": [
+                        {"source_local": "a.lua", "dest_on_fc": "/APM/Scripts/a.lua"},
+                        {"source_local": "b.lua", "dest_on_fc": "/APM/Scripts/b.lua"},
+                    ],
+                }
+            }
+            assert lfs.get_download_files("step.param") == [
+                ("https://example.com/a", os_path.realpath(os_path.join(tmp_dir, "a.lua"))),
+                ("https://example.com/b", os_path.realpath(os_path.join(tmp_dir, "b.lua"))),
+            ]
+            assert lfs.get_upload_files("step.param") == [
+                (os_path.realpath(os_path.join(tmp_dir, "a.lua")), "/APM/Scripts/a.lua"),
+                (os_path.realpath(os_path.join(tmp_dir, "b.lua")), "/APM/Scripts/b.lua"),
+            ]
+
+    def test_second_file_cannot_escape_vehicle_directory(self) -> None:
+        """Validate every array entry, not just the first."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lfs = LocalFilesystem(
+                tmp_dir, "vehicle_type", None, allow_editing_template_files=False, save_component_to_system_templates=False
+            )
+            lfs.configuration_steps = {
+                "step.param": {
+                    "download_file": [
+                        {"source_url": "https://example.com/a", "dest_local": "a.lua"},
+                        {"source_url": "https://example.com/b", "dest_local": "../escape.lua"},
+                    ]
+                }
+            }
+            with pytest.raises(ValueError, match="escapes vehicle directory"):
+                lfs.get_download_files("step.param")
 
 
 class TestPathTraversalPrevention:
@@ -1080,7 +1403,7 @@ class TestPathTraversalPrevention:
             str(tmp_path), "vehicle_type", None, allow_editing_template_files=False, save_component_to_system_templates=False
         )
         lfs.configuration_steps = {
-            "test.param": {"download_file": {"source_url": "https://example.com/payload", "dest_local": "../../.bashrc"}}
+            "test.param": {"download_file": [{"source_url": "https://example.com/payload", "dest_local": "../../.bashrc"}]}
         }
 
         with pytest.raises(ValueError, match="Path escapes vehicle directory"):
@@ -1098,7 +1421,7 @@ class TestPathTraversalPrevention:
             str(tmp_path), "vehicle_type", None, allow_editing_template_files=False, save_component_to_system_templates=False
         )
         lfs.configuration_steps = {
-            "test.param": {"upload_file": {"source_local": "../../../etc/passwd", "dest_on_fc": "/fs/microsd/file"}}
+            "test.param": {"upload_file": [{"source_local": "../../../etc/passwd", "dest_on_fc": "/fs/microsd/file"}]}
         }
 
         with pytest.raises(ValueError, match="Path escapes vehicle directory"):
@@ -1116,7 +1439,7 @@ class TestPathTraversalPrevention:
             str(tmp_path), "vehicle_type", None, allow_editing_template_files=False, save_component_to_system_templates=False
         )
         lfs.configuration_steps = {
-            "test.param": {"download_file": {"source_url": "https://example.com/file.lua", "dest_local": "script.lua"}}
+            "test.param": {"download_file": [{"source_url": "https://example.com/file.lua", "dest_local": "script.lua"}]}
         }
 
         url, local_path = lfs.get_download_url_and_local_filename("test.param")
@@ -1136,7 +1459,7 @@ class TestPathTraversalPrevention:
         )
         lfs.configuration_steps = {
             "test.param": {
-                "download_file": {"source_url": "https://example.com/payload", "dest_local": "/tmp/evil"},  # noqa: S108
+                "download_file": [{"source_url": "https://example.com/payload", "dest_local": "/tmp/evil"}],  # noqa: S108
             }
         }
 
@@ -1155,7 +1478,7 @@ class TestPathTraversalPrevention:
             str(tmp_path), "vehicle_type", None, allow_editing_template_files=False, save_component_to_system_templates=False
         )
         lfs.configuration_steps = {
-            "test.param": {"download_file": {"source_url": "https://example.com/payload", "dest_local": "."}}
+            "test.param": {"download_file": [{"source_url": "https://example.com/payload", "dest_local": "."}]}
         }
 
         with pytest.raises(ValueError, match="Path escapes vehicle directory"):
@@ -1180,7 +1503,7 @@ class TestPathTraversalPrevention:
             str(tmp_path), "vehicle_type", None, allow_editing_template_files=False, save_component_to_system_templates=False
         )
         lfs.configuration_steps = {
-            "test.param": {"download_file": {"source_url": "https://example.com/payload", "dest_local": "escape_link/evil"}}
+            "test.param": {"download_file": [{"source_url": "https://example.com/payload", "dest_local": "escape_link/evil"}]}
         }
 
         with pytest.raises(ValueError, match="Path escapes vehicle directory"):

@@ -12,13 +12,20 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 import tkinter as tk
 import unittest
+from collections import deque
+from collections.abc import Callable, Generator
+from threading import Event, get_ident
+from tkinter import ttk
 from unittest.mock import MagicMock, call, patch
 
+import pytest
+
 from ardupilot_methodic_configurator.frontend_tkinter_base_window import BaseWindow
+from ardupilot_methodic_configurator.frontend_tkinter_file_browser_tasks import BackgroundTaskRunner
 from ardupilot_methodic_configurator.frontend_tkinter_software_update import UpdateDialog
 
 
-class TestUpdateDialog(unittest.TestCase):  # pylint: disable=too-many-instance-attributes
+class TestUpdateDialog(unittest.TestCase):  # pylint: disable=too-many-instance-attributes,too-many-public-methods
     """Test cases for the UpdateDialog class."""
 
     def setUp(self) -> None:
@@ -74,6 +81,21 @@ class TestUpdateDialog(unittest.TestCase):  # pylint: disable=too-many-instance-
         )
         self.scroll_frame_patch.start()
 
+        # Execute tasks deterministically in unit tests; the real runner is tested below.
+        self.runner_patch = patch("ardupilot_methodic_configurator.frontend_tkinter_software_update.BackgroundTaskRunner")
+        runner = self.runner_patch.start().return_value
+        runner.active = False
+
+        def start(
+            task: Callable[[Callable[[float, str], None]], bool],
+            on_progress: Callable[[float, str], None],
+            on_done: Callable[[object | None, Exception | None], None],
+        ) -> bool:
+            on_done(task(on_progress), None)
+            return True
+
+        runner.start.side_effect = start
+
         # Input data for tests
         self.version_info = "Test Version Info"
         self.download_callback = MagicMock(return_value=True)
@@ -83,8 +105,8 @@ class TestUpdateDialog(unittest.TestCase):  # pylint: disable=too-many-instance-
         # Restore the original __init__ method
         BaseWindow.__init__ = self.original_init
 
-        # Close the real Tk instance
-        self.root.destroy()
+        # Bypass the mocked destroy method so later tests inherit a live Tk root.
+        tk.Tk.destroy(self.root)
 
         # Stop all patches
         patch.stopall()
@@ -128,6 +150,42 @@ class TestUpdateDialog(unittest.TestCase):  # pylint: disable=too-many-instance-
         # Second update attempt should not change result
         dialog.on_yes()
         assert dialog.result
+
+    def test_retry_keeps_dialog_open_past_previous_failure_close_deadline(self) -> None:
+        """
+        Retrying a failed download keeps its dialog available until the retry finishes.
+
+        GIVEN: A failed update has enabled retry and scheduled the dialog to close
+        WHEN: The user starts another download before that deadline
+        THEN: Advancing past the old deadline cannot destroy the active dialog
+        """
+        pending: dict[str, Callable[[], None]] = {}
+
+        def schedule(_milliseconds: int, callback: Callable[[], None]) -> str:
+            timer_id = f"close-{len(pending)}"
+            pending[timer_id] = callback
+            return timer_id
+
+        def cancel(timer_id: str) -> None:
+            pending.pop(timer_id)
+
+        self.download_callback.return_value = False
+        dialog = UpdateDialog(self.version_info, self.download_callback)
+        with (
+            patch.object(self.root, "after", side_effect=schedule),
+            patch.object(self.root, "after_cancel", side_effect=cancel),
+        ):
+            dialog.on_yes()
+            assert dialog.result is False
+            assert pending
+
+            # The runner accepts the retry but leaves its download pending.
+            dialog._download_runner.start.side_effect = None  # pylint: disable=protected-access
+            dialog.on_yes()
+            for callback in list(pending.values()):
+                callback()
+
+            self.root.destroy.assert_not_called()
 
     def test_init_window_config(self) -> None:
         """Test window configuration during initialization."""
@@ -205,22 +263,31 @@ class TestUpdateDialog(unittest.TestCase):  # pylint: disable=too-many-instance-
         dialog.progress = progress_mock
         dialog.status_label = status_label_mock
 
-        # Test with both value and status
-        dialog.update_progress(75, "Downloading...")
-        progress_mock.__setitem__.assert_called_with("value", 75)
-        status_label_mock.__setitem__.assert_called_with("text", "Downloading...")
-        self.root.update.assert_called_once()
+        with (
+            patch(
+                "ardupilot_methodic_configurator.frontend_tkinter_software_update.is_macos_sequoia_or_older",
+                return_value=False,
+            ),
+            patch.object(self.root, "update_idletasks") as update_idletasks,
+        ):
+            # Test with both value and status
+            dialog.update_progress(75, "Downloading...")
+            progress_mock.__setitem__.assert_called_with("value", 75)
+            status_label_mock.__setitem__.assert_called_with("text", "Downloading...")
+            update_idletasks.assert_called_once()
+            self.root.update.assert_not_called()
 
-        # Reset mocks
-        progress_mock.reset_mock()
-        status_label_mock.reset_mock()
-        self.root.update.reset_mock()
+            # Reset mocks
+            progress_mock.reset_mock()
+            status_label_mock.reset_mock()
+            update_idletasks.reset_mock()
 
-        # Test with only value (no status)
-        dialog.update_progress(50)
-        progress_mock.__setitem__.assert_called_with("value", 50)
-        status_label_mock.__setitem__.assert_not_called()
-        self.root.update.assert_called_once()
+            # Test with only value (no status)
+            dialog.update_progress(50)
+            progress_mock.__setitem__.assert_called_with("value", 50)
+            status_label_mock.__setitem__.assert_not_called()
+            update_idletasks.assert_called_once()
+            self.root.update.assert_not_called()
 
     def test_on_yes_successful_update(self) -> None:
         """Test successful update process."""
@@ -409,3 +476,90 @@ class TestUpdateDialog(unittest.TestCase):  # pylint: disable=too-many-instance-
 
             dialog.result = None
             assert dialog.show() is False  # None should convert to False
+
+
+@pytest.fixture(name="download_dialog")
+def fixture_download_dialog(root: tk.Tk) -> Generator[UpdateDialog, None, None]:
+    """Provide real download widgets without release-note layout or event-loop rendering."""
+    parent = tk.Toplevel(root)
+    parent.withdraw()
+    try:
+        dialog = object.__new__(UpdateDialog)
+        dialog.root = parent
+        dialog.progress = ttk.Progressbar(parent)
+        dialog.status_label = ttk.Label(parent)
+        dialog.yes_btn = ttk.Button(parent)
+        dialog.no_btn = ttk.Button(parent)
+        dialog.result = None
+        dialog._close_timer_id = None  # pylint: disable=protected-access
+        yield dialog
+    finally:
+        parent.destroy()
+
+
+def test_download_keeps_tk_responsive_and_delivers_progress_on_tk_thread(download_dialog: UpdateDialog) -> None:
+    """
+    A slow update yields to UI callbacks and delivers progress on Tk's thread.
+
+    GIVEN: A download worker waits for a heartbeat scheduled on the UI thread
+    WHEN: UI callbacks run while the download is pending
+    THEN: The UI stays available and progress reaches widgets on the UI thread
+    """
+    dialog = download_dialog
+    parent = dialog.root
+    ui_thread = get_ident()
+    heartbeat = Event()
+    worker_threads: list[int] = []
+    progress_threads: list[int] = []
+    scheduled: deque[Callable[[], None]] = deque()
+
+    def download(report: Callable[[float, str], None]) -> bool:
+        worker_threads.append(get_ident())
+        assert heartbeat.wait(2)
+        report(55.0, "Downloading")
+        return True
+
+    # Drive scheduled callbacks explicitly: a native Tk event loop can abort
+    # the interpreter on headless macOS runners, even with withdrawn windows.
+    runner = BackgroundTaskRunner(lambda _delay, callback: scheduled.append(callback))
+    try:
+        dialog.download_callback = download
+        dialog._download_runner = runner  # pylint: disable=protected-access
+        original_progress = dialog.update_progress
+
+        def on_progress(value: float, status: str = "") -> None:
+            progress_threads.append(get_ident())
+            assert (value, status) == (55.0, "Downloading")
+            original_progress(value, status)
+
+        with (
+            patch.object(dialog, "update_progress", side_effect=on_progress),
+            patch.object(parent, "after"),
+            patch(
+                "ardupilot_methodic_configurator.frontend_tkinter_software_update.is_macos_sequoia_or_older", return_value=True
+            ),
+            patch.object(parent, "destroy", wraps=parent.destroy) as destroy,
+        ):
+            dialog.on_yes()
+            dialog.on_yes()
+            dialog.on_cancel()
+            destroy.assert_not_called()
+            scheduled.append(heartbeat.set)
+            scheduled.popleft()()  # The first poll yields while the worker waits.
+            assert dialog.result is None
+            scheduled.popleft()()  # The UI heartbeat releases the worker.
+            worker = runner.thread
+            assert worker is not None
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+            scheduled.popleft()()  # Deliver progress and completion on the UI thread.
+
+        assert dialog.result is True
+        assert len(worker_threads) == 1
+        assert worker_threads[0] != ui_thread
+        assert progress_threads == [ui_thread]
+        assert dialog.progress["value"] == 55.0
+    finally:
+        heartbeat.set()
+        if runner.thread is not None:
+            runner.thread.join(timeout=2)

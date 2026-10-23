@@ -13,6 +13,11 @@ There are also [quick start instructions](README.md), [specific use case instruc
 
 1. [Step-by-Step Workflow](#step-by-step-workflow)
 1. [Configuring multiple similar vehicles](#configuring-multiple-similar-vehicles)
+1. [Flight-Controller Parameter Export](USERMANUAL_fc_parameter_export.md)
+1. [MAVFTP File Browser](USERMANUAL_MAVFTP.md)
+1. [MAVLink Inspector](USERMANUAL_MAVLink_inspector.md)
+1. [Firmware Upload](USERMANUAL_firmware_upload.md)
+1. [Flight Controller Banner](USERMANUAL_fc_banner.md)
 1. [Customizing configuration steps](https://ardupilot.github.io/MethodicConfigurator/CUSTOMIZING_CONFIGURATION_STEPS.html) (external document)
 1. [Command Line Usage](#command-line-usage)
 1. [Troubleshooting](#troubleshooting)
@@ -23,7 +28,8 @@ There are also [quick start instructions](README.md), [specific use case instruc
 
 ## Before You Begin
 
-⚠️ **IMPORTANT**: Connect your flight controller to the PC and wait **at least 7 seconds** before starting the software.
+⚠️ **IMPORTANT**: If you will connect a flight controller, connect it to the PC and wait **at least 7 seconds** before
+starting the software. You can also work offline or create a project from a `.bin` log without connecting one.
 
 💡 **TIP**: Have your vehicle's component documentation ready (motor specifications, ESC type, etc.)
 
@@ -33,44 +39,60 @@ Don't worry! It looks more complicated than it actually is. And **you do not nee
 
 ```mermaid
 flowchart TD
-    subgraph "Step 1: Connect to Vehicle"
-        A[Connect Flight Controller] --> B{Auto-Detect?}
-        B -->|Yes| C[Download FC Info]
-        B -->|No| D[Manual Connection]
-        D --> C
+    A[Start AMC] --> B{.bin log on command line?}
+    B -->|Yes| M
+    B -->|No| C
+
+    subgraph "Step 1: Connect to Vehicle (optional)"
+        C{Connect to Flight Controller?} -->|Yes| D{Auto-Detect?}
+        D -->|Yes| E[Download FC Info and Parameters]
+        D -->|No| F[Manual Connection]
+        F --> E
+        C -->|No, work offline| G[Continue without FC]
     end
 
-    subgraph "Step 2: Select Project"
-        C --> E{Existing Project?}
-        E -->|Yes| F[Open Vehicle Directory]
-        E -->|No| G[Select Template]
-        G --> H[Create New Project]
-        F --> I[Component Editor]
-        H --> I
+    subgraph "Step 2: Select or Create Project"
+        E --> H{Existing Project?}
+        G --> H
+        H -->|Yes| I[Open Vehicle Directory]
+        H -->|No| J{Create from?}
+        J -->|Configured FC, if connected| K[Create from Configured FC]
+        J -->|Template| L[Select Template]
+        L --> N[Create New Project]
+        J -->|.bin log| M[Create from .bin Log]
     end
 
     subgraph "Step 3: Edit FC Components"
-        I --> J[Validate Components]
-        J --> K{Valid?}
-        K -->|No| I
-        K -->|Yes| L[Parameter Editor]
+        O[Component Editor] --> P[Validate Components]
+        P --> Q{Valid?}
+        Q -->|No| O
     end
 
     subgraph "Step 4: Edit FC Parameters"
-        L --> M[Configure Parameters]
-        M --> N[Upload to FC]
-        N --> O{Experiment Required?}
-        O -->|Yes| P[Close AMC]
-        P --> Q[Perform Experiment/Flight]
-        Q --> R[Start AMC]
-        R --> S[Read Results from FC]
-        S --> T[Write Results to File]
-        T --> U{More Files?}
-        O -->|No| U
-        U -->|Yes| L
-        U -->|No| V[Generate Summary]
-        V -->     W[Configuration Complete]
+        R[Parameter Editor] --> S[Configure Parameters]
+        S --> T{Advance how?}
+        T -->|Upload to FC| U[Upload Selected Parameters]
+        T -->|Skip or work offline| V[Skip Parameter File]
+        U --> W{Experiment Required?}
+        W -->|Yes| X[Close AMC]
+        X --> Y[Perform Experiment/Flight]
+        Y --> Z[Start AMC]
+        Z --> AA[Read Results from FC]
+        AA --> AB[Write Results to File]
+        AB --> AC{More Files?}
+        W -->|No| AC
+        V --> AC
+        AC -->|Yes| R
+        AC -->|No| AD[Generate Summary]
+        AD --> AE[Configuration Complete]
     end
+
+    I --> R
+    K --> O
+    M --> O
+    N --> O
+    Q -->|Yes| R
+    R -->|Edit vehicle components| O
 ```
 
 If the diagram above does not display correctly [look here](https://github.com/ArduPilot/MethodicConfigurator/blob/master/USERMANUAL.md#step-by-step-workflow)
@@ -80,15 +102,19 @@ This section guides you through the complete configuration process. Follow these
 ### Preparation
 
 1. **Collect** your vehicle's component documentation (motor specifications, ESC type, GPS Type, etc.)
-1. **Connect** your flight controller to the PC via USB cable
-1. **Wait** at least 7 seconds for the flight controller to fully boot
+1. **If using a flight controller, connect** it to the PC via USB cable
+1. **If connected, wait** at least 7 seconds for the flight controller to fully boot
 1. **Launch** ArduPilot Methodic Configurator
 
 ### Step 1: Flight Controller Connection
 
-If the software successfully auto-detects your flight controller, this step will be skipped automatically and you'll proceed directly to Step 3.
+If the software successfully auto-detects your flight controller, it skips the connection selection window and downloads
+the flight controller information and parameters. You then select or create a project if needed (Step 2). If a project
+was supplied or found in the working directory, it proceeds directly to the parameter editor (Step 4).
 
 The connection selection interface is only presented **if auto-connection fails** or if no flight controller is detected.
+You can also continue without a flight controller and edit a project offline. With `--bin-log`, AMC skips the connection
+and project selection windows, creates a project from the log, and opens the component editor (Step 3).
 
 #### Flight Controller Connection Selection Interface
 
@@ -129,6 +155,86 @@ Manually specify your connection details.
   - Serial: `COM3` (Windows) or `/dev/ttyUSB0` (Linux)
   - Network: `tcp:192.168.1.100:5760`
 
+##### Connecting AMC through Mission Planner MAVLink forwarding
+
+Use this setup to keep Mission Planner connected to the vehicle while AMC reads and changes
+parameters through Mission Planner. Mission Planner sends UDP traffic **outbound**;
+AMC listens for that traffic.
+
+1. Open **Mission Planner**.
+2. **Connect** to your vehicle and wait for telemetry to appear.
+3. Press **Ctrl-F** to open Mission Planner's auxiliary tools window (titled **temp**).
+
+   ![Mission Planner Ctrl-F auxiliary tools window with the Mavlink button](images/MissionPlanner_Ctrl_F_Mavlink.png)
+
+4. Click **Mavlink**, described as "mirrors the mavlink stream received by mp".
+5. In the forwarding window, configure an outbound UDP connection:
+
+   ![Mission Planner Mavlink port forwarding window](images/MissionPlanner_Port_forwarding.png)
+
+   | Setting | Value when both applications run on the same PC |
+   | --- | --- |
+   | Type / Protocol | **UDP** |
+   | Direction | **Outbound** |
+   | Port | `14600` |
+   | Extra / Destination IP | `127.0.0.1` |
+   | Write | **Enabled / True** |
+
+   If your Mission Planner version uses a connection dropdown instead of a table,
+   select **UDP Client**, enable **Write**, and enter the same destination IP and port
+   when prompted.
+6. Start forwarding using the row's **Go** control or the **Connect** button.
+7. Open **AMC** normally using its desktop shortcut or application launcher.
+   If AMC would connect automatically to a different flight controller, disconnect that
+   flight controller from the PC before opening AMC so the connection selection window appears.
+8. In AMC's **Manual connection** section, open the **Port** dropdown and select **Add another**.
+
+   ![AMC connection selector with Add another highlighted](images/App_screenshot_FC_connection_add_another.png)
+
+9. Enter `udpin:0.0.0.0:14600` in the **Flight Controller Connection** dialog, then click **OK**.
+   AMC will connect and retrieve the flight controller information and parameters.
+
+   ![AMC custom connection dialog containing the UDP forwarding listener address](images/App_screenshot_FC_connection_udp_forwarding.png)
+
+10. Leave Mission Planner connected and forwarding while using AMC.
+
+For advanced users, AMC can also be started from a terminal with an explicit listening connection,
+if its command is available on `PATH`:
+
+```powershell
+ardupilot_methodic_configurator --device="udpin:0.0.0.0:14600"
+```
+
+**Save this connection in a desktop shortcut:** On Windows, right-click the AMC desktop shortcut,
+select **Properties**, and open the **Shortcut** tab. In **Target**, keep the existing executable
+path (including its quotes), then append a space followed by `--device="udpin:0.0.0.0:14600"`.
+Click **Apply**, then **OK**. AMC will use this connection every time you launch that shortcut;
+Mission Planner must still be connected and forwarding.
+
+You can also copy the shortcut and name it **AMC - Mission Planner**, leaving the original
+unchanged for other connections. Each shortcut can have different connection, project and startup
+settings. See [Pro Tip: Desktop Shortcuts](#pro-tip-desktop-shortcuts) for more examples.
+
+**Important:**
+
+- `127.0.0.1` is Mission Planner's destination when both applications run on the same PC.
+  `0.0.0.0` tells AMC to listen on all local IPv4 interfaces; it is not a destination address.
+  For same-PC-only listening, use `udpin:127.0.0.1:14600` instead.
+- **Write must be enabled** for AMC's parameter requests and changes to reach the vehicle.
+  Do not change the same parameters in both applications simultaneously.
+- If the applications run on different PCs, set Mission Planner's destination to the AMC PC's
+  IPv4 address and allow inbound UDP traffic on the selected port in that PC's firewall.
+- Use port `14600` for this forwarding connection to avoid conflicts with port `14550`,
+  which may already be used by Mission Planner or another MAVLink application.
+  If port `14600` is already in use, select another free port in **both** applications.
+  The baudrate setting does not affect UDP connections.
+- `--device` selects the supplied endpoint directly without requiring auto-discovery.
+  If connection fails, that endpoint remains available in AMC's connection selector for retrying.
+- If AMC times out, check the vehicle connection, forwarding status, destination, matching ports,
+  firewall and **Write** setting. A missing entry in the default port list does not mean a custom
+  UDP listening endpoint is invalid.
+- Bootloader firmware flashing requires a direct serial connection, not MAVLink forwarding.
+
 #### Option 3: No flight controller connection 📝 **For offline editing**
 
 Work with parameter files without connecting to hardware.
@@ -168,7 +274,23 @@ It provides three main options for selecting a vehicle directory:
 
 #### New
 
-Create a new vehicle configuration directory, either from a template or from a `.bin` log file.
+Create a new vehicle configuration directory from a template, an already configured flight controller, or a `.bin` log file.
+
+When a correctly configured flight controller is connected, you can create a project directly from it:
+
+- Click **Create a vehicle project from an already configured flight controller** in the **New** panel.
+- In the creator window, select the **Destination base directory** and enter the **Destination new vehicle name**.
+- The software automatically selects the empty template matching the flight controller's vehicle type and major/minor firmware version.
+- Component information and parameter values are taken from the connected flight controller.
+- The FC's default parameter values are written to `00_default.param`.
+- If live FC values differ from the selected template/default baseline, they are written to an
+  `xx_imported_flight_controller_parameters.param` file for review.
+
+![Create vehicle from an already configured flight controller](images/App_screenshot_Vehicle_directory_create_from_flight_controller.png)
+<figure align="center">
+<br>
+  <ins><b><i>Create vehicle from an already configured flight controller</i></b></ins>
+</figure>
 
 #### Open
 
@@ -200,7 +322,26 @@ It's useful for setting up a new vehicle configuration quickly.
   will use the parameter values from the flight controller instead.
 - Use the "Destination base directory" `...` button to select the existing directory where the new vehicle directory will be created.
 - Enter the name for the new vehicle directory in the "Destination new vehicle name" field.
-- Click the "Create vehicle directory from template" button to create the new vehicle directory on the base directory and copy the template files to it.
+- Click the "Create a vehicle project from a template" button to create the new vehicle directory on the base directory and copy the template files to it.
+
+### Create a New Vehicle Configuration Directory from an Already Configured Flight Controller
+
+This workflow is intended for a vehicle whose flight controller is already configured.
+It creates a new project using the live flight controller values and hardware information, while selecting the matching empty firmware template automatically.
+
+![Create vehicle project from an already configured flight controller](images/App_screenshot_Vehicle_directory_create_from_flight_controller_creator.png)
+<figure align="center">
+<br>
+  <ins><b><i>Create vehicle project from an already configured flight controller</i></b></ins>
+</figure>
+
+1. In the **New** panel, click **Create a vehicle project from an already configured flight controller**.
+1. Select the destination base directory.
+1. Enter a name for the new vehicle directory.
+1. Click the create button. AMC copies the matching empty template, substitutes the downloaded
+   FC parameter values, and derives component specifications and connections from those values.
+1. AMC writes the FC's default values to `00_default.param`. Values that differ from the template
+   baseline are written to `xx_imported_flight_controller_parameters.param`.
 
 ### Create a New Vehicle Configuration Directory from a .bin Log File
 
@@ -238,6 +379,8 @@ Correct those entries and press the `Save data and start configuration` button a
 
 Here you sequentially configure the parameters of your flight controller to meet your needs while having all the available documentation at your fingertips.
 
+For exporting the current flight-controller values, see the [Flight-Controller Parameter Export](USERMANUAL_fc_parameter_export.md) guide.
+
 ![Parameter File Editor and Uploader Window (main application)](images/App_screenshot_Parameter_file_editor_and_uploader4_4_simple.png)
 <figure align="center">
 <br>
@@ -250,8 +393,11 @@ Here you sequentially configure the parameters of your flight controller to meet
   <ins><b><i>Parameter File Editor and Uploader Window (main application) in normal GUI complexity</i></b></ins>
 </figure>
 
-The GUI complexity (simple or normal) is selected in the vehicle component editor window in the previous step.
+The GUI complexity (simple or normal) is selected in the vehicle component editor window when creating a project.
 The normal layout is explained below, the simple layout is similar but has less elements.
+
+When you open an existing project, AMC goes directly to the parameter editor. Use the **Edit vehicle components** button
+there to review or change the project's component information.
 
 #### Parameter editor and uploader workflow overview
 
@@ -266,7 +412,8 @@ Do this in a loop until the software tells you the process is finished and autom
   - Preserves your reasoning for future reference or troubleshooting
 - Press *Del* and/or *Add* buttons to delete or add parameters respectively (marked with the big red number 5),
 - If necessary scroll down using the scroll bar on the right and make sure you edit all parameters,
-- Press *Upload selected params to FC, and advance to next param file* (marked with the big red number 7),
+- If connected, press *Upload selected params to FC, and advance to next param file* (marked with the big red number 7).
+  To advance without uploading, use *Skip parameter file*; this also works offline.
 - Repeat from the top until the software tells you the process is finished.
 
 #### 1. See the Current Vehicle Directory (optional)
@@ -296,9 +443,18 @@ select a different intermediate parameter file in the `Current intermediate para
 The steps are grouped into phases and optional phases are greyed-out.
 There are mouse-over hints for each phase.
 
+Click the **Configuration sequence progress** header to collapse or expand the bar.
+Its progress continues to update while collapsed, leaving more vertical space for the parameter table.
+You can also focus the header with **Tab** and toggle it with **Enter** or **Space**.
+
 ![Parameter editor and uploader window](images/App_parameter_editor_and_uploader.png)
 
 #### 4b. Viewing Documentation
+
+Click the **Documentation** section header to hide or restore its contents without losing the
+automatic-browser-opening setting. The header still shows the current step when collapsed,
+and documentation links continue to update when you change steps.
+Both information sections start expanded and retain your collapse choices while the editor remains open.
 
 - **Click on the documentation labels to open the corresponding documentation in a web browser.**
 - Documentation is split into four categories:
@@ -446,12 +602,32 @@ Here is a list of command line options:
 - **`--skip-check-for-updates`**: Skip check for software updates before starting the software. Default is False.
 - **`--baudrate BAUDRATE`**: MAVLink serial connection baudrate to the flight controller. Default is 115200
 - **`--device`**: The MAVLink connection string to the flight controller. It defaults to autoconnection to the first available flight controller.
-- **`--vehicle-dir`**: The directory containing intermediate parameter files. Defaults to the current working directory directory.
+- **`--vehicle-dir`**: The directory containing intermediate parameter files. Defaults to the current working directory.
+  When explicitly supplied with `--bin-log`, it is the complete destination directory for the new project.
+- **`--bin-log PATH`**: Create a new vehicle project from an ArduPilot `.bin` log file without
+  connecting to a flight controller. By default, the new project is created in the default vehicles directory.
+  An explicitly supplied `--vehicle-dir` instead selects the complete destination directory.
+- **`--template-dir PATH`**: Optional template directory to use with `--bin-log`. If omitted,
+  AMC uses the empty template matching the vehicle type and major/minor firmware version extracted
+  from the log.
+
+  Bundled empty templates currently include:
+
+  - `ArduCopter/empty_4.5.x`
+  - `ArduCopter/empty_4.6.x`
+  - `ArduCopter/empty_4.7.x`
+  - `ArduPlane/empty_4.7.x`
+
+  These are the currently supported automatic defaults; for other vehicle and firmware
+  combinations, use `--template-dir` to provide a compatible template explicitly.
 - **`--n`**: Start directly on the nth intermediate parameter file (skip previous files). The default is 0.
-- **`--skip-component-editor`**: Skip the component editor window. Only use this if all components have been configured. Default is False
 - **`--loglevel`**: The logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL). The default is INFO.
 - **`-t` or `--vehicle-type`**: The type of the vehicle.
-  Choices are 'AP_Periph', 'AntennaTracker', 'ArduCopter', 'ArduPlane', 'ArduSub', 'Blimp', 'Heli', 'Rover', 'SITL'. Defaults to 'ArduCopter'.
+  Choices are 'AP_Periph', 'AntennaTracker', 'ArduCopter', 'ArduPlane', 'ArduSub', 'Blimp', 'Heli', 'Rover', 'SITL'.
+  Without `--bin-log`, the default is 'ArduCopter'. With `--bin-log`, the type is derived from the log unless `-t` is given.
+  With `--bin-log`, this value validates both the vehicle type reported by the log and the selected template, and records
+  the explicitly selected type in the new project (for example, `Heli` uses the compatible `ArduCopter` template).
+  SITL and AP_Periph are pseudo-types and cannot be used with `--bin-log`.
 - **`-r` or `--reboot-time`**: Flight controller reboot time. The default is 7.
 - **`-v` or `--version`**: Display version information and exit.
 
@@ -477,17 +653,30 @@ ardupilot_methodic_configurator --device="/dev/ttyUSB0" --vehicle-dir="/home/use
 ardupilot_methodic_configurator --device="tcp:127.0.0.1:5760" --vehicle-dir="/path/to/params"
 ```
 
-#### Skip Steps for Faster Workflow
+#### Create a Project from a `.bin` Log
 
 ```bash
-# Skip component editor (when components already configured)
-ardupilot_methodic_configurator --skip-component-editor --vehicle-dir="C:\MyDrone"
+# Use the empty template inferred from the vehicle type and firmware in the log
+ardupilot_methodic_configurator --bin-log="C:\logs\flight.bin"
+
+# Use a specific template directory instead of the inferred empty template
+ardupilot_methodic_configurator --bin-log="C:\logs\flight.bin" --template-dir="C:\templates\Holybro_X500"
+```
+
+After the project is created from the log, AMC continues through the normal GUI workflow:
+the Vehicle Component Editor opens first, followed by the parameter editor and uploader.
+
+#### Start with an Existing Project
+
+```bash
+# Existing projects open directly in the parameter editor
+ardupilot_methodic_configurator --vehicle-dir="C:\MyDrone"
 
 # Start from specific parameter file (skip earlier steps)
 ardupilot_methodic_configurator --n=5 --vehicle-dir="C:\MyDrone"
 
-# Combine multiple options for fastest startup
-ardupilot_methodic_configurator --device="COM3" --vehicle-dir="C:\MyDrone" --skip-component-editor --n=3
+# Combine options when opening an existing project
+ardupilot_methodic_configurator --device="COM3" --vehicle-dir="C:\MyDrone" --n=3
 ```
 
 #### Different Vehicle Types
@@ -518,7 +707,17 @@ ardupilot_methodic_configurator --loglevel=DEBUG --skip-check-for-updates --devi
 
 #### Pro Tip: Desktop Shortcuts
 
-Create multiple desktop shortcuts for different projects:
+Create multiple desktop shortcuts for different projects or connection settings.
+On Windows, copy an existing AMC shortcut, rename it, then right-click it and select
+**Properties → Shortcut**. Append the desired options to **Target**, after the existing
+executable path and a separating space. Keep any quotes around the executable path.
+Click **Apply**, then **OK** to save the options for every launch of that shortcut.
+If an option such as `--device` is already present, replace its value rather than adding it twice.
+
+For example, a shortcut named **AMC - Mission Planner** can append
+`--device="udpin:0.0.0.0:14600"` to use the
+[Mission Planner forwarding connection](#connecting-amc-through-mission-planner-mavlink-forwarding).
+Keep a separate shortcut without this option for automatic connection detection.
 
 **Shortcut 1** (MyQuadcopter):
 
@@ -552,8 +751,6 @@ Use an empty space to separate each option.
 1. `--device <devicename>` this explicitly connects to \<devicename> skipping the auto-detection process.
 1. `--vehicle-dir <vehicle-directory>` this explicitly looks for project files in \<vehicle-directory> saving you the trouble to
  manually select it in the GUI.
-1. `--skip-component-editor` if you do not need to change the components and connections of your vehicle, this will skip the
- component and connection editor window.
 1. `--n <number>` this will skip directly to step number \<number> so that you do not need to skip the previous steps
 1. `--skip-check-for-updates` this saves very little time on startup, but you can skip it using this.
 

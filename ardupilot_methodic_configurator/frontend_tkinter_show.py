@@ -18,6 +18,7 @@ from typing import Any, ClassVar, NamedTuple, Optional, cast
 from weakref import WeakKeyDictionary
 
 from ardupilot_methodic_configurator import _
+from ardupilot_methodic_configurator.macos_utilities import is_macos_sequoia_or_older
 
 # Tooltip positioning constants
 TOOLTIP_MAX_OFFSET = 100  # Maximum horizontal offset from widget edge
@@ -120,7 +121,8 @@ def _monitor_bounds_tk(widget: tk.Misc) -> MonitorBounds:
 
     """
     toplevel = widget.winfo_toplevel()
-    toplevel.update_idletasks()
+    if not is_macos_sequoia_or_older():
+        toplevel.update_idletasks()
 
     # Get virtual root position (top-left corner of the screen)
     vroot_x = toplevel.winfo_vrootx()
@@ -412,7 +414,7 @@ def get_monitor_bounds(widget: tk.Misc) -> MonitorBounds:
         bounds = _get_validated_bounds(_monitor_bounds_windows(widget))
     elif platform_system() == "Darwin":
         bounds = _get_validated_bounds(_monitor_bounds_macos(widget))
-    else:
+    elif platform_system() == "Linux":
         # Linux: use screeninfo + pointer position to find the correct monitor
         bounds = _get_validated_bounds(_monitor_bounds_linux(widget))
 
@@ -518,6 +520,20 @@ def calculate_tooltip_position(  # noqa: PLR0913, PLR0917 # pylint: disable=too-
     return x, y
 
 
+def position_tooltip_at_pointer(widget: tk.Widget, tooltip: tk.Toplevel | None) -> None:
+    """Place a tooltip beside the pointer while keeping it inside the active monitor."""
+    if tooltip is None:
+        return
+    try:
+        tooltip.update_idletasks()
+        left, top, right, bottom = get_monitor_bounds(widget.winfo_toplevel())
+        x = max(left, min(widget.winfo_pointerx() + 12, right - tooltip.winfo_reqwidth()))
+        y = max(top, min(widget.winfo_pointery() + 12, bottom - tooltip.winfo_reqheight()))
+        tooltip.geometry(f"+{x}+{y}")
+    except tk.TclError:
+        pass
+
+
 class Tooltip:
     """
     A tooltip class for displaying tooltips on widgets.
@@ -527,7 +543,7 @@ class Tooltip:
 
     _active_tooltip: ClassVar[Optional["Tooltip"]] = None
 
-    def __init__(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def __init__(
         self,
         widget: tk.Widget,
         text: str,
@@ -588,6 +604,9 @@ class Tooltip:
         """Create and show the tooltip when the pointer is still over the widget after the delay."""
         self._cancel_show()
 
+        if not self.text:
+            return
+
         try:
             pointed = self.widget.winfo_containing(self.widget.winfo_pointerx(), self.widget.winfo_pointery())
             widget_path = str(self.widget)
@@ -630,12 +649,20 @@ class Tooltip:
             self.tooltip, text=self.text, background="#ffffe0", relief="solid", borderwidth=1, justify=tk.LEFT
         )
         tooltip_label.pack()
-        self.position_tooltip()
+        if self._is_aqua:
+
+            def position_when_idle() -> None:
+                self.timers.pop("position", None)
+                self.position_tooltip()
+
+            self.timers["position"] = self.widget.after_idle(position_when_idle)
+        else:
+            self.position_tooltip()
 
         if self.tooltip.winfo_exists():
             Tooltip._active_tooltip = self
 
-            self.tooltip.update_idletasks()  # Force macOS to finish rendering text and colors
+            self.tooltip.update_idletasks()
             self.tooltip.deiconify()  # still invisible on Mac
 
             if self._is_aqua:
@@ -688,10 +715,22 @@ class Tooltip:
     def force_hide(self) -> None:
         """Immediately destroy the tooltip globally across all OSs."""
         self._cancel_show()
+        self._cancel_timer("position")
         self._cancel_timer("alpha")
         if self.tooltip:
+            tooltip = self.tooltip
             with contextlib.suppress(tk.TclError):
-                self.tooltip.destroy()
+                tooltip.withdraw()
+                destroy_timer_id = tooltip.after(50, tooltip.destroy)
+
+                def cancel_destroy_timer(event: tk.Event) -> None:
+                    if event.widget is tooltip:
+                        with contextlib.suppress(tk.TclError):
+                            tooltip.after_cancel(destroy_timer_id)
+
+                # Python destroy releases child widgets and registered commands.
+                # Cancel its timer before owner teardown can delete the callback.
+                tooltip.bind("<Destroy>", cancel_destroy_timer, add="+")
             self.tooltip = None
         if Tooltip._active_tooltip is self:
             Tooltip._active_tooltip = None

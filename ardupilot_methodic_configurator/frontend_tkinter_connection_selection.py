@@ -16,7 +16,6 @@ from argparse import ArgumentParser, Namespace
 from logging import basicConfig as logging_basicConfig
 from logging import debug as logging_debug
 from logging import error as logging_error
-from logging import getLevelName as logging_getLevelName
 from logging import warning as logging_warning
 from sys import exit as sys_exit
 from tkinter import messagebox, simpledialog, ttk
@@ -58,7 +57,7 @@ class ConnectionSelectionWidgets:  # pylint: disable=too-many-instance-attribute
             if flight_controller.comport and hasattr(flight_controller.comport, "device")
             else None
         )
-        self.connection_progress_window: ProgressWindow
+        self._reconnect_in_progress = False
         self._refresh_timer_id: str | None = None
         self._is_refreshing = False
 
@@ -81,7 +80,7 @@ class ConnectionSelectionWidgets:  # pylint: disable=too-many-instance-attribute
         self._connection_history_cache: list[str] = ProgramSettings.get_connection_history()
         # Perform an initial connection discovery using the cached history so the
         # combobox starts from the same source-of-truth list that refresh uses.
-        self.flight_controller.discover_connections(preserved_connections=self._connection_history_cache)
+        self.flight_controller.discover_connections(preserved_connections=self._connections_to_preserve())
 
         # Create a read-only combobox for flight controller connection selection
         self.conn_selection_combobox = PairTupleCombobox(
@@ -122,6 +121,14 @@ class ConnectionSelectionWidgets:  # pylint: disable=too-many-instance-attribute
         # Start periodic port refresh
         self.start_periodic_refresh()
 
+    def _connections_to_preserve(self, current_selection: str | None = None) -> list[str]:
+        """Keep explicit device selections available without persisting failed connections."""
+        connections = self._connection_history_cache[:]
+        for connection in (self.previous_selection, current_selection):
+            if connection and connection != _("Add another") and connection not in connections:
+                connections.append(connection)
+        return connections
+
     def _persist_and_cache_connection(self, connection_string: str) -> str:
         """
         Persist a connection string to settings and update the in-memory history cache.
@@ -154,7 +161,7 @@ class ConnectionSelectionWidgets:  # pylint: disable=too-many-instance-attribute
             current_selection = self.conn_selection_combobox.get_selected_key()
             self.flight_controller.discover_connections(
                 progress_callback=None,
-                preserved_connections=self._connection_history_cache,
+                preserved_connections=self._connections_to_preserve(current_selection),
             )
             new_connection_tuples = self.flight_controller.get_connection_tuples()
 
@@ -244,9 +251,18 @@ class ConnectionSelectionWidgets:  # pylint: disable=too-many-instance-attribute
         return selected_connection
 
     def reconnect(self, selected_connection: str = "") -> bool:  # Default is auto-connect
-        self.connection_progress_window = ProgressWindow(
-            self.parent.root, _("Connecting with the FC"), _("Connection step {} of {}")
-        )
+        """Ignore nested connection requests while the current operation pumps Tk events."""
+        if self._reconnect_in_progress:
+            return True
+        self._reconnect_in_progress = True
+        try:
+            return self._reconnect(selected_connection)
+        finally:
+            self._reconnect_in_progress = False
+
+    def _reconnect(self, selected_connection: str) -> bool:
+        """Connect once, retaining ownership of this operation's progress window."""
+        progress_window = ProgressWindow(self.parent.root, _("Connecting with the FC"), _("Connection step {} of {}"))
         # Get the current baudrate from the combobox
         selected_baudrate = "unknown"  # Initialize with default value for error handling
         try:
@@ -267,15 +283,21 @@ class ConnectionSelectionWidgets:  # pylint: disable=too-many-instance-attribute
             self.baudrate_var.set(str(self.default_baudrate))
             current_baudrate = self.default_baudrate
 
-        error_message = self.flight_controller.connect(
-            selected_connection, self.connection_progress_window.update_progress_bar, baudrate=current_baudrate
-        )
+        refresh_was_running = self._refresh_timer_id is not None
+        self.stop_periodic_refresh()
+        connected = False
+        try:
+            error_message = progress_window.run_task(
+                lambda report: self.flight_controller.connect(selected_connection, report, baudrate=current_baudrate)
+            )
+            connected = not error_message
+        finally:
+            progress_window.destroy()
+            if refresh_was_running and not connected:
+                self.start_periodic_refresh()
         if error_message:
             show_no_connection_error(error_message)
             return True
-        self.connection_progress_window.destroy()
-        # Stop periodic refresh when connection is established
-        self.stop_periodic_refresh()
         # Store the current connection as the previous selection
         if self.flight_controller.comport and hasattr(self.flight_controller.comport, "device"):
             device: str = self.flight_controller.comport.device
@@ -312,10 +334,12 @@ class ConnectionSelectionWindow(BaseWindow):
         flight_controller: FlightController,
         connection_result_string: str,
         default_baudrate: int = 115200,
+        show_skip_connection_option: bool = True,
     ) -> None:
         super().__init__()
         self.root.title(_("AMC {version} - Flight controller connection").format(version=__version__))
-        self.root.geometry(self.calculate_scaled_geometry(520, 380))
+        window_height = 380 if show_skip_connection_option else 253
+        self.root.geometry(self.calculate_scaled_geometry(520, window_height))
         self.center_window_on_screen(self.root)
         self.default_baudrate = default_baudrate
         self.flight_controller = flight_controller
@@ -381,30 +405,24 @@ class ConnectionSelectionWindow(BaseWindow):
         )
         self.connection_selection_widgets.container_frame.pack(expand=False, fill=tk.X, padx=5, pady=6)
 
-        # Option 3 - Skip FC connection, just edit the .param files on disk
-        option3_label = ttk.Label(text=_("No connection"), style="Bold.TLabel")
-        option3_label_frame = ttk.LabelFrame(self.main_frame, labelwidget=option3_label)
-        option3_label_frame.pack(expand=False, fill=tk.X, padx=6, pady=6)
-        # option3_label = ttk.Label(option3_label_frame, anchor=tk.CENTER, justify=tk.CENTER,
-        #                          text=_("Skip the flight controller connection,\n")
-        #                          "no default parameter values will be fetched from the FC,\n"
-        #                          "default parameter values from disk will be used instead\n"
-        #                          "(if '00_default.param' file is present)\n"
-        #                          "and just edit the intermediate '.param' files on disk")
-        # option3_label.pack(expand=False, fill=tk.X, padx=6)
-        skip_fc_connection_button = ttk.Button(
-            option3_label_frame,
-            text=_("Skip FC connection, just edit the .param files on disk"),
-            command=lambda fc=flight_controller: self.skip_fc_connection(fc),  # type: ignore[misc]
-        )
-        skip_fc_connection_button.pack(expand=False, fill=tk.X, padx=15, pady=6)
-        show_tooltip(
-            skip_fc_connection_button,
-            _(
-                "No parameter values will be fetched from the FC, default parameter values from disk will be used\n"
-                "instead (if '00_default.param' file is present) and just edit the intermediate '.param' files on disk"
-            ),
-        )
+        if show_skip_connection_option:
+            # Option 3 - Skip FC connection, just edit the .param files on disk
+            option3_label = ttk.Label(text=_("No connection"), style="Bold.TLabel")
+            option3_label_frame = ttk.LabelFrame(self.main_frame, labelwidget=option3_label)
+            option3_label_frame.pack(expand=False, fill=tk.X, padx=6, pady=6)
+            skip_fc_connection_button = ttk.Button(
+                option3_label_frame,
+                text=_("Skip FC connection, just edit the .param files on disk"),
+                command=lambda fc=flight_controller: self.skip_fc_connection(fc),  # type: ignore[misc]
+            )
+            skip_fc_connection_button.pack(expand=False, fill=tk.X, padx=15, pady=6)
+            show_tooltip(
+                skip_fc_connection_button,
+                _(
+                    "No parameter values will be fetched from the FC, default parameter values from disk will be used\n"
+                    "instead (if '00_default.param' file is present) and just edit the intermediate '.param' files on disk"
+                ),
+            )
 
         # Bind the close_connection_and_quit function to the window close event
         self.root.protocol("WM_DELETE_WINDOW", self.close_and_quit)
@@ -454,7 +472,7 @@ def argument_parser() -> Namespace:  # pragma: no cover
 def main() -> None:  # pragma: no cover
     args = argument_parser()
 
-    logging_basicConfig(level=logging_getLevelName(args.loglevel), format="%(asctime)s - %(levelname)s - %(message)s")
+    logging_basicConfig(level=args.loglevel, format="%(asctime)s - %(levelname)s - %(message)s")
 
     logging_warning(
         _("This main is for testing and development only, usually the ConnectionSelectionWindow is called from another script")

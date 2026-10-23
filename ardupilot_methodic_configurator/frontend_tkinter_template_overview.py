@@ -11,9 +11,9 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import argparse
+import contextlib
 import tkinter as tk
 from logging import basicConfig as logging_basicConfig
-from logging import getLevelName as logging_getLevelName
 from logging import info as logging_info
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
@@ -34,12 +34,12 @@ class VehicleComponentsProviderProtocol(Protocol):
     @staticmethod
     def get_vehicle_components_overviews() -> dict[str, TemplateOverview]:
         """Get vehicle components overviews."""
-        ...  # pylint: disable=unnecessary-ellipsis
+        ...
 
     @staticmethod
     def get_vehicle_image_filepath(relative_template_path: str) -> str:
         """Get vehicle image filepath."""
-        ...  # pylint: disable=unnecessary-ellipsis
+        ...
 
 
 class ProgramSettingsProviderProtocol(Protocol):  # pylint: disable=too-few-public-methods
@@ -48,7 +48,7 @@ class ProgramSettingsProviderProtocol(Protocol):  # pylint: disable=too-few-publ
     @staticmethod
     def store_template_dir(relative_template_dir: str) -> None:
         """Store template directory."""
-        ...  # pylint: disable=unnecessary-ellipsis
+        ...
 
 
 IMAGE_HEIGHT_PX = 100
@@ -73,7 +73,7 @@ class TemplateOverviewWindow(BaseWindow):  # pylint: disable=too-many-instance-a
 
     """
 
-    def __init__(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def __init__(
         self,
         parent: tk.Tk | None = None,
         vehicle_components_provider: VehicleComponentsProviderProtocol | None = None,
@@ -129,7 +129,7 @@ class TemplateOverviewWindow(BaseWindow):  # pylint: disable=too-many-instance-a
     def _initialize_ui_components(self) -> None:
         """Initialize UI components with proper scaling."""
         # Initialize frames
-        self.top_frame = ttk.Frame(self.main_frame, height=int(IMAGE_HEIGHT_PX * self.dpi_scaling_factor))
+        self.top_frame = ttk.Frame(self.main_frame)
 
         # Initialize instruction label
         instruction_text = self._get_instruction_text()
@@ -161,17 +161,23 @@ class TemplateOverviewWindow(BaseWindow):  # pylint: disable=too-many-instance-a
 
     def _setup_layout(self) -> None:
         """Setup the layout of UI components."""
-        # Pack top frame
-        self.top_frame.pack(side=tk.TOP, fill="x", expand=False)
-
         # Pack instruction label
         scaled_pady = self.calculate_scaled_padding_tuple(10, 20)
         self.instruction_label.pack(side=tk.LEFT, pady=scaled_pady)
 
         # Pack image label
         scaled_padx = self.calculate_scaled_padding_tuple(20, 20)
-        scaled_pady_value = int(IMAGE_HEIGHT_PX * self.dpi_scaling_factor / 2)
-        self.image_label.pack(side=tk.RIGHT, anchor=tk.NE, padx=scaled_padx, pady=scaled_pady_value)
+        self.image_label.pack(side=tk.RIGHT, anchor=tk.NE, padx=scaled_padx)
+
+        # Reserve enough room for either the instructions or an image plus the
+        # label's four-pixel border, then keep later image changes from moving the tree.
+        header_height = max(
+            self.instruction_label.winfo_reqheight() + sum(scaled_pady),
+            int(IMAGE_HEIGHT_PX * self.dpi_scaling_factor) + 4,
+        )
+        self.top_frame.configure(height=header_height)
+        self.top_frame.pack(side=tk.TOP, fill="x", expand=False)
+        self.top_frame.pack_propagate(flag=False)
 
         # Pack tree frame
         self.tree_frame.pack(fill=tk.BOTH, expand=True)
@@ -183,12 +189,8 @@ class TemplateOverviewWindow(BaseWindow):  # pylint: disable=too-many-instance-a
     def run_app(self) -> None:
         """Run the TemplateOverviewWindow application."""
         if isinstance(self.root, tk.Toplevel):
-            try:
-                while self.root.children:
-                    self.root.update_idletasks()
-                    self.root.update()
-            except tk.TclError as _exp:
-                pass
+            with contextlib.suppress(tk.TclError):
+                self.root.wait_window()
         elif isinstance(self.root, tk.Tk):
             self.root.mainloop()
 
@@ -235,6 +237,7 @@ class TemplateOverviewWindow(BaseWindow):  # pylint: disable=too-many-instance-a
         # default size.  Without this the alt theme can inherit a larger font from
         # the Windows system font, making rows look too big.
         style.configure("Treeview", font=("TkDefaultFont", self.default_font_size))
+        self.tree.tag_configure("striped", background="#eeeeee")
 
     def _setup_treeview_columns(self) -> None:
         """Setup treeview column headers."""
@@ -249,12 +252,15 @@ class TemplateOverviewWindow(BaseWindow):  # pylint: disable=too-many-instance-a
             connected_fc_vehicle_type: Optional firmware type to filter templates by
 
         """
+        visible_row_index = 0
         for key, template_overview in self.vehicle_components_provider.get_vehicle_components_overviews().items():
             attribute_names = template_overview.attributes()
             values = (key, *(getattr(template_overview, attr, "") for attr in attribute_names))
             if connected_fc_vehicle_type and not key.startswith(connected_fc_vehicle_type):
                 continue
-            self.tree.insert("", "end", text=key, values=values)
+            tags = ("striped",) if visible_row_index % 2 else ()
+            self.tree.insert("", "end", text=key, values=values, tags=tags)
+            visible_row_index += 1
 
     def _preselect_current_template(self, current_template_dir: str) -> None:
         """
@@ -379,28 +385,31 @@ class TemplateOverviewWindow(BaseWindow):  # pylint: disable=too-many-instance-a
         for index, (_val, k) in enumerate(col_data):
             self.tree.move(k, "", index)
 
+        for index, item_id in enumerate(self.tree.get_children("")):
+            self.tree.item(item_id, tags=("striped",) if index % 2 else ())
+
         # reverse sort next time
         self.tree.heading(col, command=lambda: self._sort_by_column(col, not reverse))
 
     def _display_vehicle_image(self, template_path: str) -> None:
         """Display the vehicle image corresponding to the selected template."""
-        # Delete the previous image
-        for widget in self.top_frame.winfo_children():
-            if isinstance(widget, ttk.Label) and widget == self.image_label:
-                widget.destroy()
         try:
             vehicle_image_filepath = self.get_vehicle_image_filepath(template_path)
-            self.image_label = self.put_image_in_label(self.top_frame, vehicle_image_filepath, IMAGE_HEIGHT_PX)
+            image_widget = self.put_image_in_label(self.top_frame, vehicle_image_filepath, IMAGE_HEIGHT_PX)
+            # Reuse the packed label so selecting a template never changes the
+            # header's requested geometry. Keep a reference to PhotoImage too.
+            self.image_label.configure(image=image_widget.cget("image"), text=image_widget.cget("text"), padding=0)
+            self.image_label.image = getattr(image_widget, "image", None)  # type: ignore[attr-defined]
+            image_widget.destroy()
         except FileNotFoundError:
-            scaled_padding = int(((IMAGE_HEIGHT_PX / 2) - 5.5) * self.dpi_scaling_factor)
-            self.image_label = ttk.Label(
-                self.top_frame,
+            self.image_label.configure(
+                image="",
                 text=_("No 'vehicle.jpg' image file in the vehicle template directory."),
-                padding=scaled_padding,
+                # Keep the wrapped fallback text within the fixed-height header.
+                wraplength=int(300 * self.dpi_scaling_factor),
+                padding=self.calculate_scaled_padding_tuple(4, 4),
             )
-        # Scale padding for HiDPI displays
-        scaled_padx = (int(4 * self.dpi_scaling_factor), 0)
-        self.image_label.pack(side=tk.RIGHT, anchor=tk.NE, padx=scaled_padx, pady=(0, 0))
+            self.image_label.image = None  # type: ignore[attr-defined]
 
     def get_vehicle_image_filepath(self, template_path: str) -> str:
         """
@@ -452,7 +461,7 @@ def setup_logging(loglevel: str) -> None:  # pragma: no cover
         loglevel: The log level as a string (e.g. 'DEBUG', 'INFO')
 
     """
-    logging_basicConfig(level=logging_getLevelName(loglevel), format="%(asctime)s - %(levelname)s - %(message)s")
+    logging_basicConfig(level=loglevel, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def main() -> None:  # pragma: no cover
@@ -463,8 +472,9 @@ def main() -> None:  # pragma: no cover
     window = TemplateOverviewWindow()
     window.run_app()
 
-    if window and ProgramSettings.get_recently_used_dirs():
-        logging_info(ProgramSettings.get_recently_used_dirs()[0])
+    recent_dirs = ProgramSettings.get_recently_used_dirs()
+    if window and recent_dirs[0]:
+        logging_info(recent_dirs[0])
 
 
 if __name__ == "__main__":  # pragma: no cover

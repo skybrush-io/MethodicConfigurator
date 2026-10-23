@@ -23,8 +23,13 @@ from ardupilot_methodic_configurator.common_arguments import add_common_argument
 from ardupilot_methodic_configurator.frontend_tkinter_base_window import BaseWindow, center_over_parent
 from ardupilot_methodic_configurator.frontend_tkinter_calibration_popup_base import CalibrationPopupBase
 from ardupilot_methodic_configurator.plugins.data_model_compass_calibration import CompassCalibrationDataModel
+from ardupilot_methodic_configurator.plugins.frontend_tkinter_helpers import (
+    end_calibration_navigation_lock,
+    start_calibration_with_navigation_lock,
+)
 from ardupilot_methodic_configurator.plugins.plugin_constants import PLUGIN_COMPASS_CALIBRATION
 from ardupilot_methodic_configurator.plugins.plugin_factory import PluginModelContext, plugin_factory
+from ardupilot_methodic_configurator.plugins.plugin_protocol import PluginPauseReason
 
 
 class CompassCalibrationInstructionsPopup(BaseWindow):
@@ -176,6 +181,14 @@ class CompassCalibrationPopup(CalibrationPopupBase["CompassCalibrationDataModel"
 
         self.cancel_button = ttk.Button(content_frame, text=_("Cancel Calibration"), command=self._on_cancel)
         self.cancel_button.pack(pady=(15, 0))
+
+        self.abandon_button = ttk.Button(
+            content_frame,
+            text=_("Abandon Monitoring"),
+            state="disabled",
+            command=self._on_abandon_calibration,
+        )
+        self.abandon_button.pack(pady=(5, 0))
 
     def _load_expected_compass_ids(self) -> list[int]:
         """Ask the data model which compasses are expected before telemetry starts arriving."""
@@ -373,7 +386,28 @@ class CompassCalibrationPopup(CalibrationPopupBase["CompassCalibrationDataModel"
 
         messagebox.showerror(_("Failed to Cancel"), error_msg, parent=self.root)
         logging_debug(_("Compass calibration cancel rejected: %(error)s"), {"error": error_msg})
+        self.abandon_button.configure(state="normal")
         self._timer_id = self.root.after(100, self._check_progress)
+
+    def _on_abandon_calibration(self) -> None:
+        """Close local monitoring after warning that FC cancellation was not confirmed."""
+        self._stop_polling()
+        should_abandon = messagebox.askyesno(
+            _("Abandon Monitoring"),
+            _(
+                "Cancellation was not confirmed by the flight controller. Abandon local monitoring and unlock navigation? "
+                "Compass calibration may still be running on the flight controller."
+            ),
+            parent=self.root,
+        )
+        if not should_abandon:
+            self._timer_id = self.root.after(100, self._check_progress)
+            return
+
+        try:
+            self.model.finish_calibration()
+        finally:
+            self.destroy()
 
 
 # pylint: disable=too-many-ancestors
@@ -391,7 +425,14 @@ class CompassCalibrationView(ttk.Frame):
         self.base_window = base_window
         self._instructions_popup: CompassCalibrationInstructionsPopup | None = None
         self._calibration_popup: CompassCalibrationPopup | None = None
+        self._calibration_active = False
         self._setup_ui()
+
+    def on_suspend(self, reason: PluginPauseReason = PluginPauseReason.EXCLUSIVE_OPERATION) -> None:
+        """Yield FC reception; an open calibration popup keeps recovery deferred until it closes."""
+
+    def on_resume(self) -> None:
+        """Resume after FC reception is available; calibration popups own their separate polling lifecycle."""
 
     def _setup_ui(self) -> None:
         main_frame = ttk.Frame(self)
@@ -407,14 +448,42 @@ class CompassCalibrationView(ttk.Frame):
 
     def _begin_calibration(self) -> None:
         logging_debug(_("Compass calibration instructions accepted; starting calibration."))
+        start_calibration_with_navigation_lock(self.base_window, self, self._start_calibration)
+
+    def _start_calibration(self) -> bool:
+        """Retain the shared lock for the lifetime of the non-modal progress popup."""
         success, error_msg = self.model.start_calibration()
         if success:
             logging_debug(_("Compass calibration start succeeded; opening progress popup."))
             parent = cast("tk.Widget", self.winfo_toplevel())
             self._calibration_popup = CompassCalibrationPopup(parent, self.model)
+            self._calibration_active = True
+            self._calibration_popup.root.bind("<Destroy>", self._on_calibration_popup_destroyed, add="+")
         else:
             logging_debug(_("Compass calibration start failed: %(error)s"), {"error": error_msg})
             messagebox.showerror(_("Failed to Start"), error_msg, parent=self)
+        return success
+
+    def _on_calibration_popup_destroyed(self, event: tk.Event) -> None:
+        """Release navigation only when the popup itself, not a child control, closes."""
+        if self._calibration_popup is not None and event.widget is self._calibration_popup.root:
+            self._calibration_active = False
+            end_calibration_navigation_lock(self.base_window, self)
+
+    def destroy(self) -> None:
+        """Close owned popups and release navigation during plugin teardown."""
+        try:
+            if self._calibration_active:
+                self.model.cancel_calibration()
+            if self._calibration_popup is not None:
+                with suppress(tk.TclError):
+                    self._calibration_popup.destroy()
+            if self._instructions_popup is not None:
+                with suppress(tk.TclError):
+                    self._instructions_popup.root.destroy()
+        finally:
+            end_calibration_navigation_lock(self.base_window, self)
+            super().destroy()
 
 
 def _create_compass_calibration_view(

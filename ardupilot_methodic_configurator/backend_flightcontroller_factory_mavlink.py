@@ -13,13 +13,15 @@ from typing import TYPE_CHECKING, Optional, Protocol
 from pymavlink import mavutil
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ardupilot_methodic_configurator.backend_flightcontroller_protocols import MavlinkConnection
 
 
 class MavlinkConnectionFactory(Protocol):  # pylint: disable=too-few-public-methods
     """Protocol for creating MAVLink connections."""
 
-    def create(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def create(
         self,
         device: str,
         baudrate: int,
@@ -28,13 +30,13 @@ class MavlinkConnectionFactory(Protocol):  # pylint: disable=too-few-public-meth
         progress_callback: object | None = None,
     ) -> Optional["MavlinkConnection"]:
         """Create a MAVLink connection."""
-        ...  # pylint: disable=unnecessary-ellipsis
+        ...
 
 
 class SystemMavlinkConnectionFactory:  # pylint: disable=too-few-public-methods
     """Real implementation using PyMAVLink library."""
 
-    def create(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def create(
         self,
         device: str,
         baudrate: int,
@@ -69,7 +71,7 @@ class FakeMavlinkConnectionFactory:
         """Initialize mock factory."""
         self._connections: dict[str, FakeMavlinkConnection] = {}
 
-    def create(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def create(
         self,
         device: str,
         baudrate: int,
@@ -100,17 +102,26 @@ class FakeMavlinkConnection:
         self.baudrate = baudrate
         self.connected = True
         self._message_queue: list[object] = []
+        self.message_hooks: list[Callable[[object, object], None]] = []
 
     def recv_match(
         self,
         blocking: bool = True,  # noqa: ARG002  # pylint: disable=unused-argument
         timeout: float | None = None,  # noqa: ARG002  # pylint: disable=unused-argument
+        type: str | list[str] | None = None,  # noqa: A002  # pylint: disable=redefined-builtin
     ) -> object | None:
-        """Receive a matched message from queue."""
+        """Receive a matching queued message and dispatch every packet to message hooks."""
         # Note: blocking and timeout parameters are accepted for API compatibility
         # but not used in fake implementation
-        if self._message_queue:
-            return self._message_queue.pop(0)
+        accepted_types = {type} if isinstance(type, str) else set(type or [])
+        while self._message_queue:
+            message = self._message_queue.pop(0)
+            for hook in self.message_hooks:
+                hook(self, message)
+            get_message_type = getattr(message, "get_type", None)
+            message_type = get_message_type() if callable(get_message_type) else None
+            if not accepted_types or message_type is None or message_type in accepted_types:
+                return message
         return None
 
     def mav_send(self, msg: object) -> None:

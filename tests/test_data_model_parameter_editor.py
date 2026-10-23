@@ -10,30 +10,37 @@ SPDX-FileCopyrightText: 2024-2026 Amilcar Lucas
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from ardupilot_methodic_configurator.backend_flightcontroller_protocols import FileUploadCheckStatus, FileUploadResult
 from ardupilot_methodic_configurator.data_model_ardupilot_parameter import (
     ArduPilotParameter,
+    ParameterForcedOrDerivedError,
     ParameterOutOfRangeError,
     ParameterUnchangedError,
 )
 from ardupilot_methodic_configurator.data_model_par_dict import Par, ParamFileError, ParDict
 from ardupilot_methodic_configurator.data_model_parameter_editor import (
+    FcParameterCopyResult,
     InvalidParameterNameError,
     OperationNotPossibleError,
     ParameterEditor,
     ParameterValueUpdateStatus,
 )
 from ardupilot_methodic_configurator.data_model_safe_evaluator import ConfigurationStepEvalError
+from ardupilot_methodic_configurator.plugins.frontend_tkinter_helpers import refresh_parameter_editor_after_calibration
 from ardupilot_methodic_configurator.plugins.plugin_constants import (
     PLUGIN_AHRS_ORIENTATION,
     PLUGIN_BATTERY_MONITOR,
     PLUGIN_COMPASS_CALIBRATION,
     PLUGIN_ESC_RPM_SCALE,
     PLUGIN_MOTOR_TEST,
+    PLUGIN_SERVO_OUT,
 )
 
 # pylint: disable=redefined-outer-name, too-many-lines, protected-access
@@ -46,6 +53,8 @@ def mock_flight_controller() -> MagicMock:
     mock_fc.fc_parameters = {"PARAM1": 1.0, "PARAM2": 3.0}
     # Configure set_param to return a tuple (success, error_message)
     mock_fc.set_param.return_value = (True, "")
+    mock_fc.check_file_upload.return_value = FileUploadCheckStatus.NEEDS_UPLOAD
+    mock_fc.upload_file_if_needed.return_value = FileUploadResult.UPLOADED
     return mock_fc
 
 
@@ -60,6 +69,15 @@ def mock_local_filesystem() -> MagicMock:
     mock_fs.derived_parameters = {}
     mock_fs.export_to_param = MagicMock()
     mock_fs.vehicle_components_fs.has_unsaved_changes.return_value = False
+    mock_fs.get_download_files.side_effect = lambda selected: [
+        pair for pair in [mock_fs.get_download_url_and_local_filename(selected)] if all(pair)
+    ]
+    mock_fs.get_upload_files.side_effect = lambda selected: [
+        pair for pair in [mock_fs.get_upload_local_and_remote_filenames(selected)] if all(pair)
+    ]
+    mock_fs.vehicle_configuration_file_size.side_effect = lambda filename: (
+        1 if mock_fs.vehicle_configuration_file_exists(filename) else None
+    )
 
     # Mock compound_params to compute first config filename based on file_parameters
     def mock_compound_params(last_filename=None, skip_default=True) -> tuple[ParDict, str | None]:
@@ -121,6 +139,71 @@ def parameter_editor(mock_flight_controller, mock_local_filesystem) -> Parameter
     return ParameterEditor("00_default.param", mock_flight_controller, mock_local_filesystem)
 
 
+def test_level_trim_warns_about_stale_values_in_other_step_without_changing_project(
+    parameter_editor: ParameterEditor, mock_local_filesystem: MagicMock, tmp_path: Path
+) -> None:
+    """GIVEN trims in a different step, WHEN calibrated, THEN name the step without writing its file."""
+    other_step = "14_mp_setup_mandatory_hardware.param"
+    original_step = "02_accelerometer.param"
+    original = ParDict({"AHRS_TRIM_X": Par(0.0, "roll trim"), "AHRS_TRIM_Y": Par(0.0, "pitch trim")})
+    original.export_to_param(str(tmp_path / other_step))
+    mock_local_filesystem.file_parameters = {
+        original_step: ParDict({"INS_GYRO_FILTER": Par(42.0)}),
+        other_step: original,
+    }
+
+    parameter_editor.current_file = original_step
+    parameter_editor.current_step_parameters = {}
+    parameter_editor._flight_controller.fc_parameters = {
+        "AHRS_TRIM_X": 0.01,
+        "AHRS_TRIM_Y": -0.02,
+        "INS_GYRO_FILTER": 90.0,
+    }
+    base_window = SimpleNamespace(
+        download_flight_controller_parameters=MagicMock(),
+        parameter_editor=parameter_editor,
+        repopulate_parameter_table=MagicMock(),
+    )
+
+    stale_files = refresh_parameter_editor_after_calibration(
+        base_window,
+        parameter_names_to_copy={"AHRS_TRIM_X", "AHRS_TRIM_Y"},
+        check_other_steps=True,
+    )
+
+    assert stale_files == [other_step]
+    assert ParDict.from_file(str(tmp_path / other_step)) == original
+    assert mock_local_filesystem.file_parameters[other_step] is original
+    assert mock_local_filesystem.file_parameters[original_step]["INS_GYRO_FILTER"].value == 42.0
+    mock_local_filesystem.export_to_param.assert_not_called()
+
+
+def test_level_trim_does_not_warn_when_other_step_matches_fc(parameter_editor, mock_local_filesystem) -> None:
+    """GIVEN a matching trim in another step, WHEN checking, THEN do not warn or change files."""
+    original = ParDict({"AHRS_TRIM_X": Par(0.01, "original trim")})
+    mock_local_filesystem.file_parameters = {"14_mp_setup_mandatory_hardware.param": original}
+    parameter_editor.current_file = "02_accelerometer.param"
+
+    stale_files = parameter_editor.find_other_steps_with_stale_calibration_values({"AHRS_TRIM_X": 0.01})
+
+    assert stale_files == []
+    assert mock_local_filesystem.file_parameters["14_mp_setup_mandatory_hardware.param"] is original
+    mock_local_filesystem.export_to_param.assert_not_called()
+
+
+def test_level_trim_does_not_warn_about_float32_rounding(parameter_editor, mock_local_filesystem) -> None:
+    """MAVLink float32 round-off must not make an equivalent saved trim look stale."""
+    original = ParDict({"AHRS_TRIM_X": Par(0.01, "original trim")})
+    mock_local_filesystem.file_parameters = {"14_mp_setup_mandatory_hardware.param": original}
+    parameter_editor.current_file = "02_accelerometer.param"
+
+    stale_files = parameter_editor.find_other_steps_with_stale_calibration_values({"AHRS_TRIM_X": 0.009999999776482582})
+
+    assert stale_files == []
+    assert mock_local_filesystem.file_parameters["14_mp_setup_mandatory_hardware.param"] is original
+    mock_local_filesystem.export_to_param.assert_not_called()
+
+
 class TestExternalParameterFiles:
     """Validate loading external files without adding them to the AMC project."""
 
@@ -149,6 +232,23 @@ class TestExternalParameterFiles:
 class TestExternalParameterUploadWorkflow:
     """Protect the boundary between one-off FC uploads and AMC project progress."""
 
+    def test_external_editor_keeps_followup_downloads_in_private_directory(self, parameter_editor, tmp_path) -> None:
+        """Upload verification downloads must not overwrite the compared file."""
+        private_dir = tmp_path / "private-downloads"
+        parameter_editor._flight_controller.download_params.return_value = ({"P1": 2.0}, ParDict())
+        external_editor = ParameterEditor(
+            "",
+            parameter_editor._flight_controller,
+            parameter_editor._local_filesystem,
+            parameter_download_dir=private_dir,
+        )
+
+        external_editor.download_flight_controller_parameters(persist_project_state=False)
+
+        parameter_editor._flight_controller.download_params.assert_called_once_with(
+            None, private_dir / "complete.param", private_dir / "00_default.param", response_timeout=None
+        )
+
     def test_successful_external_upload_does_not_persist_project_state(self, parameter_editor, tmp_path) -> None:
         """
         Upload external values without persisting AMC project state.
@@ -167,7 +267,7 @@ class TestExternalParameterUploadWorkflow:
             return True, ""
 
         parameter_editor._flight_controller.set_param.side_effect = accept_parameter
-        parameter_editor._flight_controller.download_params.side_effect = lambda *_args: (
+        parameter_editor._flight_controller.download_params.side_effect = lambda *_args, **_kwargs: (
             dict(parameter_editor._flight_controller.fc_parameters),
             ParDict({"P1": Par(0.0)}),
         )
@@ -189,6 +289,7 @@ class TestExternalParameterUploadWorkflow:
             None,
             tmp_path / "complete.param",
             tmp_path / "00_default.param",
+            response_timeout=None,
         )
         parameter_editor._local_filesystem.write_last_uploaded_filename.assert_not_called()
         parameter_editor._local_filesystem.write_param_default_values_to_file.assert_not_called()
@@ -215,7 +316,7 @@ class TestExternalParameterUploadWorkflow:
             return True, ""
 
         parameter_editor._flight_controller.set_param.side_effect = accept_parameter
-        parameter_editor._flight_controller.download_params.side_effect = lambda *_args: (
+        parameter_editor._flight_controller.download_params.side_effect = lambda *_args, **_kwargs: (
             dict(parameter_editor._flight_controller.fc_parameters),
             ParDict({"P1": Par(0.0)}),
         )
@@ -232,8 +333,8 @@ class TestExternalParameterUploadWorkflow:
         # than falling back to the process working directory on MAVFTP.
         assert result is True
         assert parameter_editor._flight_controller.download_params.call_args_list == [
-            call(None, tmp_path / "complete.param", tmp_path / "00_default.param"),
-            call(None, tmp_path / "complete.param", tmp_path / "00_default.param"),
+            call(None, tmp_path / "complete.param", tmp_path / "00_default.param", response_timeout=None),
+            call(None, tmp_path / "complete.param", tmp_path / "00_default.param", response_timeout=None),
         ]
         parameter_editor._local_filesystem.write_param_default_values_to_file.assert_not_called()
         parameter_editor._local_filesystem.write_last_uploaded_filename.assert_not_called()
@@ -319,7 +420,7 @@ class TestExternalParameterUploadWorkflow:
         assert reset_happened is True
         assert reset_succeeded is True
         assert uploaded == {"BRD_BOOT_DELAY"}
-        parameter_editor._flight_controller.reset_and_reconnect.assert_called_once_with(None, None, 8)
+        parameter_editor._flight_controller.reset_and_reconnect.assert_called_once_with(None, 8)
 
 
 class TestParameterFilteringWorkflows:
@@ -983,14 +1084,13 @@ class TestFileDownloadUrlWorkflows:
         # Mock the download_file_from_url function to return success
         with patch("ardupilot_methodic_configurator.data_model_parameter_editor.download_file_from_url", return_value=True):
             # Act: Execute download workflow
-            result = parameter_editor._should_download_file_from_url_workflow(
+            parameter_editor._download_files_for_step(
                 selected_file,
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
             )
 
         # Assert: Workflow completed successfully
-        assert result is True
         ask_confirmation_mock.assert_called_once()
         show_error_mock.assert_not_called()
 
@@ -1000,7 +1100,7 @@ class TestFileDownloadUrlWorkflows:
 
         GIVEN: A user has a file that needs to be downloaded but download fails
         WHEN: They execute the download workflow
-        THEN: Error should be shown and workflow should return False
+        THEN: Error should be shown for the failed download
         """
         # Arrange: Set up file info and failing download
         selected_file = "test_file.param"
@@ -1016,14 +1116,13 @@ class TestFileDownloadUrlWorkflows:
         # Mock the download_file_from_url function to return failure
         with patch("ardupilot_methodic_configurator.data_model_parameter_editor.download_file_from_url", return_value=False):
             # Act: Execute download workflow
-            result = parameter_editor._should_download_file_from_url_workflow(
+            parameter_editor._download_files_for_step(
                 selected_file,
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
             )
 
         # Assert: Workflow failed and error was shown
-        assert result is False
         ask_confirmation_mock.assert_called_once()
         show_error_mock.assert_called_once()
 
@@ -1033,7 +1132,7 @@ class TestFileDownloadUrlWorkflows:
 
         GIVEN: A user has a file that could be downloaded
         WHEN: They decline the download confirmation
-        THEN: No download should occur and workflow should return False
+        THEN: No download should occur
         """
         # Arrange: Set up file info and declining user
         selected_file = "test_file.param"
@@ -1047,14 +1146,13 @@ class TestFileDownloadUrlWorkflows:
         show_error_mock = MagicMock()
 
         # Act: Execute download workflow
-        result = parameter_editor._should_download_file_from_url_workflow(
+        parameter_editor._download_files_for_step(
             selected_file,
             ask_confirmation=ask_confirmation_mock,
             show_error=show_error_mock,
         )
 
         # Assert: Workflow succeeded without download
-        assert result is False
         ask_confirmation_mock.assert_called_once()
         show_error_mock.assert_not_called()
 
@@ -1227,6 +1325,62 @@ class TestSummaryFileWritingWorkflows:
         )
 
 
+class TestConnectedFlightControllerFactory:
+    """Test creation of a standalone parameter model from a connected controller."""
+
+    def test_uses_connected_firmware_metadata_and_downloaded_defaults(self) -> None:
+        """The model factory creates an external filesystem for the connected FC firmware."""
+        flight_controller = MagicMock()
+        flight_controller.info = SimpleNamespace(vehicle_type="ArduPlane", flight_sw_version="4.6.3")
+        downloaded_parameters = {"ROLL_P": 0.1}
+        default_parameters = ParDict({"ROLL_P": Par(0.0)})
+        flight_controller.download_params.return_value = (downloaded_parameters, default_parameters)
+        filesystem = MagicMock()
+
+        with patch(
+            "ardupilot_methodic_configurator.data_model_parameter_editor.LocalFilesystem.for_external_parameter_file",
+            return_value=filesystem,
+        ) as create_filesystem:
+            parameter_editor = ParameterEditor.for_connected_flight_controller(flight_controller, "vehicle")
+
+        create_filesystem.assert_called_once_with("vehicle", "ArduPlane", "4.6.3", default_parameters)
+        flight_controller.download_params.assert_called_once_with(
+            parameter_values_filename=Path("vehicle") / "complete.param",
+            parameter_defaults_filename=Path("vehicle") / "00_default.param",
+        )
+        assert parameter_editor._flight_controller is flight_controller
+        assert parameter_editor._local_filesystem is filesystem
+
+    def test_vehicle_type_override_is_passed_to_metadata_loader(self) -> None:
+        """An explicit vehicle type takes precedence over the controller report."""
+        flight_controller = MagicMock()
+        flight_controller.info = SimpleNamespace(vehicle_type="ArduPlane", flight_sw_version="4.6.3")
+        flight_controller.download_params.return_value = ({"ROLL_P": 0.1}, ParDict())
+
+        with patch(
+            "ardupilot_methodic_configurator.data_model_parameter_editor.LocalFilesystem.for_external_parameter_file",
+            return_value=MagicMock(),
+        ) as create_filesystem:
+            ParameterEditor.for_connected_flight_controller(flight_controller, "vehicle", "Copter")
+
+        create_filesystem.assert_called_once_with("vehicle", "Copter", "4.6.3", ParDict())
+
+    def test_empty_parameter_download_fails_before_metadata_loading(self) -> None:
+        """Metadata is not fetched when the FC did not provide parameters."""
+        flight_controller = MagicMock()
+        flight_controller.download_params.return_value = ({}, ParDict())
+
+        with (
+            patch(
+                "ardupilot_methodic_configurator.data_model_parameter_editor.LocalFilesystem.for_external_parameter_file"
+            ) as create_filesystem,
+            pytest.raises(ValueError, match="Could not download parameters"),
+        ):
+            ParameterEditor.for_connected_flight_controller(flight_controller, "vehicle")
+
+        create_filesystem.assert_not_called()
+
+
 class TestFlightControllerDownloadWorkflows:
     """Test flight controller parameter download business logic workflows."""
 
@@ -1247,7 +1401,10 @@ class TestFlightControllerDownloadWorkflows:
             _progress_callback,
             _complete_param_path,
             _default_param_path,
+            *,
+            response_timeout: float | None,
         ) -> tuple[dict, dict]:
+            assert response_timeout is None
             parameter_editor._flight_controller.fc_parameters = expected_fc_params.copy()
             return (expected_fc_params, expected_defaults)
 
@@ -1433,7 +1590,7 @@ class TestFlightControllerResetWorkflows:
         assert result is None
         parameter_editor._flight_controller.reset_and_reconnect.assert_called_once()
         args = parameter_editor._flight_controller.reset_and_reconnect.call_args[0]
-        assert args[2] == 3  # Calculated sleep time
+        assert args[1] == 3  # Calculated sleep time
 
     def test_user_can_reset_with_custom_sleep_time(self, parameter_editor) -> None:
         """
@@ -1452,7 +1609,7 @@ class TestFlightControllerResetWorkflows:
 
         # Assert: Custom time was used
         args = parameter_editor._flight_controller.reset_and_reconnect.call_args[0]
-        assert args[2] == custom_sleep_time
+        assert args[1] == custom_sleep_time
 
     def test_user_handles_reset_failure(self, parameter_editor) -> None:
         """
@@ -1483,23 +1640,41 @@ class TestFlightControllerResetWorkflows:
         parameter_editor._flight_controller.reset_all_parameters_to_default_and_reconnect.return_value = (True, "")
         parameter_editor.download_flight_controller_parameters = MagicMock(return_value=({"P1": 1.0}, ParDict()))
         show_error = MagicMock()
-        reset_progress_callback = MagicMock()
-        connection_progress_callback = MagicMock()
+        progress_callback = MagicMock()
         get_download_progress_callback = MagicMock()
 
         result = parameter_editor.reset_all_parameters_to_default(
             show_error,
-            reset_progress_callback,
-            connection_progress_callback,
+            progress_callback,
             get_download_progress_callback,
         )
 
         assert result is True
         parameter_editor._flight_controller.reset_all_parameters_to_default_and_reconnect.assert_called_once_with(
-            reset_progress_callback,
-            connection_progress_callback,
+            progress_callback,
         )
-        parameter_editor.download_flight_controller_parameters.assert_called_once_with(get_download_progress_callback)
+        parameter_editor.download_flight_controller_parameters.assert_called_once_with(
+            get_download_progress_callback, persist_project_state=True
+        )
+        show_error.assert_not_called()
+
+    def test_project_reset_still_updates_downloaded_defaults(self, parameter_editor, tmp_path: Path) -> None:
+        """
+        Preserve default-value persistence for normal AMC resets.
+
+        GIVEN: An AMC project and a connected controller with new defaults
+        WHEN: The user resets the controller using the default workflow
+        THEN: The downloaded defaults are passed to the project defaults writer.
+        """
+        defaults = ParDict({"ROLL_P": Par(0.1)})
+        parameter_editor._local_filesystem.vehicle_dir = str(tmp_path)
+        parameter_editor._flight_controller.reset_all_parameters_to_default_and_reconnect.return_value = (True, "")
+        parameter_editor._flight_controller.download_params.return_value = ({"ROLL_P": 0.1}, defaults)
+        show_error = MagicMock()
+
+        assert parameter_editor.reset_all_parameters_to_default(show_error) is True
+
+        parameter_editor._local_filesystem.write_param_default_values_to_file.assert_called_once_with(defaults)
         show_error.assert_not_called()
 
     def test_user_is_informed_when_resetting_all_parameters_fails(self, parameter_editor) -> None:
@@ -1581,8 +1756,8 @@ class TestFileCopyWorkflows:
         User can update in-memory parameters from FC values.
 
         GIVEN: A user has relevant FC parameters to copy that exist in current_step_parameters
-        WHEN: They call _update_parameters_from_fc_values
-        THEN: The in-memory parameter values should be updated and the method reports success
+        WHEN: They call update_parameters_from_fc_values
+        THEN: The in-memory parameter values should be updated and the result counts both updates
         """
         # Arrange (Given): Set up parameters in current_step_parameters
         param1 = ArduPilotParameter(
@@ -1603,12 +1778,35 @@ class TestFileCopyWorkflows:
         relevant_params = {"PARAM1": 1.0, "PARAM2": 2.0}
 
         # Act (When): Update parameters from FC values
-        result = parameter_editor._update_parameters_from_fc_values(relevant_params)
+        result = parameter_editor.update_parameters_from_fc_values(relevant_params)
 
         # Assert (Then): In-memory values were updated
-        assert result is True
+        assert result == FcParameterCopyResult(copied=2)
         assert param1.get_new_value() == pytest.approx(1.0)
         assert param2.get_new_value() == pytest.approx(2.0)
+
+    def test_user_can_update_the_current_step_from_fc_values(self, parameter_editor) -> None:
+        """
+        A calibration readback updates the active step's new values from the FC.
+
+        GIVEN: The active step contains parameters with freshly downloaded FC values
+        WHEN: The current step is synchronized with those values
+        THEN: The active parameters contain the downloaded values
+        """
+        param = ArduPilotParameter(
+            name="PARAM1",
+            par_obj=Par(0.0, ""),
+            metadata={},
+            default_par=Par(0.0, ""),
+            fc_value=1.0,
+        )
+        parameter_editor.current_step_parameters = {"PARAM1": param}
+        parameter_editor._flight_controller.fc_parameters = {"PARAM1": 3.5}
+
+        result = parameter_editor.update_parameters_from_fc_values()
+
+        assert result == FcParameterCopyResult(copied=1)
+        assert param.get_new_value() == pytest.approx(3.5)
 
     def test_user_sees_ui_updated_when_copying_fc_values_to_current_file(self, parameter_editor) -> None:
         """
@@ -1648,7 +1846,7 @@ class TestFileCopyWorkflows:
 
         # Assert (Then):
         # 1) Method reports success
-        assert result is True
+        assert result == FcParameterCopyResult(copied=2)
 
         # 2) In-memory ArduPilotParameter values were updated to match FC values
         assert param1.get_new_value() == pytest.approx(1.0)
@@ -1665,7 +1863,7 @@ class TestFileCopyWorkflows:
 
         GIVEN: A copy operation that fails
         WHEN: User attempts to copy values
-        THEN: False should be returned
+        THEN: The result should count the failed copy
         """
         # Arrange: Set up failed copy - current_step_parameters is empty by default
         # so trying to copy PARAM1 will fail because it doesn't exist in current_step_parameters
@@ -1675,7 +1873,7 @@ class TestFileCopyWorkflows:
         result = parameter_editor._update_parameters_from_fc_values(relevant_params)
 
         # Assert: Copy failed
-        assert result is False
+        assert result == FcParameterCopyResult(failed=1)
 
     def test_partial_update_when_some_params_fail(self, parameter_editor) -> None:
         """
@@ -1708,7 +1906,7 @@ class TestFileCopyWorkflows:
         result = parameter_editor._update_parameters_from_fc_values(relevant_params)
 
         # Assert: Partial success
-        assert result is True  # At least some succeeded
+        assert result == FcParameterCopyResult(copied=2, failed=1)
         assert param1.get_new_value() == pytest.approx(1.0)
         assert param2.get_new_value() == pytest.approx(2.0)
         # PARAM3 was logged as error but didn't prevent other updates
@@ -1770,8 +1968,46 @@ class TestFileNavigationWorkflows:  # pylint: disable=too-few-public-methods
         parameter_editor._local_filesystem.jump_possible.assert_called_once_with(selected_file)
 
 
-class TestFileDownloadWorkflows:  # pylint: disable=too-few-public-methods
+class TestFileDownloadWorkflows:
     """Test file download workflows."""
+
+    @patch("ardupilot_methodic_configurator.data_model_parameter_editor.download_file_from_url")
+    def test_filesystem_error_during_download_does_not_skip_later_files(self, mock_download, parameter_editor) -> None:
+        """
+        An inaccessible download destination does not abort the whole step.
+
+        GIVEN: Creating the first download's parent directory raises OSError
+        WHEN: The step also requests another file
+        THEN: The first failure is displayed and the second download is attempted
+        """
+        fs = parameter_editor._local_filesystem
+        fs.get_download_files.side_effect = None
+        fs.get_download_files.return_value = [("https://example.com/a", "a.lua"), ("https://example.com/b", "b.lua")]
+        fs.vehicle_configuration_file_exists.return_value = False
+        mock_download.side_effect = [PermissionError("destination is read-only"), True]
+        error = MagicMock()
+
+        parameter_editor._download_files_for_step("step.param", MagicMock(return_value=True), error)
+
+        error.assert_called_once()
+        assert mock_download.call_args_list[-1] == call("https://example.com/b", "b.lua")
+
+    @pytest.mark.parametrize("declined", [True, False])
+    @patch("ardupilot_methodic_configurator.data_model_parameter_editor.download_file_from_url")
+    def test_download_problem_does_not_skip_later_files(self, mock_download, parameter_editor, declined) -> None:
+        """Declining or failing one download leaves subsequent downloads available."""
+        fs = parameter_editor._local_filesystem
+        fs.get_download_files.side_effect = None
+        fs.get_download_files.return_value = [("https://example.com/a", "a.lua"), ("https://example.com/b", "b.lua")]
+        fs.vehicle_configuration_file_exists.return_value = False
+        confirm = MagicMock(side_effect=[not declined, True])
+        mock_download.side_effect = [True] if declined else [False, True]
+        error = MagicMock()
+
+        parameter_editor._download_files_for_step("step.param", confirm, error)
+        assert confirm.call_count == 2
+        assert mock_download.call_args_list[-1] == call("https://example.com/b", "b.lua")
+        assert error.call_count == (0 if declined else 1)
 
     @patch("ardupilot_methodic_configurator.data_model_parameter_editor.download_file_from_url")
     def test_user_can_download_file_successfully(self, mock_download, parameter_editor) -> None:
@@ -1796,18 +2032,172 @@ class TestFileDownloadWorkflows:  # pylint: disable=too-few-public-methods
         mock_show_error = MagicMock()
 
         # Act: Download file
-        result = parameter_editor._should_download_file_from_url_workflow(
-            selected_file, mock_ask_confirmation, mock_show_error
-        )
+        parameter_editor._download_files_for_step(selected_file, mock_ask_confirmation, mock_show_error)
 
         # Assert: Download successful
-        assert result is True
         mock_show_error.assert_not_called()
         mock_download.assert_called_once_with("https://example.com/firmware.bin", "firmware.bin")
+
+    @patch("ardupilot_methodic_configurator.data_model_parameter_editor.download_file_from_url")
+    def test_multiple_downloads_skip_existing_file(self, mock_download, parameter_editor) -> None:
+        """Every absent file is downloaded, even when an earlier one already exists."""
+        fs = parameter_editor._local_filesystem
+        fs.get_download_files.side_effect = None
+        fs.get_download_files.return_value = [("https://example.com/a", "a.lua"), ("https://example.com/b", "b.lua")]
+        fs.vehicle_configuration_file_exists.side_effect = [True, False]
+        mock_download.return_value = True
+        confirm = MagicMock(return_value=True)
+
+        parameter_editor._download_files_for_step("step.param", confirm, MagicMock())
+        mock_download.assert_called_once_with("https://example.com/b", "b.lua")
+        confirm.assert_called_once()
+
+    @patch("ardupilot_methodic_configurator.data_model_parameter_editor.download_file_from_url")
+    def test_zero_byte_download_is_requested_again(self, mock_download, parameter_editor, tmp_path) -> None:
+        """An empty local script must not suppress a fresh download prompt."""
+        empty_file = tmp_path / "empty.lua"
+        empty_file.touch()
+        fs = parameter_editor._local_filesystem
+        fs.get_download_files.side_effect = None
+        fs.get_download_files.return_value = [("https://example.com/empty.lua", str(empty_file))]
+        fs.vehicle_configuration_file_exists.side_effect = lambda path: Path(path).is_file() and Path(path).stat().st_size > 0
+        mock_download.return_value = True
+        confirm = MagicMock(return_value=True)
+
+        parameter_editor._download_files_for_step("step.param", confirm, MagicMock())
+        confirm.assert_called_once()
+        mock_download.assert_called_once_with("https://example.com/empty.lua", str(empty_file))
 
 
 class TestFileUploadWorkflows:
     """Test file upload workflows."""
+
+    def test_upload_confirmation_cannot_reenter_editor_workflow(self, parameter_editor) -> None:
+        """
+        The editor retains batch ownership across confirmation dialogs.
+
+        GIVEN: An upload confirmation dispatches another editor upload request
+        WHEN: The first batch is awaiting confirmation
+        THEN: The nested request cannot preflight or upload any file
+        AND: The outer upload succeeds
+        """
+        fs = parameter_editor._local_filesystem
+        fc = parameter_editor._flight_controller
+        fs.get_upload_files.side_effect = None
+        fs.get_upload_files.return_value = [("a.lua", "/APM/Scripts/a.lua")]
+        fs.get_download_files.side_effect = None
+        fs.get_download_files.return_value = []
+        fs.vehicle_configuration_file_size.side_effect = None
+        fs.vehicle_configuration_file_size.return_value = 12
+        fc.master = True
+
+        def confirm(_title: str, _message: str) -> bool:
+            with pytest.raises(RuntimeError, match="already in progress"):
+                parameter_editor.should_upload_file_to_fc_workflow(
+                    "step.param", MagicMock(return_value=True), MagicMock(), MagicMock(), MagicMock()
+                )
+            return True
+
+        assert parameter_editor.should_upload_file_to_fc_workflow("step.param", confirm, MagicMock(), MagicMock(), MagicMock())
+        fc.check_file_upload.assert_called_once()
+        fc.upload_file_if_needed.assert_called_once()
+
+    def test_declined_download_is_not_reported_as_upload_failure(self, parameter_editor) -> None:
+        """A missing upload file whose download was declined is skipped quietly."""
+        fs = parameter_editor._local_filesystem
+        fc = parameter_editor._flight_controller
+        fs.get_download_files.side_effect = None
+        fs.get_download_files.return_value = [("https://example.com/missing.lua", "missing.lua")]
+        fs.get_upload_files.side_effect = None
+        fs.get_upload_files.return_value = [
+            ("missing.lua", "/APM/Scripts/missing.lua"),
+            ("available.lua", "/APM/Scripts/available.lua"),
+        ]
+        fs.vehicle_configuration_file_exists.side_effect = lambda filename: filename == "available.lua"
+        fc.master = True
+        fc.check_file_upload.return_value = FileUploadCheckStatus.NEEDS_UPLOAD
+        fc.upload_file_if_needed.return_value = FileUploadResult.UPLOADED
+        download_confirmation = MagicMock(return_value=False)
+        upload_confirmation = MagicMock(return_value=True)
+        show_error = MagicMock()
+
+        parameter_editor._download_files_for_step("step.param", download_confirmation, show_error)
+        upload_succeeded = parameter_editor.should_upload_file_to_fc_workflow(
+            "step.param", upload_confirmation, show_error, MagicMock(), MagicMock(return_value=None)
+        )
+
+        assert upload_succeeded
+        show_error.assert_not_called()
+        fc.check_file_upload.assert_called_once_with("/APM/Scripts/available.lua", "available.lua")
+        fc.upload_file_if_needed.assert_called_once()
+        assert fc.upload_file_if_needed.call_args.args[:2] == ("available.lua", "/APM/Scripts/available.lua")
+        assert callable(fc.upload_file_if_needed.call_args.args[2])
+
+    def test_empty_upload_file_is_rejected_while_later_files_can_upload(self, parameter_editor) -> None:
+        """An empty script is reported explicitly without blocking a valid script."""
+        fs = parameter_editor._local_filesystem
+        fc = parameter_editor._flight_controller
+        fs.get_download_files.side_effect = None
+        fs.get_download_files.return_value = []
+        fs.get_upload_files.side_effect = None
+        fs.get_upload_files.return_value = [
+            ("empty.lua", "/APM/Scripts/empty.lua"),
+            ("available.lua", "/APM/Scripts/available.lua"),
+        ]
+        fs.vehicle_configuration_file_size.side_effect = [0, 10]
+        fc.master = True
+        fc.check_file_upload.return_value = FileUploadCheckStatus.NEEDS_UPLOAD
+        fc.upload_file_if_needed.return_value = FileUploadResult.UPLOADED
+        error = MagicMock()
+
+        result = parameter_editor.should_upload_file_to_fc_workflow(
+            "step.param", MagicMock(return_value=True), error, MagicMock(), MagicMock(return_value=None)
+        )
+
+        assert result is False
+        assert "empty" in error.call_args_list[0].args[1].lower()
+        fc.check_file_upload.assert_called_once_with("/APM/Scripts/available.lua", "available.lua")
+        fc.upload_file_if_needed.assert_called_once()
+        assert fc.upload_file_if_needed.call_args.args[:2] == ("available.lua", "/APM/Scripts/available.lua")
+        assert callable(fc.upload_file_if_needed.call_args.args[2])
+
+    @pytest.mark.parametrize("problem", ["missing", "unknown", "failed"])
+    def test_one_unavailable_upload_does_not_block_the_next(self, parameter_editor, problem) -> None:
+        """Each file is checked independently without overwriting unverifiable remote files."""
+        fs = parameter_editor._local_filesystem
+        fc = parameter_editor._flight_controller
+        fs.get_upload_files.side_effect = None
+        fs.get_upload_files.return_value = [("a.lua", "/APM/Scripts/a.lua"), ("b.lua", "/APM/Scripts/b.lua")]
+        fs.vehicle_configuration_file_exists.side_effect = [problem != "missing", True]
+        fc.master = True
+        fc.check_file_upload.side_effect = (
+            [FileUploadCheckStatus.VERIFICATION_FAILED, FileUploadCheckStatus.NEEDS_UPLOAD]
+            if problem == "unknown"
+            else [FileUploadCheckStatus.NEEDS_UPLOAD, FileUploadCheckStatus.NEEDS_UPLOAD]
+        )
+        upload_results = (
+            [FileUploadResult.UPLOAD_FAILED, FileUploadResult.UPLOADED] if problem == "failed" else [FileUploadResult.UPLOADED]
+        )
+
+        def upload_with_progress(_local: str, _remote: str, callback: Callable[[int, int], None] | None) -> FileUploadResult:
+            if callback is not None:
+                callback(50, 100)
+            return upload_results.pop(0)
+
+        fc.upload_file_if_needed.side_effect = upload_with_progress
+        confirm = MagicMock(return_value=True)
+        error, warning = MagicMock(), MagicMock()
+        progress_factory = MagicMock(return_value=None)
+
+        assert not parameter_editor.should_upload_file_to_fc_workflow("step.param", confirm, error, warning, progress_factory)
+        final_upload = fc.upload_file_if_needed.call_args_list[-1]
+        assert final_upload.args[:2] == ("b.lua", "/APM/Scripts/b.lua")
+        assert callable(final_upload.args[2])
+        if problem != "failed":
+            fc.upload_file_if_needed.assert_called_once()
+        assert error.call_count == (0 if problem == "unknown" else 1)
+        assert warning.call_count == (1 if problem == "unknown" else 0)
+        assert progress_factory.call_count == (2 if problem == "failed" else 1)
 
     def test_user_can_upload_file_workflow_success(self, parameter_editor) -> None:
         """
@@ -1828,7 +2218,13 @@ class TestFileUploadWorkflows:
         )
         parameter_editor._local_filesystem.vehicle_configuration_file_exists.return_value = True
         parameter_editor._flight_controller.master = True  # FC connected
-        parameter_editor._flight_controller.upload_file.return_value = True
+
+        def upload_with_progress(_local: str, _remote: str, callback: Callable[[int, int], None] | None) -> FileUploadResult:
+            if callback is not None:
+                callback(50, 100)
+            return FileUploadResult.UPLOADED
+
+        parameter_editor._flight_controller.upload_file_if_needed.side_effect = upload_with_progress
 
         ask_confirmation = MagicMock(return_value=True)
         show_error = MagicMock()
@@ -1844,11 +2240,104 @@ class TestFileUploadWorkflows:
         # Assert: Upload successful
         assert result is True
         ask_confirmation.assert_called_once()
-        parameter_editor._flight_controller.upload_file.assert_called_once_with(
-            local_filename, remote_filename, progress_callback
-        )
+        upload_call = parameter_editor._flight_controller.upload_file_if_needed.call_args
+        assert upload_call.args[:2] == (local_filename, remote_filename)
+        assert callable(upload_call.args[2])
+        progress_callback.assert_called_once_with(50, 100)
         show_error.assert_not_called()
         show_warning.assert_not_called()
+
+    def test_multiple_uploads_allow_individual_confirmation(self, parameter_editor) -> None:
+        """Declining one script does not prevent uploading the next."""
+        fs = parameter_editor._local_filesystem
+        fs.get_upload_files.side_effect = None
+        fs.get_upload_files.return_value = [("a.lua", "/APM/Scripts/a.lua"), ("b.lua", "/APM/Scripts/b.lua")]
+        fs.vehicle_configuration_file_exists.return_value = True
+        parameter_editor._flight_controller.master = True
+
+        def upload_with_progress(_local: str, _remote: str, callback: Callable[[int, int], None] | None) -> FileUploadResult:
+            if callback is not None:
+                callback(50, 100)
+            return FileUploadResult.UPLOADED
+
+        parameter_editor._flight_controller.upload_file_if_needed.side_effect = upload_with_progress
+        confirm = MagicMock(side_effect=[False, True])
+        progress = MagicMock()
+        progress_factory = MagicMock(return_value=progress)
+
+        assert parameter_editor.should_upload_file_to_fc_workflow(
+            "step.param", confirm, MagicMock(), MagicMock(), progress_factory
+        )
+        assert confirm.call_count == 2
+        upload_call = parameter_editor._flight_controller.upload_file_if_needed.call_args
+        assert upload_call.args[:2] == ("b.lua", "/APM/Scripts/b.lua")
+        assert callable(upload_call.args[2])
+        progress.assert_called_once_with(50, 100)
+        progress_factory.assert_called_once()
+
+    def test_matching_remote_file_skips_upload_prompt(self, parameter_editor) -> None:
+        """Only a missing or CRC-mismatched script needs user confirmation."""
+        fc = parameter_editor._flight_controller
+        fs = parameter_editor._local_filesystem
+        fs.get_upload_files.side_effect = None
+        fs.get_upload_files.return_value = [("a.lua", "/APM/Scripts/a.lua"), ("b.lua", "/APM/Scripts/b.lua")]
+        fs.vehicle_configuration_file_exists.return_value = True
+        fc.master = True
+        fc.check_file_upload.side_effect = [FileUploadCheckStatus.ALREADY_CURRENT, FileUploadCheckStatus.NEEDS_UPLOAD]
+        fc.upload_file_if_needed.return_value = FileUploadResult.UPLOADED
+        confirm = MagicMock(return_value=True)
+
+        assert parameter_editor.should_upload_file_to_fc_workflow(
+            "step.param", confirm, MagicMock(), MagicMock(), MagicMock(return_value=None)
+        )
+        assert fc.check_file_upload.call_count == 2
+        confirm.assert_called_once()
+        upload_call = fc.upload_file_if_needed.call_args
+        assert upload_call.args[:2] == ("b.lua", "/APM/Scripts/b.lua")
+        assert callable(upload_call.args[2])
+
+    def test_file_that_becomes_current_after_confirmation_is_not_reuploaded(self, parameter_editor) -> None:
+        """The backend's final preflight can safely skip a now-unnecessary upload."""
+        fs = parameter_editor._local_filesystem
+        fc = parameter_editor._flight_controller
+        fs.get_upload_files.side_effect = None
+        fs.get_upload_files.return_value = [("a.lua", "/APM/Scripts/a.lua")]
+        fs.vehicle_configuration_file_exists.return_value = True
+        fc.master = True
+        fc.check_file_upload.return_value = FileUploadCheckStatus.NEEDS_UPLOAD
+        fc.upload_file_if_needed.return_value = FileUploadResult.ALREADY_CURRENT
+        confirm = MagicMock(return_value=True)
+        error, warning = MagicMock(), MagicMock()
+        progress_factory = MagicMock()
+
+        result = parameter_editor.should_upload_file_to_fc_workflow("step.param", confirm, error, warning, progress_factory)
+
+        assert result
+        confirm.assert_called_once()
+        upload_call = fc.upload_file_if_needed.call_args
+        assert upload_call.args[:2] == ("a.lua", "/APM/Scripts/a.lua")
+        assert callable(upload_call.args[2])
+        error.assert_not_called()
+        warning.assert_not_called()
+        progress_factory.assert_not_called()
+
+    def test_unknown_remote_crc_does_not_prompt_or_overwrite(self, parameter_editor) -> None:
+        """Communication failures are not evidence that a file differs."""
+        fc = parameter_editor._flight_controller
+        parameter_editor._local_filesystem.get_upload_local_and_remote_filenames.return_value = (
+            "a.lua",
+            "/APM/Scripts/a.lua",
+        )
+        parameter_editor._local_filesystem.vehicle_configuration_file_exists.return_value = True
+        fc.master = True
+        fc.check_file_upload.return_value = FileUploadCheckStatus.VERIFICATION_FAILED
+        confirm = MagicMock()
+        warning = MagicMock()
+
+        assert not parameter_editor.should_upload_file_to_fc_workflow("step.param", confirm, MagicMock(), warning, MagicMock())
+        warning.assert_called_once()
+        confirm.assert_not_called()
+        fc.upload_file_if_needed.assert_not_called()
 
     def test_user_can_decline_file_upload_workflow(self, parameter_editor) -> None:
         """
@@ -1883,7 +2372,7 @@ class TestFileUploadWorkflows:
         # Assert: Workflow succeeds but no upload
         assert result is True
         ask_confirmation.assert_called_once()
-        parameter_editor._flight_controller.upload_file.assert_not_called()
+        parameter_editor._flight_controller.upload_file_if_needed.assert_not_called()
         show_error.assert_not_called()
         show_warning.assert_not_called()
 
@@ -1906,7 +2395,7 @@ class TestFileUploadWorkflows:
         )
         parameter_editor._local_filesystem.vehicle_configuration_file_exists.return_value = True
         parameter_editor._flight_controller.master = True  # FC connected
-        parameter_editor._flight_controller.upload_file.return_value = False
+        parameter_editor._flight_controller.upload_file_if_needed.return_value = FileUploadResult.UPLOAD_FAILED
 
         ask_confirmation = MagicMock(return_value=True)
         show_error = MagicMock()
@@ -1921,7 +2410,7 @@ class TestFileUploadWorkflows:
         # Assert: Workflow fails and error shown
         assert result is False
         ask_confirmation.assert_called_once()
-        parameter_editor._flight_controller.upload_file.assert_called_once()
+        parameter_editor._flight_controller.upload_file_if_needed.assert_called_once()
         show_error.assert_called_once()
         show_warning.assert_not_called()
 
@@ -1958,7 +2447,7 @@ class TestFileUploadWorkflows:
         # Assert: Workflow fails and warning shown
         assert result is False
         ask_confirmation.assert_not_called()
-        parameter_editor._flight_controller.upload_file.assert_not_called()
+        parameter_editor._flight_controller.upload_file_if_needed.assert_not_called()
         show_error.assert_not_called()
         show_warning.assert_called_once()
 
@@ -1995,7 +2484,7 @@ class TestFileUploadWorkflows:
         # Assert: Workflow fails and error shown
         assert result is False
         ask_confirmation.assert_not_called()
-        parameter_editor._flight_controller.upload_file.assert_not_called()
+        parameter_editor._flight_controller.upload_file_if_needed.assert_not_called()
         show_error.assert_called_once()
         show_warning.assert_not_called()
 
@@ -2025,7 +2514,7 @@ class TestFileUploadWorkflows:
         # Assert: Workflow succeeds without any actions
         assert result is True
         ask_confirmation.assert_not_called()
-        parameter_editor._flight_controller.upload_file.assert_not_called()
+        parameter_editor._flight_controller.upload_file_if_needed.assert_not_called()
         show_error.assert_not_called()
         show_warning.assert_not_called()
 
@@ -2757,8 +3246,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock()
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Mock successful reset
         with patch.object(parameter_editor, "_reset_and_reconnect_flight_controller", return_value=None):
@@ -2768,8 +3256,7 @@ class TestResetAndReconnectWorkflow:
                 fc_reset_unsure=[],
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
-                reset_progress_callback=reset_progress_callback_mock,
-                connection_progress_callback=connection_progress_callback_mock,
+                progress_callback=progress_callback_mock,
             )
 
         # Assert: Workflow completed successfully
@@ -2792,8 +3279,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock(return_value=True)  # User confirms
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Mock successful reset
         with patch.object(parameter_editor, "_reset_and_reconnect_flight_controller", return_value=None):
@@ -2803,8 +3289,7 @@ class TestResetAndReconnectWorkflow:
                 fc_reset_unsure=["PARAM1", "PARAM2"],
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
-                reset_progress_callback=reset_progress_callback_mock,
-                connection_progress_callback=connection_progress_callback_mock,
+                progress_callback=progress_callback_mock,
             )
 
         # Assert: Workflow completed successfully
@@ -2831,8 +3316,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock(return_value=False)  # User declines
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Act: Execute workflow with uncertain parameters
         result = parameter_editor.reset_and_reconnect_workflow(
@@ -2840,8 +3324,7 @@ class TestResetAndReconnectWorkflow:
             fc_reset_unsure=["PARAM1"],
             ask_confirmation=ask_confirmation_mock,
             show_error=show_error_mock,
-            reset_progress_callback=reset_progress_callback_mock,
-            connection_progress_callback=connection_progress_callback_mock,
+            progress_callback=progress_callback_mock,
         )
 
         # Assert: Workflow completed without reset
@@ -2864,8 +3347,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock()
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Mock failed reset with error message
         error_message = "Connection timeout during reset"
@@ -2876,8 +3358,7 @@ class TestResetAndReconnectWorkflow:
                 fc_reset_unsure=[],
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
-                reset_progress_callback=reset_progress_callback_mock,
-                connection_progress_callback=connection_progress_callback_mock,
+                progress_callback=progress_callback_mock,
             )
 
         # Assert: Workflow failed
@@ -2897,8 +3378,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock()
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Mock reset returning error message
         error_message = "Failed to reset flight controller: Communication error"
@@ -2909,8 +3389,7 @@ class TestResetAndReconnectWorkflow:
                 fc_reset_unsure=[],
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
-                reset_progress_callback=reset_progress_callback_mock,
-                connection_progress_callback=connection_progress_callback_mock,
+                progress_callback=progress_callback_mock,
             )
 
         # Assert: Workflow failed
@@ -2930,8 +3409,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock()
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Act: Execute workflow with no reset requirements
         result = parameter_editor.reset_and_reconnect_workflow(
@@ -2939,8 +3417,7 @@ class TestResetAndReconnectWorkflow:
             fc_reset_unsure=[],
             ask_confirmation=ask_confirmation_mock,
             show_error=show_error_mock,
-            reset_progress_callback=reset_progress_callback_mock,
-            connection_progress_callback=connection_progress_callback_mock,
+            progress_callback=progress_callback_mock,
         )
 
         # Assert: Workflow completed without reset
@@ -3519,6 +3996,7 @@ class TestDerivedParameterApplication:
                 [],  # duplicates_to_remove
                 [],  # renames_to_apply
                 derived_params,  # derived_params
+                set(),  # autoimported_parameters
             ),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
@@ -3564,6 +4042,7 @@ class TestDerivedParameterApplication:
                     [],  # duplicates_to_remove
                     [],  # renames_to_apply
                     derived_params,  # derived_params
+                    set(),  # autoimported_parameters
                 ),
             ),
             patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_error") as mock_log_error,
@@ -3612,6 +4091,7 @@ class TestDerivedParameterApplication:
                     [],
                     [],
                     derived_params,
+                    set(),
                 ),
             ),
             patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_error") as mock_log_error,
@@ -3651,6 +4131,7 @@ class TestDerivedParameterApplication:
                 [],
                 [],
                 derived_params,
+                set(),
             ),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
@@ -3680,7 +4161,7 @@ class TestDerivedParameterApplication:
             patch.object(
                 parameter_editor._config_step_processor,
                 "process_configuration_step",
-                return_value=({}, [], [], set(), [], ParDict()),
+                return_value=({}, [], [], set(), [], ParDict(), set()),
             ),
             patch.object(
                 parameter_editor._config_step_processor,
@@ -3693,6 +4174,38 @@ class TestDerivedParameterApplication:
         assert "NEW_FORCED" in parameter_editor.current_step_parameters
         assert parameter_editor.current_step_parameters["NEW_FORCED"] is mock_ap_param
         assert "NEW_FORCED" in parameter_editor._added_parameters
+
+    def test_autoimported_parameter_is_tracked_for_saving(self, parameter_editor) -> None:
+        """
+        Auto-imported parameters trigger the normal save workflow.
+
+        GIVEN: A configuration step adds a non-default FC parameter automatically
+        WHEN: The step is repopulated and the user confirms saving changes
+        THEN: The imported parameter is treated as an unsaved file change
+        AND: The current file is exported through the normal save path
+        """
+        parameter_editor.current_file = "test_file.param"
+        parameter_editor._last_time_asked_to_save = 0.0
+        autoimported = ArduPilotParameter("AUTO_IMPORTED", Par(2.0), fc_value=2.0)
+        with patch.object(
+            parameter_editor._config_step_processor,
+            "process_configuration_step",
+            return_value=({"AUTO_IMPORTED": autoimported}, [], [], set(), [], ParDict(), {"AUTO_IMPORTED"}),
+        ):
+            parameter_editor._repopulate_configuration_step_parameters()
+
+        assert parameter_editor._has_unsaved_changes()
+
+        with patch.object(parameter_editor, "_export_current_file") as mock_export:
+            assert (
+                parameter_editor.handle_write_changes_workflow(
+                    annotate_params_into_files=False,
+                    ask_user_confirmation=MagicMock(return_value=True),
+                )
+                is True
+            )
+
+        mock_export.assert_called_once_with(annotate_doc=False)
 
     def test_connected_editor_delegates_plugin_model_creation_to_registry(self, parameter_editor) -> None:
         """The editor supplies shared dependencies without importing concrete plugin models."""
@@ -3790,13 +4303,30 @@ class TestEditorStateInitialization:
         assert result is None
         mock_factory.create_model.assert_not_called()
 
-    def test_system_returns_false_when_fc_parameter_is_not_in_current_step(self, parameter_editor) -> None:
+    def test_servo_output_plugin_model_is_available_without_a_flight_controller(self, parameter_editor) -> None:
+        """Offline servo-output recommendations remain available in a disconnected project."""
+        parameter_editor._flight_controller.master = None
+        parameter_editor._flight_controller.fc_parameters = {}
+        expected_model = MagicMock()
+
+        with patch("ardupilot_methodic_configurator.data_model_parameter_editor.plugin_factory") as mock_factory:
+            mock_factory.is_registered.return_value = True
+            mock_factory.requires_flight_controller.return_value = False
+            mock_factory.create_model.return_value = expected_model
+
+            result = parameter_editor.create_plugin_data_model(PLUGIN_SERVO_OUT)
+
+        assert result is expected_model
+        mock_factory.requires_flight_controller.assert_called_once_with(PLUGIN_SERVO_OUT)
+        mock_factory.create_model.assert_called_once()
+
+    def test_system_counts_missing_fc_parameter_as_failed_copy(self, parameter_editor) -> None:
         """
-        System returns False and logs an error when the FC supplies a parameter absent from the current step.
+        System counts a missing current-step parameter as a failed copy and logs an error.
 
         GIVEN: A parameter editor whose current step contains no parameters
         WHEN: _update_parameters_from_fc_values receives a value for an unknown parameter
-        THEN: It should return False (zero parameters were successfully updated)
+        THEN: It should report one failed copy and zero successful updates
         """
         # Arrange: Empty current step
         parameter_editor.current_step_parameters = {}
@@ -3806,15 +4336,15 @@ class TestEditorStateInitialization:
             result = parameter_editor._update_parameters_from_fc_values({"MISSING_PARAM": 1.0})
 
         # Assert
-        assert result is False
+        assert result == FcParameterCopyResult(failed=1)
 
-    def test_system_returns_false_when_parameter_update_fails_with_type_error(self, parameter_editor) -> None:
+    def test_system_counts_type_error_as_failed_copy(self, parameter_editor) -> None:
         """
-        System returns False when set_new_value raises TypeError for the supplied FC value.
+        System counts a TypeError from set_new_value as a failed copy.
 
         GIVEN: A current step parameter whose set_new_value raises TypeError
         WHEN: _update_parameters_from_fc_values supplies a value that triggers the error
-        THEN: It should return False (zero parameters were successfully updated)
+        THEN: It should report one failed copy and zero successful updates
         """
         # Arrange: Parameter that rejects the value
         mock_param = MagicMock()
@@ -3825,7 +4355,7 @@ class TestEditorStateInitialization:
         result = parameter_editor._update_parameters_from_fc_values({"P1": None})
 
         # Assert
-        assert result is False
+        assert result == FcParameterCopyResult(failed=1)
 
 
 class TestWorkflowEdgeCases:
@@ -3866,7 +4396,11 @@ class TestWorkflowEdgeCases:
         # Arrange
         with (
             patch.object(parameter_editor, "_should_copy_fc_values_to_file", return_value=(True, {"P": 1.0}, "SomeTool")),
-            patch.object(parameter_editor, "_update_parameters_from_fc_values", return_value=True) as mock_update,
+            patch.object(
+                parameter_editor,
+                "_update_parameters_from_fc_values",
+                return_value=FcParameterCopyResult(copied=1),
+            ) as mock_update,
         ):
             mock_ask = MagicMock(return_value=True)
 
@@ -3876,6 +4410,60 @@ class TestWorkflowEdgeCases:
         # Assert
         assert result is True
         mock_update.assert_called_once_with({"P": 1.0})
+
+    def test_user_is_told_when_fc_values_are_already_up_to_date(self, parameter_editor) -> None:
+        """
+        User is told when the confirmed FC values already match the file.
+
+        GIVEN: The user confirms copying FC values and every value is unchanged
+        WHEN: The copy workflow processes the values
+        THEN: The user is told that the parameters are already up to date
+        """
+        with (
+            patch.object(parameter_editor, "_should_copy_fc_values_to_file", return_value=(True, {"P": 1.0}, "SomeTool")),
+            patch.object(
+                parameter_editor,
+                "_update_parameters_from_fc_values",
+                return_value=FcParameterCopyResult(unchanged=1),
+            ),
+        ):
+            mock_ask = MagicMock(return_value=True)
+            mock_show_info = MagicMock()
+
+            result = parameter_editor.handle_copy_fc_values_workflow("step.param", mock_ask, mock_show_info)
+
+        assert result is True
+        mock_show_info.assert_called_once_with(
+            "Parameters already up to date",
+            "FC values already match step.param.",
+        )
+
+    def test_user_is_told_when_fc_values_fail_to_copy(self, parameter_editor) -> None:
+        """
+        User is told when confirmed FC values cannot be copied.
+
+        GIVEN: The user confirms copying FC values and the copy operation fails
+        WHEN: The copy workflow processes the values
+        THEN: The user is told that no parameters were copied
+        """
+        with (
+            patch.object(parameter_editor, "_should_copy_fc_values_to_file", return_value=(True, {"P": 1.0}, "SomeTool")),
+            patch.object(
+                parameter_editor,
+                "_update_parameters_from_fc_values",
+                return_value=FcParameterCopyResult(failed=1),
+            ),
+        ):
+            mock_ask = MagicMock(return_value=True)
+            mock_show_info = MagicMock()
+
+            result = parameter_editor.handle_copy_fc_values_workflow("step.param", mock_ask, mock_show_info)
+
+        assert result is True
+        mock_show_info.assert_called_once_with(
+            "No parameters copied",
+            "No FC values could be copied to step.param.",
+        )
 
     def test_system_skips_copy_when_user_declines(self, parameter_editor) -> None:
         """
@@ -4003,7 +4591,7 @@ class TestWorkflowEdgeCases:
             (None, "simple", "dest.param", False),  # Simple GUI → auto-jump, no prompt
         ],
     )
-    def test_system_navigates_to_destination_based_on_gui_complexity_and_user_choice(  # pylint: disable= too-many-arguments, too-many-positional-arguments
+    def test_system_navigates_to_destination_based_on_gui_complexity_and_user_choice(
         self, parameter_editor, jump_choice: bool | None, gui_complexity: str, expected_file: str, expect_asked: bool
     ) -> None:
         """
@@ -4043,19 +4631,18 @@ class TestWorkflowEdgeCases:
         mock_ask = MagicMock()
 
         # Act
-        result = parameter_editor._should_download_file_from_url_workflow("01_setup.param", mock_ask, MagicMock())
+        parameter_editor._download_files_for_step("01_setup.param", mock_ask, MagicMock())
 
-        # Assert
-        assert result is True
+        # Assert: No download was needed
         mock_ask.assert_not_called()
 
     def test_system_skips_download_when_file_already_exists_locally(self, parameter_editor) -> None:
         """
-        System returns True immediately when the target file is already present in the vehicle directory.
+        An existing file needs no download prompt.
 
         GIVEN: A config step with a URL but the corresponding file already exists locally
         WHEN: The download-check workflow runs
-        THEN: It should return True (no download needed) without prompting the user
+        THEN: It should continue without prompting the user
         """
         # Arrange: URL exists but file is already present
         parameter_editor._local_filesystem.get_download_url_and_local_filename.return_value = (
@@ -4066,10 +4653,9 @@ class TestWorkflowEdgeCases:
         mock_ask = MagicMock()
 
         # Act
-        result = parameter_editor._should_download_file_from_url_workflow("01_setup.param", mock_ask, MagicMock())
+        parameter_editor._download_files_for_step("01_setup.param", mock_ask, MagicMock())
 
         # Assert
-        assert result is True
         mock_ask.assert_not_called()
 
 
@@ -4112,6 +4698,38 @@ class TestParameterUploadNavigation:
         mock_retry.assert_not_called()
         assert result is True
         mock_write.assert_called_once()
+
+    def test_system_logs_upload_and_verification_duration(self, parameter_editor) -> None:
+        """Log the elapsed time after uploaded parameters have been verified."""
+        parameter_editor._flight_controller.fc_parameters = {"P1": 1.0}
+
+        with (
+            patch(
+                "ardupilot_methodic_configurator.data_model_parameter_editor.perf_counter",
+                side_effect=(100.0, 100.123),
+            ),
+            patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_info") as mock_log,
+            patch.multiple(
+                parameter_editor,
+                upload_parameters_that_require_reset_workflow=MagicMock(return_value=(False, set(), True)),
+                _upload_parameters_to_fc=MagicMock(return_value=1),
+                download_flight_controller_parameters=MagicMock(),
+                _write_current_file=MagicMock(),
+                _validate_uploaded_parameters=MagicMock(return_value=[]),
+            ),
+        ):
+            result = parameter_editor.upload_selected_params_workflow(
+                {"P1": Par(1.0)},
+                ask_confirmation=MagicMock(return_value=True),
+                ask_retry_cancel=MagicMock(),
+                show_error=MagicMock(),
+            )
+
+        assert result is True
+        mock_log.assert_any_call(
+            "Uploaded and verified %(parameter_count)d parameters in %(duration_ms)d ms",
+            {"parameter_count": 1, "duration_ms": 123},
+        )
 
     def test_system_prompts_retry_when_parameter_validation_finds_mismatch(self, parameter_editor) -> None:
         """
@@ -4501,7 +5119,7 @@ class TestParameterManagementBehavior:
             patch.object(
                 parameter_editor._config_step_processor,
                 "process_configuration_step",
-                return_value=({"OLD": MagicMock()}, [], [], [], [("OLD", "NEW")], ParDict()),
+                return_value=({"OLD": MagicMock()}, [], [], [], [("OLD", "NEW")], ParDict(), set()),
             ),
             patch.object(parameter_editor._config_step_processor, "create_ardupilot_parameter", return_value=mock_new_param),
         ):
@@ -4524,12 +5142,13 @@ class TestParameterManagementBehavior:
         parameter_editor.current_file = "test.param"
         parameter_editor._local_filesystem.file_parameters = {"test.param": ParDict()}
         mock_der = MagicMock()
+        mock_der.is_manual_override = False
 
         # Act
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({"DER": mock_der}, [], [], [], [], ParDict({"DER": Par(2.0, "because math")})),
+            return_value=({"DER": mock_der}, [], [], [], [], ParDict({"DER": Par(2.0, "because math")}), set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 
@@ -5138,105 +5757,9 @@ class TestRefreshConnectionRenames:
         assert parameter_editor._connection_renames.get("ORIG_PARAM") == "OLD_TARGET"
 
 
-class TestFlightLogDownloadWorkflow:
-    """Test the flight log download workflow and its guard clauses."""
-
-    def test_user_is_warned_when_downloading_log_without_a_connected_fc(self, parameter_editor: ParameterEditor) -> None:
-        """
-        User is told to connect a flight controller before a log download is attempted.
-
-        GIVEN: No flight controller is connected
-        WHEN: The user triggers the flight log download
-        THEN: An error is shown and no save dialog is opened
-        """
-        parameter_editor._flight_controller.master = None
-        ask_saveas_filename = MagicMock()
-        show_error = MagicMock()
-        show_info = MagicMock()
-
-        parameter_editor.download_last_flight_log_workflow(ask_saveas_filename, show_error, show_info)
-
-        show_error.assert_called_once()
-        ask_saveas_filename.assert_not_called()
-        show_info.assert_not_called()
-
-    def test_user_is_warned_when_flight_controller_lacks_mavftp(self, parameter_editor: ParameterEditor) -> None:
-        """
-        User is told the download is impossible when the flight controller has no MAVFTP support.
-
-        GIVEN: A connected flight controller that does not support MAVFTP
-        WHEN: The user triggers the flight log download
-        THEN: An error is shown and no save dialog is opened
-        """
-        parameter_editor._flight_controller.master = MagicMock()
-        parameter_editor._flight_controller.info.is_mavftp_supported = False
-        ask_saveas_filename = MagicMock()
-        show_error = MagicMock()
-
-        parameter_editor.download_last_flight_log_workflow(ask_saveas_filename, show_error, MagicMock())
-
-        show_error.assert_called_once()
-        ask_saveas_filename.assert_not_called()
-
-    def test_user_can_cancel_the_save_dialog_without_downloading(self, parameter_editor: ParameterEditor) -> None:
-        """
-        User cancelling the save dialog aborts the download silently.
-
-        GIVEN: A connected flight controller with MAVFTP support
-        WHEN: The user closes the save dialog without picking a filename
-        THEN: No download is started and no message is shown
-        """
-        parameter_editor._flight_controller.master = MagicMock()
-        parameter_editor._flight_controller.info.is_mavftp_supported = True
-        show_error = MagicMock()
-        show_info = MagicMock()
-
-        parameter_editor.download_last_flight_log_workflow(lambda: "", show_error, show_info)
-
-        parameter_editor._flight_controller.download_last_flight_log.assert_not_called()
-        show_error.assert_not_called()
-        show_info.assert_not_called()
-
-    def test_user_sees_the_saved_path_after_a_successful_download(self, parameter_editor: ParameterEditor) -> None:
-        """
-        User is shown the destination path once the flight log has been downloaded.
-
-        GIVEN: A connected flight controller with MAVFTP support and a chosen filename
-        WHEN: The download succeeds
-        THEN: A success message containing the filename is shown
-        AND: The progress callback is forwarded to the backend
-        """
-        parameter_editor._flight_controller.master = MagicMock()
-        parameter_editor._flight_controller.info.is_mavftp_supported = True
-        parameter_editor._flight_controller.download_last_flight_log.return_value = True
-        show_info = MagicMock()
-        progress_callback = MagicMock()
-
-        parameter_editor.download_last_flight_log_workflow(lambda: "flight_log.bin", MagicMock(), show_info, progress_callback)
-
-        parameter_editor._flight_controller.download_last_flight_log.assert_called_once_with(
-            "flight_log.bin", progress_callback
-        )
-        assert "flight_log.bin" in show_info.call_args[0][1]
-
-    def test_user_is_told_when_the_flight_log_download_fails(self, parameter_editor: ParameterEditor) -> None:
-        """
-        User receives an error when the backend reports a failed download.
-
-        GIVEN: A connected flight controller with MAVFTP support and a chosen filename
-        WHEN: The backend download returns failure
-        THEN: An error is shown and no success message is displayed
-        """
-        parameter_editor._flight_controller.master = MagicMock()
-        parameter_editor._flight_controller.info.is_mavftp_supported = True
-        parameter_editor._flight_controller.download_last_flight_log.return_value = False
-        show_error = MagicMock()
-        show_info = MagicMock()
-
-        parameter_editor.download_last_flight_log_workflow(lambda: "flight_log.bin", show_error, show_info)
-
-        show_error.assert_called_once()
-        show_info.assert_not_called()
+def test_old_flight_log_ui_workflow_is_retired() -> None:
+    """Dialogs and progress belong to FileBrowserWindow, not the model."""
+    assert not hasattr(ParameterEditor, "download_last_flight_log_workflow")
 
 
 class TestConfigurationStepNumbering:
@@ -5979,6 +6502,25 @@ class TestBulkAddFeedback:
 class TestUnsavedComponentChangesPrompt:
     """Test how unsaved component-data edits are handled when writing changes."""
 
+    def test_recent_save_prompt_suppresses_a_second_prompt_during_handoff(self, parameter_editor: ParameterEditor) -> None:
+        """A save prompt shown moments earlier is not repeated during the window handoff."""
+        parameter_editor._last_time_asked_to_save = 100.0
+        ask = MagicMock()
+
+        with (
+            patch.object(parameter_editor, "_has_unsaved_changes", return_value=True),
+            patch.object(parameter_editor, "_export_current_file") as mock_export,
+            patch("ardupilot_methodic_configurator.data_model_parameter_editor.time", return_value=100.5),
+        ):
+            result = parameter_editor.handle_write_changes_workflow(
+                annotate_params_into_files=False,
+                ask_user_confirmation=ask,
+            )
+
+        assert result is False
+        ask.assert_not_called()
+        mock_export.assert_not_called()
+
     def test_user_saving_parameters_also_saves_pending_component_edits(self, parameter_editor: ParameterEditor) -> None:
         """
         Confirming the save prompt writes both the parameter file and the component data.
@@ -6100,6 +6642,38 @@ class TestUnsavedComponentChangesPrompt:
         mock_revert.assert_called_once()
 
 
+class TestManualOverridePersistenceAcrossNavigation:  # pylint: disable=too-few-public-methods
+    """Protect persisted manual override values during configuration-step rebuilds."""
+
+    def test_repopulate_does_not_reapply_derived_value_to_manual_override(self, parameter_editor: ParameterEditor) -> None:
+        """A saved derived override must win over the newly computed derived value."""
+        parameter_editor.current_file = "test_file.param"
+        manual_param = ArduPilotParameter(
+            "PARAM1",
+            Par(42.0, "@manual_override user value"),
+            derived_par=Par(99.0, "derived by configuration"),
+        )
+        derived_params = ParDict({"PARAM1": Par(99.0, "derived by configuration")})
+        parameter_editor._config_step_processor.process_configuration_step = MagicMock(
+            return_value=(
+                {"PARAM1": manual_param},
+                [],
+                [],
+                set(),
+                [],
+                derived_params,
+                set(),
+            )
+        )
+
+        parameter_editor._repopulate_configuration_step_parameters()
+
+        reloaded_param = parameter_editor.current_step_parameters["PARAM1"]
+        assert reloaded_param.is_manual_override
+        assert reloaded_param.get_new_value() == 42.0
+        assert reloaded_param.change_reason == "user value"
+
+
 class TestCopyFlightControllerValuesEdgeCases:
     """Test how out-of-range and unchanged flight controller values are copied into a file."""
 
@@ -6117,7 +6691,7 @@ class TestCopyFlightControllerValuesEdgeCases:
         param.set_new_value.side_effect = ParameterOutOfRangeError("out of range")
         parameter_editor.current_step_parameters = {"PARAM1": param}
 
-        assert parameter_editor._update_parameters_from_fc_values({"PARAM1": 999.0}) is True
+        assert parameter_editor._update_parameters_from_fc_values({"PARAM1": 999.0}) == FcParameterCopyResult(copied=1)
         param.set_new_value.assert_called_once_with("999.0", ignore_out_of_range=True)
 
     def test_user_sees_no_change_when_the_flight_controller_values_already_match(
@@ -6134,7 +6708,7 @@ class TestCopyFlightControllerValuesEdgeCases:
         param.set_new_value.side_effect = ParameterUnchangedError("unchanged")
         parameter_editor.current_step_parameters = {"PARAM1": param}
 
-        assert parameter_editor._update_parameters_from_fc_values({"PARAM1": 1.0}) is False
+        assert parameter_editor._update_parameters_from_fc_values({"PARAM1": 1.0}) == FcParameterCopyResult(unchanged=1)
 
     def test_system_skips_a_flight_controller_value_that_cannot_be_converted(self, parameter_editor: ParameterEditor) -> None:
         """
@@ -6149,8 +6723,37 @@ class TestCopyFlightControllerValuesEdgeCases:
         good = ArduPilotParameter("GOOD", Par(1.0))
         parameter_editor.current_step_parameters = {"BAD": bad, "GOOD": good}
 
-        assert parameter_editor._update_parameters_from_fc_values({"BAD": 1.0, "GOOD": 2.0}) is True
+        with patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_exception") as mock_exception:
+            result = parameter_editor._update_parameters_from_fc_values({"BAD": 1.0, "GOOD": 2.0})
+
         assert good.get_new_value() == 2.0
+        assert result == FcParameterCopyResult(copied=1, failed=1)
+        mock_exception.assert_called_once_with("Failed to update in-memory value for BAD after FC copy")
+
+    def test_system_warns_without_a_traceback_when_a_parameter_is_forced_or_derived(
+        self, parameter_editor: ParameterEditor
+    ) -> None:
+        """
+        A forced or derived parameter cannot be replaced by a value from the flight controller.
+
+        GIVEN: A parameter that rejects an FC value because it is forced or derived
+        WHEN: The FC value is copied into the current file
+        THEN: Its error message is logged as a warning without an exception traceback
+        """
+        param = MagicMock()
+        error_message = "This parameter is forced or derived and cannot be changed."
+        error = ParameterForcedOrDerivedError(error_message)
+        param.set_new_value.side_effect = error
+        parameter_editor.current_step_parameters = {"FORCED": param}
+
+        with patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_warning") as mock_warning:
+            result = parameter_editor._update_parameters_from_fc_values({"FORCED": 1.0})
+
+        assert result == FcParameterCopyResult(failed=1)
+        mock_warning.assert_called_once_with(
+            "Parameter FORCED could not be updated because it is forced or derived: "
+            "This parameter is forced or derived and cannot be changed."
+        )
 
     def test_system_skips_a_flight_controller_value_absent_from_the_current_step(
         self, parameter_editor: ParameterEditor
@@ -6164,7 +6767,7 @@ class TestCopyFlightControllerValuesEdgeCases:
         """
         parameter_editor.current_step_parameters = {}
 
-        assert parameter_editor._update_parameters_from_fc_values({"ABSENT": 1.0}) is False
+        assert parameter_editor._update_parameters_from_fc_values({"ABSENT": 1.0}) == FcParameterCopyResult(failed=1)
 
 
 class TestFlightControllerParameterDiffExport:
@@ -6299,7 +6902,7 @@ class TestConfigurationStepParameterRepopulation:
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({}, [], [], [], [], {}),
+            return_value=({}, [], [], [], [], {}, set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 
@@ -6324,7 +6927,7 @@ class TestConfigurationStepParameterRepopulation:
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({"OLD_PARAM": MagicMock()}, [], [], [], [], {}),
+            return_value=({"OLD_PARAM": MagicMock()}, [], [], [], [], {}, set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 
@@ -6461,6 +7064,19 @@ class TestProjectAccessors:
 
         parameter_editor._local_filesystem.doc_dict = {}
         assert parameter_editor.parameter_documentation_available() is False
+
+    def test_gui_reads_enum_choices_from_parameter_documentation(self, parameter_editor: ParameterEditor) -> None:
+        """
+        Plugin controls can populate choices without exposing filesystem internals.
+
+        GIVEN: RC channel option values in the loaded parameter documentation
+        WHEN: The parameter editor's public enum-choice accessor is queried
+        THEN: The numeric choice labels are returned without changing the metadata
+        """
+        parameter_editor._local_filesystem.doc_dict = {"RC6_OPTION": {"values": {"0": "Disabled", "300": "QuickTune"}}}
+
+        assert parameter_editor.get_parameter_choices("RC6_OPTION") == {"0": "Disabled", "300": "QuickTune"}
+        assert parameter_editor.get_parameter_choices("UNKNOWN_PARAMETER") == {}
 
     def test_gui_reads_the_configuration_phases_from_the_project(self, parameter_editor: ParameterEditor) -> None:
         """
@@ -6638,7 +7254,7 @@ class TestParameterFileChangeWorkflow:
         with (
             patch.object(parameter_editor, "_handle_file_jump_workflow", return_value="10_step.param"),
             patch.object(parameter_editor, "_repopulate_configuration_step_parameters", return_value=([], [])),
-            patch.object(parameter_editor, "_should_download_file_from_url_workflow", return_value=False),
+            patch.object(parameter_editor, "_download_files_for_step"),
             patch.object(parameter_editor, "open_documentation_in_browser") as mock_doc,
         ):
             parameter_editor.handle_param_file_change_workflow(
@@ -6688,13 +7304,30 @@ class TestParameterFileChangeWorkflow:
         with (
             patch.object(parameter_editor, "_handle_file_jump_workflow", return_value="10_step.param"),
             patch.object(parameter_editor, "_repopulate_configuration_step_parameters", return_value=([], [])),
-            patch.object(parameter_editor, "_should_download_file_from_url_workflow", return_value=True),
+            patch.object(parameter_editor, "_download_files_for_step"),
             patch.object(parameter_editor, "open_documentation_in_browser"),
         ):
             parameter_editor.handle_param_file_change_workflow(
                 "10_step.param", forced=False, gui_complexity="normal", auto_open_documentation=False, **cb
             )
 
+        cb["handle_upload_file"].assert_called_once_with("10_step.param")
+
+    def test_incomplete_downloads_still_offer_available_uploads(self, parameter_editor: ParameterEditor) -> None:
+        """The upload workflow checks individual local files even when downloads were incomplete."""
+        parameter_editor.current_file = "01_first.param"
+        cb = self._callbacks()
+        with (
+            patch.object(parameter_editor, "_handle_file_jump_workflow", return_value="10_step.param"),
+            patch.object(parameter_editor, "_repopulate_configuration_step_parameters", return_value=([], [])),
+            patch.object(parameter_editor, "_download_files_for_step"),
+            patch.object(parameter_editor, "open_documentation_in_browser"),
+        ):
+            selected, keep_going = parameter_editor.handle_param_file_change_workflow(
+                "10_step.param", forced=False, gui_complexity="normal", auto_open_documentation=False, **cb
+            )
+
+        assert (selected, keep_going) == ("10_step.param", True)
         cb["handle_upload_file"].assert_called_once_with("10_step.param")
 
     def test_step_errors_and_notices_are_surfaced_to_the_user(self, parameter_editor: ParameterEditor) -> None:
@@ -6715,7 +7348,7 @@ class TestParameterFileChangeWorkflow:
                 "_repopulate_configuration_step_parameters",
                 return_value=([("Error", "bad expression")], [("Notice", "value derived")]),
             ),
-            patch.object(parameter_editor, "_should_download_file_from_url_workflow", return_value=False),
+            patch.object(parameter_editor, "_download_files_for_step"),
             patch.object(parameter_editor, "open_documentation_in_browser"),
         ):
             parameter_editor.handle_param_file_change_workflow(
@@ -6746,7 +7379,7 @@ class TestDuplicateParameterRemoval:
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({"DUP_PARAM": MagicMock()}, [], [], {"DUP_PARAM"}, [], {}),
+            return_value=({"DUP_PARAM": MagicMock()}, [], [], {"DUP_PARAM"}, [], {}, set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 
@@ -6772,7 +7405,7 @@ class TestDuplicateParameterRemoval:
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({"DUP_PARAM": MagicMock()}, [], [], {"DUP_PARAM"}, [], {}),
+            return_value=({"DUP_PARAM": MagicMock()}, [], [], {"DUP_PARAM"}, [], {}, set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 

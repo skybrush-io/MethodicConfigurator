@@ -108,6 +108,69 @@ This systematic approach ensures methodical, traceable, and safe vehicle configu
   - Coordinate between documentation, table, and progress components
   - Manage application state and configuration persistence
 
+#### Collapsible Information Sections
+
+- **File**: `frontend_tkinter_collapsible_label_frame.py`
+- **Purpose**: Reusable `ttk.LabelFrame` with a persistent disclosure button and a content frame
+- **Responsibilities**:
+  - Hide and restore content with `grid_remove()` and `grid()` without recreating controls
+  - Keep translated section titles visible and support keyboard toggling
+  - Preserve per-section expansion state while progress and documentation update
+  - Let the parameter editor's existing `<Configure>` bindings reclaim released vertical space
+- **Consumers**: `StageProgressBar` and `DocumentationFrame`, both initially expanded
+- **Lifetime**: Collapse choices last for the current editor window; they are not stored in program settings
+
+#### Plugin Lifecycle During Step Changes
+
+After saving pending edits, the parameter editor deactivates and destroys the outgoing plugin view
+before running the step-change workflow. Deactivation completes safety actions such as stopping motors;
+destruction removes controls, keyboard bindings, and polling timers before dialogs or transfers process
+Tk events. The existing layout remains available for reuse.
+
+The resulting step gets a new plugin view even when its plugin configuration matches the outgoing one.
+Forced step refreshes follow the same lifecycle. If the workflow raises an exception, the editor restores
+the plugin for the current step before propagating the error. A failed safety stop prevents the workflow
+from starting. Diagnostics temporarily suspend plugin receivers while preserving the active view.
+
+The editor delegates connection timers, retries and worker cancellation to `ConnectionRecovery`
+in `frontend_tkinter_connection_recovery.py`. UI callbacks display connection status and refresh
+FC cells while preserving local edits. FC operations retain explicit leases through nested Tk event
+loops; tools whose lifetime outlasts their opening callback release their lease when they close.
+Parameter upload previews and export windows use `_retain_fc_operation_until_closed()`
+to bind lease release to destruction of their root, rather than infer ownership from
+visibility. Unrelated report windows do not block recovery.
+An open bitmask editor blocks new connection checks and defers a successful worker's
+completion through `RecoveryCallbacks.can_refresh` until the dialog closes, keeping
+its row widgets alive even on macOS where the dialog does not take a grab.
+`SuspendablePlugin.on_suspend(reason)` distinguishes exclusive operations from connection recovery;
+motor tests stop before exclusive tools take reception and yield without commands during recovery.
+Both recovery eligibility and suspension use `resolve_plugin_lifecycle()` to select
+the preferred paired suspend/resume hooks or the legacy hide/show pair.
+
+#### Calibration Navigation Lock
+
+- **File**: `frontend_tkinter_navigation_lock.py`
+- **Purpose**: Keep the active configuration context stable during calibration and configured file uploads
+- **Responsibilities**:
+  - Disable registered navigation, upload, file-browser, export, and auxiliary action controls
+  - Preserve each control's existing disabled state and the step selector's readonly state
+  - Restore controls only after every owner releases its lock, tolerating widget teardown
+- **Integration**:
+  - `BaseWindow.navigation_lock` supplies the shared frontend-only service
+  - The parameter editor registers its header and footer controls and guards queued callbacks
+  - Calibration views use `plugins/frontend_tkinter_helpers.py` to acquire before sending commands
+    and release after completion, cancellation, failed startup, or teardown
+  - Accelerometer and level calibration retain their locks through parameter readback and staging
+  - RC calibration retains its lock while collecting and saving channel extremes
+  - Compass calibration retains its lock until its progress popup closes
+  - Configured file uploads retain their lock while a background transport worker runs;
+    the modal Tk wait continues processing estimates and progress
+  - Closing the parameter editor is deferred until a configured file upload finishes;
+    other navigation locks leave application close available
+  - Future asynchronous calibrations can use `start_calibration_with_navigation_lock()` and
+    `end_calibration_navigation_lock()` without depending on `ParameterEditorWindow`
+  - Calibration continue/cancel controls and application close remain available
+
 #### Documentation Frame
 
 - **File**: `frontend_tkinter_parameter_editor_documentation_frame.py`
@@ -199,6 +262,15 @@ This systematic approach ensures methodical, traceable, and safe vehicle configu
 - **Documentation System**: Integrates with online and cached documentation
 
 ### Derived Parameter Awareness Workflow
+
+`run_initial_component_editor()` applies project-creation preferences only for new
+projects. Existing projects open the Parameter Editor directly. The Parameter Editor
+returns an explicit action when the user requests component editing, and its caller
+reopens the editor at the same parameter step after the component window closes. The
+component window reports its close outcome; the application decides whether an initial
+setup close exits startup or an on-demand close returns to parameter editing. Each
+on-demand visit rebuilds the parameter model so evaluator references use the updated
+component data.
 
 After the Component Editor closes and before the Parameter Editor opens,
 `process_component_editor_results()` recalculates forced/derived parameters and notifies

@@ -25,6 +25,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 from collections.abc import Callable, Sequence
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
@@ -33,8 +34,29 @@ import serial.tools.list_ports_common
 from ardupilot_methodic_configurator.data_model_flightcontroller_info import FlightControllerInfo
 from ardupilot_methodic_configurator.data_model_par_dict import ParDict
 
+
+class FileUploadCheckStatus(Enum):
+    """Outcomes from checking whether a local file needs to be uploaded."""
+
+    ALREADY_CURRENT = auto()
+    NEEDS_UPLOAD = auto()
+    VERIFICATION_FAILED = auto()
+
+
+class FileUploadResult(Enum):
+    """Outcomes from an attempted file upload operation."""
+
+    ALREADY_CURRENT = auto()
+    VERIFICATION_FAILED = auto()
+    LOCAL_FILE_MISSING = auto()
+    EMPTY_LOCAL_FILE = auto()
+    UPLOADED = auto()
+    UPLOAD_FAILED = auto()
+
+
 if TYPE_CHECKING:
     from ardupilot_methodic_configurator.backend_flightcontroller_commands import CompassCalibrationUpdate
+    from ardupilot_methodic_configurator.backend_flightcontroller_files import FlightControllerLogFile, LastLogDownloadResult
 
 # Type alias for MAVLink connection to avoid type checker issues
 # We define MavlinkConnection as a protocol-like type to represent any MAVLink connection object
@@ -84,7 +106,7 @@ class FlightControllerConnectionProtocol(Protocol):
     @property
     def info(self) -> FlightControllerInfo:  # pyright: ignore[reportInvalidTypeForm]
         """Get flight controller information (connection manager is sole mutator)."""
-        ...  # pylint: disable=unnecessary-ellipsis
+        ...
 
     @property
     def comport(self) -> mavutil.SerialPort | serial.tools.list_ports_common.ListPortInfo | None:
@@ -96,7 +118,12 @@ class FlightControllerConnectionProtocol(Protocol):
     @property
     def baudrate(self) -> int:
         """Get the default baud rate for serial connections."""
-        ...  # pylint: disable=unnecessary-ellipsis
+        ...
+
+    @property
+    def active_baudrate(self) -> int:
+        """Get the baud rate used for the current or most recent serial session."""
+        ...
 
     def discover_connections(
         self,
@@ -105,6 +132,8 @@ class FlightControllerConnectionProtocol(Protocol):
     ) -> None: ...
 
     def disconnect(self) -> None: ...
+
+    def start_gcs_heartbeat(self) -> None: ...
 
     def add_connection(self, connection_string: str) -> bool: ...
 
@@ -123,15 +152,17 @@ class FlightControllerConnectionProtocol(Protocol):
         timeout: int,
         baudrate: int,
         log_errors: bool,
+        reconnect_progress_callback: Callable[[int, int], None] | None = None,
+        is_reconnect: bool = False,
     ) -> str: ...
 
     def get_serial_ports(self) -> list[serial.tools.list_ports_common.ListPortInfo]:
         """Get all available serial ports."""
-        ...  # pylint: disable=unnecessary-ellipsis
+        ...
 
     def get_network_ports(self) -> list[str]:
         """Get all available network ports."""
-        ...  # pylint: disable=unnecessary-ellipsis
+        ...
 
     def get_connection_tuples(self) -> list[tuple[str, str]]: ...
 
@@ -150,7 +181,17 @@ class FlightControllerConnectionProtocol(Protocol):
     @property
     def banner_text_buffer(self) -> list[str]: ...
 
-    def _detect_vehicles_from_heartbeats(self, timeout: int) -> dict[tuple[int, int], Any]: ...
+    @property
+    def status_text_buffer(self) -> list[str]: ...
+
+    @property
+    def status_text_display_buffer(self) -> list[str]: ...
+
+    def poll_status_text(self) -> list[str]: ...
+
+    def _detect_vehicles_from_heartbeats(
+        self, timeout: int, return_after_first_heartbeat: bool = False
+    ) -> dict[tuple[int, int], Any]: ...
 
     def _extract_firmware_type_from_banner(self, banner_msgs: list[str], os_custom_version_index: int | None) -> str: ...
 
@@ -180,7 +221,7 @@ class FlightControllerParamsProtocol(Protocol):
     @property
     def fc_parameters(self) -> dict[str, float]:
         """Get the parameter dictionary."""
-        ...  # pylint: disable=unnecessary-ellipsis
+        ...
 
     @fc_parameters.setter
     def fc_parameters(self, value: dict[str, float]) -> None:
@@ -191,6 +232,9 @@ class FlightControllerParamsProtocol(Protocol):
         progress_callback: Callable[[int, int], None] | None,
         parameter_values_filename: Path | None,
         parameter_defaults_filename: Path | None,
+        *,
+        response_timeout: float | None = None,
+        cancellation_requested: Callable[[], bool] | None = None,
     ) -> tuple[dict[str, float], ParDict]: ...
 
     def set_param(self, param_name: str, param_value: float) -> tuple[bool, str]: ...
@@ -233,9 +277,11 @@ class FlightControllerCommandsProtocol(Protocol):  # pylint: disable=too-many-pu
         timeout: float,
     ) -> tuple[bool, str]: ...
 
+    def reboot_to_bootloader(self) -> tuple[bool, str]: ...
+
     def reset_all_parameters_to_default(self) -> tuple[bool, str]: ...
 
-    def test_motor(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def test_motor(
         self, test_sequence_nr: int, motor_letters: str, motor_output_nr: int, throttle_percent: int, timeout_seconds: int
     ) -> tuple[bool, str]: ...
 
@@ -251,21 +297,25 @@ class FlightControllerCommandsProtocol(Protocol):  # pylint: disable=too-many-pu
 
     def start_accel_calibration_level(self) -> tuple[bool, str]: ...
 
+    def poll_accel_calibration_level(self) -> tuple[bool, str] | None: ...
+
+    def abort_level_calibration(self) -> None: ...
+
     def send_accel_calibration_full_start(self) -> tuple[bool, str]: ...
 
     def poll_accel_cal_vehicle_pos(self) -> int | None: ...
 
     def confirm_accel_vehicle_pos(self, position: int) -> tuple[bool, str]: ...
 
-    def cancel_accel_calibration(self) -> tuple[bool, str]: ...
-
     def poll_scaled_imu(self) -> tuple[float, float, float] | None: ...
 
     def request_scaled_imu_messages(self, interval_microseconds: int) -> tuple[bool, str]: ...
 
+    def request_rc_receiver_messages(self, interval_microseconds: int) -> tuple[bool, str]: ...
+
     def request_periodic_battery_status(self, interval_microseconds: int) -> tuple[bool, str]: ...
 
-    def get_battery_status(self) -> tuple[tuple[float, float] | None, str]: ...
+    def get_battery_statuses(self) -> tuple[dict[int, tuple[float, float]] | None, str]: ...
 
     def get_voltage_thresholds(self) -> tuple[float, float]: ...
 
@@ -293,4 +343,35 @@ class FlightControllerFilesProtocol(Protocol):
         self, local_filename: str, remote_filename: str, progress_callback: Callable[[int, int], None] | None
     ) -> bool: ...
 
-    def download_last_flight_log(self, local_filename: str, progress_callback: Callable[[int, int], None] | None) -> bool: ...
+    def download_last_flight_log(
+        self, local_filename: str, progress_callback: Callable[[int, int], None] | None
+    ) -> "LastLogDownloadResult": ...
+
+    def list_remote_files(
+        self,
+        remote_directory: str = "/APM/LOGS/",
+    ) -> list["FlightControllerLogFile"] | None: ...
+
+    def download_remote_file(
+        self,
+        remote_path: str,
+        local_filename: str,
+        progress_callback: Callable[[int, int], None] | None,
+    ) -> bool: ...
+
+    def verify_remote_file(self, remote_path: str, local_filename: str) -> bool | None: ...
+
+    def check_file_upload(self, remote_path: str, local_filename: str) -> FileUploadCheckStatus: ...
+
+    def upload_file_if_needed(
+        self,
+        local_filename: str,
+        remote_filename: str,
+        progress_callback: Callable[[int, int], None] | None,
+    ) -> FileUploadResult: ...
+
+    def make_remote_directory(self, remote_directory: str) -> bool: ...
+
+    def delete_remote_path(self, remote_path: str, is_directory: bool = False) -> bool: ...
+
+    def rename_remote_path(self, remote_path: str, new_remote_path: str) -> bool: ...

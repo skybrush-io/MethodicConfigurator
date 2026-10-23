@@ -13,11 +13,17 @@ SPDX-License-Identifier: GPL-3.0-or-later
 import contextlib
 import tkinter as tk
 from collections.abc import Generator
+from threading import Event, get_ident
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ardupilot_methodic_configurator.frontend_tkinter_progress_window import ProgressWindow
+from ardupilot_methodic_configurator.data_model_transfer_progress import TransferProgress
+from ardupilot_methodic_configurator.frontend_tkinter_progress_window import (
+    ProgressWindow,
+    TkThreadCallbacks,
+    update_flight_controller_restart_progress,
+)
 
 
 @pytest.fixture
@@ -60,8 +66,35 @@ def lazy_progress_window(tk_root) -> Generator[ProgressWindow, None, None]:
             window.destroy()
 
 
-class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name
+class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name,too-many-public-methods
     """Test ProgressWindow from the user's perspective - focusing on progress indication behavior."""
+
+    @pytest.mark.parametrize("parent_visible", [True, False])
+    @pytest.mark.parametrize("lazy", [True, False])
+    def test_user_sees_progress_owned_by_visible_parent_or_independent_of_hidden_parent(
+        self, tk_root: tk.Tk, parent_visible: bool, lazy: bool
+    ) -> None:
+        """
+        Progress stays associated with a visible parent and can appear without one.
+
+        GIVEN: A visible application window or withdrawn initialization parent
+        WHEN: Its eager or lazy progress window appears
+        THEN: Only the visible parent owns it, and progress is visible in both cases
+        """
+        parent = tk.Toplevel(tk_root)
+        if not parent_visible:
+            parent.withdraw()
+        parent.update_idletasks()
+        window = ProgressWindow(parent, title="Progress", only_show_when_update_progress_called=lazy)
+        try:
+            window.update_progress_bar(10, 100)
+            window.progress_window.update_idletasks()
+
+            assert str(window.progress_window.transient()) == (str(parent) if parent_visible else "")
+            assert window.progress_window.winfo_viewable()
+        finally:
+            window.destroy()
+            parent.destroy()
 
     def test_user_sees_progress_window_with_initial_state(self, progress_window) -> None:
         """
@@ -78,6 +111,38 @@ class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name
         assert progress_window.progress_label.cget("text") == "Progress: 0/0"
         assert progress_window.progress_bar["value"] == 0
         assert progress_window.progress_bar["maximum"] == 100
+
+    def test_invalid_master_is_reported_before_centering(self) -> None:
+        """Progress windows warn when their parent is not a Tk window."""
+        fake_window = MagicMock()
+        fake_window.tk.call.side_effect = ["x11", "1.0"]
+        fake_window.winfo_fpixels.return_value = 96
+        fake_frame = MagicMock()
+        fake_progress_bar = MagicMock()
+        fake_label = MagicMock()
+
+        class FakeToplevel:  # pylint: disable=too-few-public-methods
+            """Return a widget double while remaining valid for isinstance checks."""
+
+            def __new__(cls, *_args: object, **_kwargs: object) -> MagicMock:
+                return fake_window
+
+        with (
+            patch("ardupilot_methodic_configurator.frontend_tkinter_progress_window.tk.Toplevel", FakeToplevel),
+            patch("ardupilot_methodic_configurator.frontend_tkinter_progress_window.ttk.Frame", return_value=fake_frame),
+            patch(
+                "ardupilot_methodic_configurator.frontend_tkinter_progress_window.ttk.Progressbar",
+                return_value=fake_progress_bar,
+            ),
+            patch("ardupilot_methodic_configurator.frontend_tkinter_progress_window.ttk.Label", return_value=fake_label),
+            patch("ardupilot_methodic_configurator.frontend_tkinter_progress_window.BaseWindow.center_window"),
+            patch("ardupilot_methodic_configurator.frontend_tkinter_progress_window.logging_error") as log_error,
+        ):
+            ProgressWindow(object(), title="Test", only_show_when_update_progress_called=True)
+
+        log_error.assert_called_once_with(
+            "ProgressWindow: master is not a tk.Tk or tk.Toplevel instance, window centering may fail"
+        )
 
     def test_user_sees_progress_updates_during_task_execution(self, progress_window) -> None:
         """
@@ -100,6 +165,42 @@ class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name
         assert progress_window.progress_bar["value"] == 75
         assert progress_window.progress_label.cget("text") == "Progress: 75/100"
 
+    def test_user_sees_progress_message_change_during_task_execution(self, progress_window) -> None:
+        """A caller can replace the progress message for a new task stage."""
+        progress_window.update_progress_bar_with_message(30, 100, "Reconnect attempt 1 of 3")
+
+        assert progress_window.progress_bar["value"] == 30
+        assert progress_window.progress_bar["maximum"] == 100
+        assert progress_window.progress_label.cget("text") == "Reconnect attempt 1 of 3"
+
+    def test_user_keeps_window_stacking_order_while_progress_updates(self, progress_window: ProgressWindow) -> None:
+        """
+        Progress updates repaint the window without repeatedly raising it.
+
+        GIVEN: A progress window has already been shown above its parent
+        WHEN: A transfer reports further progress
+        THEN: The bar advances without changing the user's window stacking order
+        """
+        with patch.object(progress_window.progress_window, "lift") as lift:
+            progress_window.update_progress_bar(30, 100)
+            progress_window.update_progress_bar(60, 100)
+
+        lift.assert_not_called()
+        assert progress_window.progress_bar["value"] == 60
+        assert progress_window.progress_label.cget("text") == "Progress: 60/100"
+
+    def test_restart_progress_does_not_assume_three_reconnect_attempts(self) -> None:
+        """The restart UI leaves the retry count unspecified when it is not supplied."""
+        progress_window = MagicMock()
+
+        update_flight_controller_restart_progress(progress_window, 43, 100)
+
+        progress_window.update_progress_bar_with_message.assert_called_once_with(
+            43,
+            100,
+            "Reconnecting to flight controller",
+        )
+
     def test_user_sees_progress_window_close_when_task_completes(self, progress_window) -> None:
         """
         User sees progress window automatically close when task completes.
@@ -113,6 +214,22 @@ class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name
 
         # Window should be destroyed
         assert not progress_window.progress_window.winfo_exists()
+
+    def test_user_can_reuse_restart_progress_window_after_reconnect(self, tk_root) -> None:
+        """Restart progress remains available if a later validation retry resets the FC again."""
+        window = ProgressWindow(
+            tk_root,
+            title="Restarting Flight Controller",
+            message="Reset command sent",
+            auto_close_on_complete=False,
+        )
+
+        update_flight_controller_restart_progress(window, 100, 100)
+        assert window.progress_window.winfo_exists()
+
+        update_flight_controller_restart_progress(window, 10, 100)
+        assert window.progress_label.cget("text") == "Reset command sent"
+        window.destroy()
 
     def test_user_sees_special_progress_for_long_running_tasks(self, progress_window) -> None:
         """
@@ -230,16 +347,15 @@ class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name
         progress_window.destroy()
         assert not progress_window.progress_window.winfo_exists()
 
-    def test_user_sees_progress_window_handle_master_not_tk_instance(self, tk_root) -> None:
+    def test_user_sees_progress_window_accept_toplevel_master(self, tk_root) -> None:
         """
-        User sees progress window handle non-Tk master gracefully.
+        User sees progress window accept a Toplevel parent without a false error.
 
-        GIVEN: A progress window is created with a non-Tk master
+        GIVEN: A progress window is created with a Toplevel parent
         WHEN: The window is initialized
-        THEN: An error is logged but window creation continues
+        THEN: Window creation continues without an error
         """
-        # Create a non-Tk master (using a Toplevel instead of Tk)
-        non_tk_master = tk.Toplevel(tk_root)
+        parent = tk.Toplevel(tk_root)
 
         with (
             patch("ardupilot_methodic_configurator.frontend_tkinter_progress_window.logging_error") as mock_logging,
@@ -248,17 +364,15 @@ class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name
             patch("tkinter.Misc.update"),
             patch("tkinter.Misc.update_idletasks"),
         ):
-            window = ProgressWindow(non_tk_master, title="Test Progress", message="Progress: {}/{}")
+            window = ProgressWindow(parent, title="Test Progress", message="Progress: {}/{}")
 
-            # Verify error was logged
-            mock_logging.assert_called_once()
-            assert "master is not a tk.Tk instance" in mock_logging.call_args[0][0]
+            mock_logging.assert_not_called()
 
             # Window should still be created
             assert window.progress_window.winfo_exists()
 
             window.destroy()
-            non_tk_master.destroy()
+            parent.destroy()
 
     def test_user_sees_progress_window_handle_widget_update_errors(self, progress_window) -> None:
         """
@@ -301,31 +415,20 @@ class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name
         progress_window.progress_bar.update.assert_not_called()
         progress_window.progress_bar.update_idletasks.assert_called_once()
 
-    def test_user_sees_progress_window_handle_lazy_window_relift(self, progress_window) -> None:
+    def test_user_sees_lazy_progress_window_raised_only_when_first_shown(self, lazy_progress_window: ProgressWindow) -> None:
         """
-        User sees progress window handle relifting for already shown windows.
+        A lazy progress window is raised once when it first becomes visible.
 
-        GIVEN: A progress window that is already shown
+        GIVEN: A progress window initially hidden until it receives progress
         WHEN: Progress is updated multiple times
-        THEN: Window is lifted appropriately for non-lazy windows
+        THEN: The window is raised on its first update, but not on subsequent updates
         """
-        # Mock the lift method to track calls
-        progress_window.progress_window.lift = MagicMock()
+        with patch.object(lazy_progress_window.progress_window, "lift") as lift:
+            lazy_progress_window.update_progress_bar(25, 100)
+            lazy_progress_window.update_progress_bar(50, 100)
 
-        # First update - window should be lifted
-        progress_window.update_progress_bar(25, 100)
-
-        # Verify window is lifted for non-lazy windows
-        progress_window.progress_window.lift.assert_called_once()
-
-        # Reset mock
-        progress_window.progress_window.lift.reset_mock()
-
-        # Second update - window should be lifted again
-        progress_window.update_progress_bar(50, 100)
-
-        # Should be lifted again
-        progress_window.progress_window.lift.assert_called_once()
+        lift.assert_called_once()
+        assert lazy_progress_window.progress_bar["value"] == 50
 
     def test_user_sees_fc_init_progress_centered_on_screen_when_parent_is_withdrawn(self, tk_root) -> None:
         """
@@ -354,6 +457,7 @@ class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name
                 message="Init: {}/{}",
                 only_show_when_update_progress_called=True,
             )
+            assert str(window.progress_window.transient()) == ""
 
             # Ignore any centering that may have happened during __init__
             mock_center_screen.reset_mock()
@@ -444,3 +548,87 @@ class TestProgressWindowUserExperience:  # pylint: disable=redefined-outer-name
 
         # Should not raise even though progress_bar is None
         progress_window.update_progress_bar(50, 100)
+
+
+def test_user_sees_the_entire_download_label_at_the_required_popup_size(tk_root) -> None:
+    """Given a two-line download label, the popup grows to fit both lines."""
+    window = ProgressWindow(tk_root, "Downloading", "Downloaded {} of {} bytes")
+    try:
+        window.enable_transfer_progress()
+        window.update_transfer_progress(TransferProgress(1024, 2048))
+        window.progress_window.update_idletasks()
+        label_bottom = window.progress_label.winfo_y() + window.progress_label.winfo_height()
+        assert label_bottom <= window.progress_window.winfo_height()
+    finally:
+        window.destroy()
+
+
+def test_sequoia_progress_defers_all_rendering(
+    lazy_progress_window: ProgressWindow,  # pylint: disable=redefined-outer-name
+) -> None:
+    """Progress values change without entering either Tk event pump on older macOS."""
+    window = lazy_progress_window
+    window._is_aqua = True  # pylint: disable=protected-access
+    with (
+        patch("ardupilot_methodic_configurator.frontend_tkinter_progress_window.is_macos_sequoia_or_older", return_value=True),
+        patch.object(window.progress_window, "update") as update,
+        patch.object(window.progress_window, "update_idletasks") as idle,
+        patch.object(window.progress_bar, "update_idletasks") as bar_idle,
+    ):
+        window.update_progress_bar(30, 100)
+        assert window.progress_bar["value"] == 30
+        update.assert_not_called()
+        idle.assert_not_called()
+        bar_idle.assert_not_called()
+
+
+@pytest.mark.parametrize("fail_dialog", [False, True])
+@pytest.mark.parametrize("fail_progress", [False, True])
+def test_workflow_keeps_timers_dialogs_and_progress_on_the_ui_thread(
+    tk_root: tk.Tk, monkeypatch: pytest.MonkeyPatch, fail_dialog: bool, fail_progress: bool
+) -> None:
+    """
+    Interactive work yields to Tk while callbacks preserve their owning thread.
+
+    GIVEN: A blocking workflow with many progress reports and a confirmation dialog
+    WHEN: The workflow runs in a worker, including a possible dialog failure
+    THEN: Timers run, callbacks stay on Tk, and the result or exception reaches the caller
+    """
+    callbacks = TkThreadCallbacks()
+    monkeypatch.setattr(tk.Misc, "update", lambda _self: None)
+    monkeypatch.setattr(tk.Misc, "update_idletasks", lambda _self: None)
+    ui_thread = get_ident()
+    heartbeat = Event()
+    rendered: list[int] = []
+    tk_root.after(0, heartbeat.set)
+
+    def render(current: int, _total: int) -> None:
+        assert get_ident() == ui_thread
+        rendered.append(current)
+        if fail_progress:
+            message = "paint failed"
+            raise ValueError(message)
+
+    def confirm() -> bool:
+        assert get_ident() == ui_thread
+        assert rendered[-1] == 999
+        if fail_dialog:
+            message = "dialog failed"
+            raise ValueError(message)
+        return True
+
+    report = callbacks.progress(render)
+
+    def workflow() -> bool:
+        assert get_ident() != ui_thread
+        assert heartbeat.wait(2), "Tk must service timers while the worker waits"
+        for current in range(1000):
+            report(current, 1000)
+        return callbacks.call(confirm)
+
+    if fail_dialog:
+        with pytest.raises(ValueError, match="dialog failed"):
+            callbacks.run(tk_root, workflow)
+    else:
+        assert callbacks.run(tk_root, workflow)
+    assert len(rendered) < 1000

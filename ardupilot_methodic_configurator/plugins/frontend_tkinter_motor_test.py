@@ -20,10 +20,12 @@ SPDX-FileCopyrightText: 2024-2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+import sys
 import time
 import tkinter as tk
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable
+from contextlib import nullcontext, suppress
 from logging import debug as logging_debug
 from logging import error as logging_error
 from logging import info as logging_info
@@ -45,8 +47,12 @@ from ardupilot_methodic_configurator.frontend_tkinter_base_window import (
     BaseWindow,
 )
 from ardupilot_methodic_configurator.frontend_tkinter_pair_tuple_combobox import PairTupleCombobox
-from ardupilot_methodic_configurator.frontend_tkinter_progress_window import ProgressWindow
+from ardupilot_methodic_configurator.frontend_tkinter_progress_window import (
+    ProgressWindow,
+    update_flight_controller_restart_progress,
+)
 from ardupilot_methodic_configurator.frontend_tkinter_scroll_frame import ScrollFrame
+from ardupilot_methodic_configurator.macos_utilities import is_macos_sequoia_or_older
 from ardupilot_methodic_configurator.plugins.data_model_motor_test import (
     DURATION_S_MAX,
     DURATION_S_MIN,
@@ -62,6 +68,9 @@ from ardupilot_methodic_configurator.plugins.data_model_motor_test import (
 )
 from ardupilot_methodic_configurator.plugins.plugin_constants import PLUGIN_MOTOR_TEST
 from ardupilot_methodic_configurator.plugins.plugin_factory import PluginModelContext, plugin_factory
+from ardupilot_methodic_configurator.plugins.plugin_protocol import PluginPauseReason
+
+# pylint: disable=too-many-lines
 
 
 class DelayedProgressCallback:  # pylint: disable=too-few-public-methods
@@ -124,6 +133,9 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
         self._content_frame: ttk.Frame | None = None  # Store reference to content frame for widget searches
         self._motor_grid_frame: ttk.Frame | None = None  # Direct handle for motor grid frame
         self._timer_id: str | None = None  # Track scheduled update timer for cleanup
+        self._suspended = False
+        self._restart_active = False
+        self._keyboard_bindings: list[tuple[str, str, str]] = []
 
         self._create_widgets()
 
@@ -348,7 +360,8 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
 
     def _update_view(self) -> None:
         """Update the view with data from the model."""
-        # Update diagram only when needed (not every second)
+        if self._suspended:
+            return
         if self._diagram_needs_update:
             self._update_diagram()
             self._diagram_needs_update = False
@@ -356,7 +369,13 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
         self._update_motor_buttons_layout()
         self._update_battery_status()
         self._update_spinbox_values()
-        self._timer_id = self.after(1000, self._update_view)  # Schedule periodic update
+        if self._timer_id is None:
+            self._timer_id = self.after(1000, self._on_update_timer)
+
+    def _on_update_timer(self) -> None:
+        """Consume the pending timer before scheduling the next update."""
+        self._timer_id = None
+        self._update_view()
 
     def _update_spinbox_values(self) -> None:
         """Update spinbox values from the data model only if not currently being edited."""
@@ -381,8 +400,8 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
         except KeyError:
             pass
 
-    def _update_motor_buttons_layout(self) -> None:
-        """Re-create motor buttons if motor count changes."""
+    def _update_motor_buttons_layout(self, *, force: bool = False) -> None:
+        """Re-create motor buttons when their count or frame layout changes."""
         motor_grid = self._motor_grid_frame
         if motor_grid is None:
             logging_error(_("Could not find motor grid frame"))
@@ -391,7 +410,7 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
         current_count = len(self.motor_buttons)
         required_count = self.model.motor_count
 
-        if current_count == required_count:
+        if current_count == required_count and not force:
             return
 
         for child in motor_grid.winfo_children():
@@ -484,39 +503,39 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
 
     def _on_frame_type_change(self, _event: object) -> None:
         """Handle frame type selection change and immediately upload parameters."""
+        if self._restart_active:
+            return
         # Get the selected frame type code from PairTupleCombobox
         selected_key = self.frame_type_combobox.get_selected_key()
         if selected_key is None:
             logging_warning(_("No frame type selected"))
             return
 
+        progress_window: ProgressWindow | None = None
+        owner = object()
+        # Restart progress can pump Tk's event loop while the FC is disconnected.
+        # Retain ownership so recovery and editor actions cannot use that connection.
+        self.base_window.navigation_lock.acquire(owner)
         try:
-            # Create delayed progress windows that only show if operation takes more than 1 second
-            reset_progress_window = ProgressWindow(
+            # Only show the shared progress window if restarting takes more than one second.
+            progress_window = ProgressWindow(
                 self.root_window,
-                _("Resetting Flight Controller"),
-                _("Waiting for {} of {} seconds"),
+                _("Restarting Flight Controller"),
+                _("Reset command sent"),
                 only_show_when_update_progress_called=True,
-            )
-            connection_progress_window = ProgressWindow(
-                self.root_window,
-                _("Re-Connecting to Flight Controller"),
-                _("Waiting for {} of {} seconds"),
-                only_show_when_update_progress_called=True,
+                auto_close_on_complete=False,
             )
 
-            # Create delayed callback wrappers that wait 1 second before showing progress
-            reset_callback = DelayedProgressCallback(reset_progress_window.update_progress_bar, 1.0)
-            connection_callback = DelayedProgressCallback(connection_progress_window.update_progress_bar, 1.0)
+            def update_progress(current: int, total: int) -> None:
+                update_flight_controller_restart_progress(progress_window, current, total)
 
-            self.model.update_frame_type_by_key(
-                selected_key,
-                reset_callback,
-                connection_callback,
-                extra_sleep_time=2,
+            self._run_restart_task(
+                progress_window,
+                lambda report: self.model.update_frame_type_by_key(
+                    selected_key, DelayedProgressCallback(report, 1.0), extra_sleep_time=2
+                ),
+                update_progress,
             )
-            reset_progress_window.destroy()  # for the case that we are doing a test and there is no real FC connected
-            connection_progress_window.destroy()  # for the case that we are doing a test and there is no real FC connected
 
             # Invalidate diagram cache since frame type changed
             self._diagrams_path = ""
@@ -527,6 +546,12 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
 
         except (ValidationError, ParameterError, FrameConfigurationError) as e:
             showerror(_("Parameter Update Error"), str(e))
+        finally:
+            try:
+                if progress_window is not None:
+                    progress_window.destroy()  # also needed when no real FC is connected
+            finally:
+                self.base_window.navigation_lock.release(owner)
 
     def _on_throttle_change(self) -> None:
         """Handle throttle spinbox change."""
@@ -578,6 +603,8 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
 
     def _set_motor_spin_arm(self) -> None:
         """Open a dialog to set MOT_SPIN_ARM."""
+        if self._restart_active:
+            return
         # Simple dialog for now, should be a custom Toplevel
         current_val = self.model.get_parameter("MOT_SPIN_ARM")
         new_val = askfloat(
@@ -586,14 +613,55 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
             initialvalue=current_val,
         )
         if new_val is not None:
+            progress_window: ProgressWindow | None = None
+            owner = object()
+            self.base_window.navigation_lock.acquire(owner)
             try:
-                reset_progress_window = ProgressWindow(
-                    self.root_window, _("Resetting Flight Controller"), _("Waiting for {} of {} seconds")
+                progress_window = ProgressWindow(
+                    self.root_window,
+                    _("Restarting Flight Controller"),
+                    _("Reset command sent"),
+                    auto_close_on_complete=False,
                 )
-                self.model.set_motor_spin_arm_value(new_val, reset_progress_window.update_progress_bar)
-                reset_progress_window.destroy()  # for the case that we are doing a test and there is no real FC connected
+
+                def update_progress(current: int, total: int) -> None:
+                    update_flight_controller_restart_progress(progress_window, current, total)
+
+                self._run_restart_task(
+                    progress_window, lambda report: self.model.set_motor_spin_arm_value(new_val, report), update_progress
+                )
             except (ParameterError, ValidationError) as e:
                 showerror(_("Error"), str(e))
+            finally:
+                try:
+                    if progress_window is not None:
+                        progress_window.destroy()  # for the case that we are doing a test and there is no real FC connected
+                finally:
+                    self.base_window.navigation_lock.release(owner)
+
+    def _run_restart_task(
+        self,
+        window: ProgressWindow,
+        task: Callable[[Callable[[int, int], None]], object],
+        on_progress: Callable[[int, int], None],
+    ) -> None:
+        """Yield to Tk without allowing telemetry or shortcuts to compete for the link."""
+        resume_updates = self._timer_id is not None
+        if self._timer_id is not None:
+            self.after_cancel(self._timer_id)
+            self._timer_id = None
+        self._restart_active = True
+        try:
+            recovery = getattr(self.base_window, "_connection_recovery", None)
+            with recovery.operation() if recovery is not None else nullcontext():
+                if is_macos_sequoia_or_older():
+                    window.run_task(task, on_progress=on_progress)
+                else:
+                    task(on_progress)
+        finally:
+            self._restart_active = False
+            if resume_updates and self.winfo_exists():
+                self._timer_id = self.after(1000, self._on_update_timer)
 
     def _set_motor_spin_min(self) -> None:
         """Open a dialog to set MOT_SPIN_MIN."""
@@ -626,7 +694,7 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
 
         except MotorTestSafetyError as e:
             # Check if it's a voltage issue and provide specific guidance
-            if self.model.is_battery_related_safety_issue(str(e)):
+            if self.model.is_battery_related_safety_issue(e):
                 showwarning(_("Battery Voltage Warning"), self.model.get_battery_safety_message(str(e)))
             else:
                 showwarning(_("Safety Check Failed"), str(e))
@@ -739,30 +807,60 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
 
     def _setup_keyboard_shortcuts(self) -> None:
         """Setup keyboard shortcuts for critical motor test functions."""
-        # Emergency stop (Escape key)
-        self.root_window.bind("<Escape>", lambda _: self._stop_all_motors())
-        self.root_window.bind("<Control-s>", lambda _: self._stop_all_motors())
-
-        # Test all motors (Ctrl+A)
-        self.root_window.bind("<Control-a>", lambda _: self._test_all_motors())
-
-        # Test in sequence (Ctrl+Q)
-        self.root_window.bind("<Control-q>", lambda _: self._test_motors_in_sequence())
+        shortcuts = {
+            "<Escape>": self._stop_all_motors,
+            "<Control-s>": self._stop_all_motors,
+        }
+        for sequence, action in shortcuts.items():
+            previous_binding = str(self.root_window.tk.call("bind", str(self.root_window), sequence))
+            callback = cast(
+                "Callable[[Event], str]",
+                lambda _event, shortcut=action: self._handle_keyboard_shortcut(shortcut),
+            )
+            binding_id = self.root_window.bind(
+                sequence,
+                callback,
+                add="+",
+            )
+            if isinstance(binding_id, str):
+                self._keyboard_bindings.append((sequence, binding_id, previous_binding))
 
         # Focus root window to ensure it can capture key events
         self.root_window.focus_set()
 
-    def on_activate(self) -> None:
-        """
-        Called when the plugin becomes active (visible).
+    def _handle_keyboard_shortcut(self, action: Callable[[], None]) -> str:
+        """Run a keyboard shortcut and stop Tk from processing the event further."""
+        if not self._suspended and not self._restart_active and not self.base_window.navigation_lock.locked:
+            action()
+        return "break"
 
-        Refreshes the frame configuration from the flight controller
-        to ensure the display is up-to-date.
-        """
-        # Refresh frame configuration when becoming active
+    def on_suspend(self, reason: PluginPauseReason = PluginPauseReason.EXCLUSIVE_OPERATION) -> None:
+        """Stop actuators for FC tools; yield silently for connection checks and recovery."""
+        if reason is PluginPauseReason.EXCLUSIVE_OPERATION:
+            self.on_deactivate()
+        self._suspended = True
+        if self._timer_id is not None:
+            self.after_cancel(self._timer_id)
+            self._timer_id = None
+
+    def on_resume(self) -> None:
+        """Refresh the frame from cached FC values and resume polling without motor commands."""
+        self._suspended = False
+        previous_frame = (self.model.frame_class, self.model.frame_type)
         if not self.model.refresh_from_flight_controller():
             logging_warning(_("Could not refresh frame configuration from flight controller"))
+        elif previous_frame != (self.model.frame_class, self.model.frame_type):
+            self.frame_type_combobox.set_entries_tuple(
+                self.model.get_frame_type_pairs(), self.model.get_current_frame_selection_key()
+            )
+            self._diagrams_path = ""
+            self._diagram_needs_update = True
+            self._update_motor_buttons_layout(force=True)
         self._update_view()
+
+    def on_activate(self) -> None:
+        """Refresh frame configuration and polling when the view becomes visible."""
+        self.on_resume()
 
     def on_deactivate(self) -> None:
         """
@@ -804,6 +902,18 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
         if self._timer_id:
             self.after_cancel(self._timer_id)
             self._timer_id = None
+        for sequence, binding_id, previous_binding in self._keyboard_bindings:
+            with suppress(tk.TclError):
+                if sys.version_info >= (3, 11):
+                    self.root_window.unbind(sequence, binding_id)
+                else:
+                    # Python 3.10's tkinter.unbind(sequence, funcid) clears the
+                    # complete binding script before deleting funcid. Restore
+                    # the script that was present before this view was bound.
+                    self.root_window.unbind(sequence, binding_id)
+                    if previous_binding:
+                        self.root_window.bind(sequence, previous_binding)
+        self._keyboard_bindings.clear()
         super().destroy()
 
 

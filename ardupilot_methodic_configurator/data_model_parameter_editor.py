@@ -15,6 +15,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 import contextlib
 import platform
 import subprocess
+import textwrap
 from collections.abc import Callable
 from copy import deepcopy
 from csv import writer as csv_writer
@@ -26,21 +27,32 @@ from logging import exception as logging_exception
 from logging import info as logging_info
 from logging import warning as logging_warning
 from pathlib import Path
-from time import time
+from time import perf_counter, time
 from typing import Any, Literal
 
-from ardupilot_methodic_configurator import _
+from ardupilot_methodic_configurator import _, data_model_parameter_export
 from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.backend_filesystem_configuration_steps import PhaseData
 from ardupilot_methodic_configurator.backend_flightcontroller import FlightController
+from ardupilot_methodic_configurator.backend_flightcontroller_files import FlightControllerLogFile, LastLogDownloadResult
 from ardupilot_methodic_configurator.backend_internet import download_file_from_url, webbrowser_open_url
 from ardupilot_methodic_configurator.data_model_ardupilot_parameter import (
     ArduPilotParameter,
+    ParameterForcedOrDerivedError,
     ParameterOutOfRangeError,
     ParameterUnchangedError,
 )
 from ardupilot_methodic_configurator.data_model_configuration_step import ConfigurationStepProcessor
+from ardupilot_methodic_configurator.data_model_file_upload import (
+    FileUploadDisposition,
+    FileUploadOutcome,
+    FileUploadWorkflow,
+    UploadExecutor,
+)
 from ardupilot_methodic_configurator.data_model_par_dict import Par, ParamFileError, ParDict, is_within_tolerance
+from ardupilot_methodic_configurator.data_model_parameter_conversion import (
+    parameters_as_par_dict as convert_parameters_to_par_dict,
+)
 from ardupilot_methodic_configurator.data_model_safe_evaluator import ConfigurationStepEvalError, safe_evaluate
 from ardupilot_methodic_configurator.log_analysis.utils import APMDoc
 from ardupilot_methodic_configurator.plugins.plugin_factory import PluginModelContext, plugin_factory
@@ -118,6 +130,15 @@ class ParameterValueUpdateResult:
     message: str | None = None
 
 
+@dataclass(frozen=True)
+class FcParameterCopyResult:
+    """Counts describing the outcome of copying flight-controller values."""
+
+    copied: int = 0
+    unchanged: int = 0
+    failed: int = 0
+
+
 # pylint: disable=too-many-lines
 
 
@@ -144,12 +165,21 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         flight_controller: FlightController,
         filesystem: LocalFilesystem,
         export_fc_params_missing_or_different: bool = False,
+        *,
+        parameter_download_dir: Path | None = None,
     ) -> None:
         self.current_file = current_file
         self._flight_controller = flight_controller
         self._local_filesystem = filesystem
+        self._parameter_download_dir = parameter_download_dir
         self._config_step_processor = ConfigurationStepProcessor(self._local_filesystem)
         self._should_export_fc_params_diff = export_fc_params_missing_or_different
+        self._file_upload_workflow = FileUploadWorkflow(
+            self._local_filesystem.vehicle_configuration_file_size,
+            lambda: self._flight_controller.master is not None,
+            self._flight_controller.check_file_upload,
+            self._flight_controller.upload_file_if_needed,
+        )
 
         # self.current_step_parameters is rebuilt on every repopulate(...) call and only contains the ArduPilotParameter
         # objects needed for the current table view.
@@ -169,7 +199,43 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
 
         self._last_time_asked_to_save: float = 0
 
+    @classmethod
+    def for_connected_flight_controller(
+        cls,
+        flight_controller: FlightController,
+        vehicle_dir: str,
+        vehicle_type_override: str = "",
+        *,
+        parameter_download_dir: Path | None = None,
+    ) -> "ParameterEditor":
+        """Create a standalone parameter model with FC values and matching pdef metadata."""
+        vehicle_path = Path(vehicle_dir)
+        download_path = parameter_download_dir or vehicle_path
+        fc_parameters, default_parameters = flight_controller.download_params(
+            parameter_values_filename=download_path / "complete.param",
+            parameter_defaults_filename=download_path / "00_default.param",
+        )
+        if not fc_parameters:
+            msg = _("Could not download parameters from the flight controller.")
+            raise ValueError(msg)
+
+        vehicle_info = flight_controller.info
+        vehicle_type = vehicle_type_override or vehicle_info.vehicle_type or ""
+        firmware_version = vehicle_info.flight_sw_version or ""
+        filesystem = LocalFilesystem.for_external_parameter_file(
+            vehicle_dir,
+            vehicle_type,
+            firmware_version,
+            default_parameters,
+        )
+        return cls("", flight_controller, filesystem, parameter_download_dir=download_path)
+
     # frontend_tkinter_parameter_editor.py API start
+    @property
+    def flight_controller(self) -> FlightController:
+        """Shared connection facade for embedded flight-controller sub-applications."""
+        return self._flight_controller
+
     @property
     def connected_vehicle_type(self) -> str:
         return (
@@ -182,9 +248,23 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
     def is_fc_connected(self) -> bool:
         return self._flight_controller.master is not None and bool(self._flight_controller.fc_parameters)
 
+    @property
+    def is_fc_link_connected(self) -> bool:
+        """Whether a controller transport exists, independently of parameter download."""
+        return self._flight_controller.master is not None
+
     def get_fc_banner_text(self) -> list[str]:
         """Return the latest flight-controller banner text."""
         return self._flight_controller.banner_text_buffer
+
+    def get_fc_status_text(self) -> list[str]:
+        """Return newest-first flight-controller STATUSTEXT lines with local arrival times."""
+        return self._flight_controller.status_text_display_buffer
+
+    def poll_fc_status_text(self) -> list[str]:
+        """Refresh diagnostics while the modal diagnostics view owns the connection."""
+        self._flight_controller.poll_status_text()
+        return self._flight_controller.status_text_display_buffer
 
     @property
     def fc_parameters(self) -> dict[str, float]:
@@ -307,7 +387,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             return True, relevant_fc_params, auto_changed_by
         return False, None, auto_changed_by
 
-    def _update_parameters_from_fc_values(self, relevant_fc_params: dict[str, float]) -> bool:
+    def _update_parameters_from_fc_values(self, relevant_fc_params: dict[str, float]) -> FcParameterCopyResult:
         """
         Update in-memory parameter values from flight controller values.
 
@@ -324,7 +404,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             relevant_fc_params: Dictionary of parameter names and FC values to copy.
 
         Returns:
-            bool: True if at least one parameter was successfully updated in memory.
+            FcParameterCopyResult: Counts of copied, unchanged, and failed parameter values.
 
         Note:
             This method bypasses range checking since values came from the FC and were
@@ -333,24 +413,69 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
 
         """
         params_copied = 0
+        params_unchanged = 0
+        params_failed = 0
         for param_name, value in relevant_fc_params.items():
             param = self.current_step_parameters.get(param_name)
             if param is None:
                 logging_error(_("Parameter %s not in current step parameters"), param_name)
+                params_failed += 1
                 continue
             try:
                 param.set_new_value(str(value), ignore_out_of_range=True)
                 params_copied += 1
             except ParameterUnchangedError:
-                continue  # Expected, not an error
+                params_unchanged += 1
             except ParameterOutOfRangeError:
                 # Log warning but accept FC value anyway since it came from FC
-                logging_warning(_("Parameter %s value %s is out of range but accepted from FC"), param_name, value)
+                logging_warning(
+                    _("Parameter {parameter} value {value} is out of range but accepted from FC").format(
+                        parameter=param_name, value=value
+                    )
+                )
                 params_copied += 1
+            except ParameterForcedOrDerivedError as exc:
+                logging_warning(
+                    _("Parameter {parameter} could not be updated because it is forced or derived: {error}").format(
+                        parameter=param_name, error=exc
+                    )
+                )
+                params_failed += 1
             except (ValueError, TypeError):
-                logging_exception(_("Failed to update in-memory value for %s after FC copy"), param_name)
+                logging_exception(
+                    _("Failed to update in-memory value for {parameter} after FC copy").format(parameter=param_name)
+                )
+                params_failed += 1
+        return FcParameterCopyResult(params_copied, params_unchanged, params_failed)
+
+    def update_parameters_from_fc_values(self, relevant_fc_params: dict[str, float] | None = None) -> FcParameterCopyResult:
+        """
+        Copy flight-controller values into the active step's new values.
+
+        If no parameter subset is provided, all current-step parameters available from the
+        flight controller are copied. A subset can be provided by workflows that already
+        filtered the parameters, such as external-tool readback.
+        """
+        if relevant_fc_params is None:
+            relevant_fc_params = {
+                param_name: self.fc_parameters[param_name]
+                for param_name in self.current_step_parameters
+                if param_name in self.fc_parameters
+            }
+        return self._update_parameters_from_fc_values(relevant_fc_params)
+
+    def find_other_steps_with_stale_calibration_values(self, fc_values: dict[str, float]) -> list[str]:
+        """List other project steps whose saved values differ from calibrated FC values; never change them."""
+        stale_files: list[str] = []
+        for filename, parameters in self._local_filesystem.file_parameters.items():
+            if filename == self.current_file:
                 continue
-        return bool(params_copied)
+            if any(
+                name in parameters and not is_within_tolerance(parameters[name].value, value)
+                for name, value in fc_values.items()
+            ):
+                stale_files.append(filename)
+        return stale_files
 
     def handle_copy_fc_values_workflow(
         self,
@@ -385,11 +510,21 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             user_choice = ask_user_choice(_("Update file with values from FC?"), msg, [_("Close"), _("Yes"), _("No")])
 
             if user_choice is True:  # Yes option
-                params_copied = self._update_parameters_from_fc_values(relevant_fc_params)
-                if params_copied:
+                copy_result = self.update_parameters_from_fc_values(relevant_fc_params)
+                if copy_result.copied:
                     show_info(
                         _("Parameters copied"),
                         _("FC values have been copied to {selected_file}").format(selected_file=selected_file),
+                    )
+                elif copy_result.unchanged and not copy_result.failed:
+                    show_info(
+                        _("Parameters already up to date"),
+                        _("FC values already match {selected_file}.").format(selected_file=selected_file),
+                    )
+                else:
+                    show_info(
+                        _("No parameters copied"),
+                        _("No FC values could be copied to {selected_file}.").format(selected_file=selected_file),
                     )
             return user_choice
         return False
@@ -491,7 +626,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
 
         return False
 
-    def handle_param_file_change_workflow(  # pylint: disable=too-many-arguments, too-many-positional-arguments, too-many-locals # noqa: PLR0913, PLR0917
+    def handle_param_file_change_workflow(  # pylint: disable=too-many-arguments, too-many-positional-arguments, too-many-locals # noqa: PLR0913, PLR0917, RUF100
         self,
         selected_file: str,
         forced: bool,
@@ -563,18 +698,19 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             return self.current_file, False
 
         # Handle file download from URL
-        if self._should_download_file_from_url_workflow(self.current_file, ask_confirmation, show_error):
-            # Handle file upload to FC
-            handle_upload_file(self.current_file)
+        self._download_files_for_step(self.current_file, ask_confirmation, show_error)
+        # Uploads validate each local file independently; incomplete downloads
+        # must not prevent already available files from being uploaded.
+        handle_upload_file(self.current_file)
 
         return self.current_file, True
 
-    def _should_download_file_from_url_workflow(
+    def _download_files_for_step(
         self,
         selected_file: str,
         ask_confirmation: AskConfirmationCallback,
         show_error: ShowErrorCallback,
-    ) -> bool:
+    ) -> None:
         """
         Handle file download workflow with injected GUI callbacks.
 
@@ -586,37 +722,34 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             ask_confirmation: Callback to ask user if they want to download the file.
             show_error: Callback to show error messages to the user.
 
-        Returns:
-            bool: True if download was successful or not needed, False if download failed.
-
         """
-        url, local_filename = self._local_filesystem.get_download_url_and_local_filename(selected_file)
-        if not url or not local_filename:
-            return True  # No download required
+        for url, local_filename in self._local_filesystem.get_download_files(selected_file):
+            if self._local_filesystem.vehicle_configuration_file_exists(local_filename):
+                continue  # Already present in the vehicle directory
 
-        if self._local_filesystem.vehicle_configuration_file_exists(local_filename):
-            return True  # File already exists in the vehicle directory, no need to download it
+            msg = _("Should the {local_filename} file be downloaded from the URL\n{url}?")
+            if not ask_confirmation(_("Download file from URL"), msg.format(local_filename=local_filename, url=url)):
+                logging_info(_("Download declined for %s"), local_filename)
+                continue
 
-        # Ask user for confirmation
-        msg = _("Should the {local_filename} file be downloaded from the URL\n{url}?")
-        if not ask_confirmation(_("Download file from URL"), msg.format(local_filename=local_filename, url=url)):
-            return False  # User declined download
+            try:
+                downloaded = download_file_from_url(url, local_filename)
+            except OSError as error:
+                logging_warning("Could not download %s to %s: %s", url, local_filename, error)
+                downloaded = False
+            if not downloaded:
+                error_msg = _("Failed to download {local_filename} from {url}, please download it manually")
+                show_error(_("Download failed"), error_msg.format(local_filename=local_filename, url=url))
 
-        # Attempt download
-        if not download_file_from_url(url, local_filename):
-            error_msg = _("Failed to download {local_filename} from {url}, please download it manually")
-            show_error(_("Download failed"), error_msg.format(local_filename=local_filename, url=url))
-            return False
-
-        return True
-
-    def should_upload_file_to_fc_workflow(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def should_upload_file_to_fc_workflow(  # pylint: disable=too-many-arguments
         self,
         selected_file: str,
         ask_confirmation: Callable[[str, str], bool],
         show_error: Callable[[str, str], None],
         show_warning: Callable[[str, str], None],
         get_progress_callback: Callable[[], Callable | None],
+        *,
+        run_upload: UploadExecutor | None = None,
     ) -> bool:
         """
         Handle file upload workflow with injected GUI callbacks.
@@ -631,41 +764,71 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             show_warning: Callback to show warning messages to the user.
             get_progress_callback: Factory callback that creates and returns a progress callback
                                    only when actually needed (after all checks pass).
+            run_upload: Optional execution boundary for running transport work away from the UI thread.
 
         Returns:
             bool: True if upload was successful or not needed, False if upload failed.
 
         """
-        local_filename, remote_filename = self._local_filesystem.get_upload_local_and_remote_filenames(selected_file)
-        if not local_filename or not remote_filename:
+        files = self._local_filesystem.get_upload_files(selected_file)
+        if not files:
             return True  # No upload required
 
-        if not self._local_filesystem.vehicle_configuration_file_exists(local_filename):
-            error_msg = _("Local file {local_filename} does not exist")
-            show_error(_("Will not upload any file"), error_msg.format(local_filename=local_filename))
-            return False
+        download_filenames = {
+            download[1]
+            for download in self._local_filesystem.get_download_files(selected_file)
+            if isinstance(download, (tuple, list)) and len(download) == 2
+        }
 
-        if self._flight_controller.master is None:
-            show_warning(_("Will not upload any file"), _("No flight controller connection"))
-            return False
+        def confirm_upload(local_filename: str, remote_filename: str) -> bool:
+            message = _("Should the {local_filename} file be uploaded to the flight controller as {remote_filename}?")
+            return ask_confirmation(
+                _("Upload file to FC"),
+                message.format(local_filename=local_filename, remote_filename=remote_filename),
+            )
 
-        # Ask user for confirmation
-        msg = _("Should the {local_filename} file be uploaded to the flight controller as {remote_filename}?")
-        if not ask_confirmation(
-            _("Upload file to FC"), msg.format(local_filename=local_filename, remote_filename=remote_filename)
-        ):
-            return True  # User declined upload
+        outcomes = self._file_upload_workflow.upload_files(
+            files, download_filenames, confirm_upload, get_progress_callback, run_upload=run_upload
+        )
+        return self._report_file_upload_outcomes(outcomes, show_error, show_warning)
 
-        # Get progress callback only after all checks passed
-        progress_callback = get_progress_callback()
-
-        # Attempt upload
-        if not self._flight_controller.upload_file(local_filename, remote_filename, progress_callback):
-            error_msg = _("Failed to upload {local_filename} to {remote_filename}, please upload it manually")
-            show_error(_("Upload failed"), error_msg.format(local_filename=local_filename, remote_filename=remote_filename))
-            return False
-
-        return True
+    @staticmethod
+    def _report_file_upload_outcomes(
+        outcomes: list[FileUploadOutcome],
+        show_error: ShowErrorCallback,
+        show_warning: ShowWarningCallback,
+    ) -> bool:
+        """Present workflow outcomes and report whether all attempted uploads succeeded."""
+        all_succeeded = True
+        for outcome in outcomes:
+            if outcome.disposition in (
+                FileUploadDisposition.AWAITING_DOWNLOAD,
+                FileUploadDisposition.ALREADY_CURRENT,
+                FileUploadDisposition.USER_DECLINED,
+                FileUploadDisposition.UPLOADED,
+            ):
+                continue
+            if outcome.disposition is FileUploadDisposition.NO_CONNECTION:
+                show_warning(_("Will not upload any file"), _("No flight controller connection"))
+                return False
+            if outcome.disposition is FileUploadDisposition.VERIFICATION_FAILED:
+                show_warning(_("Upload failed"), _("Could not verify remote file %s") % outcome.remote_filename)
+            elif outcome.disposition is FileUploadDisposition.LOCAL_FILE_MISSING:
+                message = _("Local file {local_filename} does not exist").format(local_filename=outcome.local_filename)
+                show_error(_("Upload failed"), message)
+            elif outcome.disposition is FileUploadDisposition.EMPTY_LOCAL_FILE:
+                message = _("Local file {local_filename} is empty; it cannot be uploaded").format(
+                    local_filename=outcome.local_filename
+                )
+                show_error(_("Upload failed"), message)
+            elif outcome.disposition is FileUploadDisposition.UPLOAD_FAILED:
+                message = _("Failed to upload {local_filename} to {remote_filename}, please upload it manually").format(
+                    local_filename=outcome.local_filename,
+                    remote_filename=outcome.remote_filename,
+                )
+                show_error(_("Upload failed"), message)
+            all_succeeded = False
+        return all_succeeded
 
     def ensure_upload_preconditions(
         self,
@@ -689,6 +852,8 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         self,
         get_progress_callback: Callable[[], Callable | None] | None = None,
         persist_project_state: bool = True,
+        *,
+        response_timeout: float | None = None,
     ) -> tuple[dict, dict]:
         """
         Download parameters from the flight controller.
@@ -696,6 +861,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         Args:
             get_progress_callback: Optional factory function that creates and returns a progress callback.
             persist_project_state: Whether to update AMC-managed default-value data after the download.
+            response_timeout: Optional maximum response wait in seconds for either download protocol.
 
         Returns:
             tuple: (fc_parameters, param_default_values) downloaded from the flight controller.
@@ -705,10 +871,12 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         progress_callback = get_progress_callback() if get_progress_callback else None
 
         # Download all parameters from the flight controller
+        download_dir = self._parameter_download_dir or Path(self._local_filesystem.vehicle_dir)
         fc_parameters, param_default_values = self._flight_controller.download_params(
             progress_callback,
-            Path(self._local_filesystem.vehicle_dir) / "complete.param",
-            Path(self._local_filesystem.vehicle_dir) / "00_default.param",
+            download_dir / "complete.param",
+            download_dir / "00_default.param",
+            response_timeout=response_timeout,
         )
 
         # Note: fc_parameters are already updated internally in the flight controller
@@ -731,13 +899,12 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
 
         return fc_parameters, param_default_values
 
-    def upload_parameters_that_require_reset_workflow(  # pylint: disable=too-many-locals, too-many-arguments, too-many-positional-arguments
+    def upload_parameters_that_require_reset_workflow(  # pylint: disable=too-many-locals
         self,
         selected_params: dict,
         ask_confirmation: AskConfirmationCallback,
         show_error: ShowErrorCallback,
-        reset_progress_callback: Callable | None = None,
-        connection_progress_callback: Callable | None = None,
+        progress_callback: Callable | None = None,
     ) -> tuple[bool, set[str], bool]:
         """
         Upload parameters that require reset to the flight controller.
@@ -746,8 +913,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             selected_params: Dictionary of parameters to upload.
             ask_confirmation: Callback to ask user for confirmation.
             show_error: Callback to show error messages.
-            reset_progress_callback: Optional callback for reset progress updates.
-            connection_progress_callback: Optional callback for connection progress updates.
+            progress_callback: Optional callback for reset and reconnect progress updates.
             selected_params: Upload payload used to calculate an external BRD_BOOT_DELAY.
 
         Returns:
@@ -817,8 +983,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             reset_unsure_params,
             ask_confirmation,
             show_error,
-            reset_progress_callback,
-            connection_progress_callback,
+            progress_callback,
             selected_params,
         )
 
@@ -846,8 +1011,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
 
     def _reset_and_reconnect_flight_controller(
         self,
-        reset_progress_callback: Callable | None = None,
-        connection_progress_callback: Callable | None = None,
+        progress_callback: Callable | None = None,
         sleep_time: int | None = None,
         selected_params: dict | None = None,
     ) -> str | None:
@@ -855,8 +1019,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         Reset and reconnect to the flight controller.
 
         Args:
-            reset_progress_callback: Optional callback function for progress updates.
-            connection_progress_callback: Optional callback function for connection progress updates.
+            progress_callback: Optional callback function for reset and reconnect progress updates.
             sleep_time: Optional sleep time override. If None, calculates based on boot delay parameters.
             selected_params: Upload payload used to calculate an external BRD_BOOT_DELAY.
 
@@ -867,27 +1030,26 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         if sleep_time is None:
             sleep_time = self._calculate_reset_time(selected_params)
 
-        # Call reset_and_reconnect with a callback to update the reset progress bar and the progress message
-        return self._flight_controller.reset_and_reconnect(
-            reset_progress_callback, connection_progress_callback, int(sleep_time)
-        )
+        return self._flight_controller.reset_and_reconnect(progress_callback, int(sleep_time))
 
     def reset_all_parameters_to_default(
         self,
         show_error: ShowErrorCallback,
-        reset_progress_callback: Callable | None = None,
-        connection_progress_callback: Callable | None = None,
+        progress_callback: Callable | None = None,
         get_download_progress_callback: Callable[[], Callable | None] | None = None,
+        *,
+        persist_project_state: bool = True,
     ) -> bool:
-        """Reset all flight-controller parameters, then reboot and reconnect."""
+        """Reset and reconnect the FC, optionally persisting downloaded project defaults."""
         success, error_message = self._flight_controller.reset_all_parameters_to_default_and_reconnect(
-            reset_progress_callback,
-            connection_progress_callback,
+            progress_callback,
         )
         if not success:
             show_error(_("ArduPilot methodic configurator"), error_message)
             return False
-        fc_parameters, _param_default_values = self.download_flight_controller_parameters(get_download_progress_callback)
+        fc_parameters, _param_default_values = self.download_flight_controller_parameters(
+            get_download_progress_callback, persist_project_state=persist_project_state
+        )
         if not fc_parameters:
             show_error(
                 _("ArduPilot methodic configurator"),
@@ -902,8 +1064,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         fc_reset_unsure: list[str],
         ask_confirmation: AskConfirmationCallback,
         show_error: ShowErrorCallback,
-        reset_progress_callback: Callable | None = None,
-        connection_progress_callback: Callable | None = None,
+        progress_callback: Callable | None = None,
         selected_params: dict | None = None,
     ) -> bool:
         """
@@ -919,8 +1080,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             fc_reset_unsure: List of parameters that potentially require reset
             ask_confirmation: Callback to ask user for confirmation
             show_error: Callback to show error messages
-            reset_progress_callback: Optional callback for reset progress updates
-            connection_progress_callback: Optional callback for connection progress updates
+            progress_callback: Optional callback for reset and reconnect progress updates
             selected_params: Upload payload used to calculate an external BRD_BOOT_DELAY.
 
         Returns:
@@ -937,8 +1097,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
 
         if should_reset:
             error_message = self._reset_and_reconnect_flight_controller(
-                reset_progress_callback,
-                connection_progress_callback,
+                progress_callback,
                 selected_params=selected_params,
             )
             if error_message:
@@ -1095,7 +1254,6 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         ask_retry_cancel: AskRetryCancelCallback,
         show_error: ShowErrorCallback,
         get_upload_progress_callback: Callable[[], Callable | None] | None = None,
-        get_reset_progress_callback: Callable[[], Callable | None] | None = None,
         get_connection_progress_callback: Callable[[], Callable | None] | None = None,
         get_download_progress_callback: Callable[[], Callable | None] | None = None,
         *,
@@ -1110,8 +1268,8 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             ask_retry_cancel: Callback to ask user to retry or cancel on upload error.
             show_error: Callback to show error messages.
             get_upload_progress_callback: Optional factory function that creates and returns an upload progress callback.
-            get_reset_progress_callback: Optional factory function that creates and returns a reset progress callback.
-            get_connection_progress_callback: Optional factory function that creates and returns a connection prog. callback.
+            get_connection_progress_callback: Optional factory function that creates and returns a reset/reconnect progress
+                                              callback.
             get_download_progress_callback: Optional factory function that creates and returns a download progress callback.
             persist_project_state: Whether to write AMC step state, tuning reports, and FC-difference exports.
 
@@ -1128,15 +1286,17 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
                 len(selected_params),
                 self.current_file,
             )
+            # Include the complete upload/reset/verification workflow, while
+            # using a monotonic high-resolution clock for elapsed time.
+            upload_start_time = perf_counter()
 
             # Get progress callbacks from factories if provided
             progress_callback_for_upload = get_upload_progress_callback() if get_upload_progress_callback else None
-            progress_callback_for_reset = get_reset_progress_callback() if get_reset_progress_callback else None
             progress_callback_for_connection = get_connection_progress_callback() if get_connection_progress_callback else None
             progress_callback_for_download = get_download_progress_callback() if get_download_progress_callback else None
             # Upload parameters that require reset
             reset_happened, already_uploaded_params, reset_succeeded = self.upload_parameters_that_require_reset_workflow(
-                selected_params, ask_confirmation, show_error, progress_callback_for_reset, progress_callback_for_connection
+                selected_params, ask_confirmation, show_error, progress_callback_for_connection
             )
             if not reset_succeeded:
                 self._at_least_one_changed = False
@@ -1191,6 +1351,13 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
                         continue
                     self._at_least_one_changed = False
                     return False
+                logging_info(
+                    _("Uploaded and verified %(parameter_count)d parameters in %(duration_ms)d ms"),
+                    {
+                        "parameter_count": len(selected_params),
+                        "duration_ms": int((perf_counter() - upload_start_time) * 1000),
+                    },
+                )
                 logging_info(_("All parameters uploaded to the flight controller successfully"))
 
                 if persist_project_state and self._should_export_fc_params_diff:
@@ -1208,7 +1375,6 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         ask_retry_cancel: AskRetryCancelCallback,
         show_error: ShowErrorCallback,
         get_upload_progress_callback: Callable[[], Callable | None] | None = None,
-        get_reset_progress_callback: Callable[[], Callable | None] | None = None,
         get_connection_progress_callback: Callable[[], Callable | None] | None = None,
         get_download_progress_callback: Callable[[], Callable | None] | None = None,
     ) -> bool:
@@ -1219,7 +1385,6 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             ask_retry_cancel,
             show_error,
             get_upload_progress_callback,
-            get_reset_progress_callback,
             get_connection_progress_callback,
             get_download_progress_callback,
             persist_project_state=False,
@@ -1358,41 +1523,54 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             non_default_non_read_only_fc_params, last_config_step_filename
         )
 
-    def download_last_flight_log_workflow(
+    def get_remote_files(
         self,
-        ask_saveas_filename: Callable[[], str],
-        show_error: Callable[[str, str], None],
-        show_info: Callable[[str, str], None],
+        remote_directory: str = "/APM/LOGS/",
+    ) -> list[FlightControllerLogFile] | None:
+        """Return files and directories in the selected remote directory."""
+        return self._flight_controller.list_remote_files(remote_directory)
+
+    def download_last_flight_log(
+        self,
+        local_filename: str,
         progress_callback: Callable[[int, int], None] | None = None,
-    ) -> None:
-        """
-        Download the last flight log from the flight controller, using GUI callbacks for interaction.
+    ) -> LastLogDownloadResult:
+        """Download the last log while preserving its specific outcome."""
+        return self._flight_controller.download_last_flight_log(local_filename, progress_callback)
 
-        Args:
-            ask_saveas_filename: Callback to show file dialog and get filename.
-            show_error: Callback to show error messages.
-            show_info: Callback to show info messages.
-            progress_callback: Progress bar update callback.
-            run_in_thread: Callback to run the download in a thread (optional).
+    def upload_file_to_fc(
+        self,
+        local_filename: str,
+        remote_filename: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """Upload one local file to the flight controller."""
+        return self._flight_controller.upload_file(local_filename, remote_filename, progress_callback)
 
-        """
-        if self._flight_controller.master is None:
-            show_error(_("Error"), _("No flight controller connected"))
-            return
+    def download_remote_file(
+        self,
+        remote_path: str,
+        local_filename: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """Download one explicitly selected remote file."""
+        return self._flight_controller.download_remote_file(remote_path, local_filename, progress_callback)
 
-        if not self.is_mavftp_supported:
-            show_error(_("Error"), _("MAVFTP is not supported by the flight controller"))
-            return
+    def verify_remote_file(self, remote_path: str, local_filename: str) -> bool | None:
+        """Compare a transferred local file with the remote file CRC."""
+        return self._flight_controller.verify_remote_file(remote_path, local_filename)
 
-        filename = ask_saveas_filename()
-        if not filename:
-            return
+    def make_remote_directory(self, remote_directory: str) -> bool:
+        """Create one remote directory."""
+        return self._flight_controller.make_remote_directory(remote_directory)
 
-        success = self._flight_controller.download_last_flight_log(filename, progress_callback)
-        if success:
-            show_info(_("Success"), _("Flight log downloaded successfully to:\n%s") % filename)
-        else:
-            show_error(_("Error"), _("Failed to download flight log. Check the console for details."))
+    def delete_remote_path(self, remote_path: str, is_directory: bool = False) -> bool:
+        """Delete one remote file or directory."""
+        return self._flight_controller.delete_remote_path(remote_path, is_directory)
+
+    def rename_remote_path(self, remote_path: str, new_remote_path: str) -> bool:
+        """Rename one remote file or directory."""
+        return self._flight_controller.rename_remote_path(remote_path, new_remote_path)
 
     def is_configuration_step_optional(self, file_name: str | None = None, threshold_pct: int = 20) -> bool:
         """
@@ -1489,16 +1667,16 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
 
         # Categorize parameters using filesystem logic
         categorized = self._local_filesystem.categorize_parameters(annotated_fc_parameters)
-        if not categorized or len(categorized) != 4:
-            # Return empty dict if categorization fails or returns empty tuple
+        try:
+            (
+                non_default__read_only_params,
+                non_default__writable_calibrations,
+                non_default__ids,
+                non_default__writable_non_calibrations_non_ids,
+            ) = categorized
+        except (TypeError, ValueError):
+            # Keep summary generation resilient if categorization returns an invalid result at runtime.
             return {}
-
-        (
-            non_default__read_only_params,
-            non_default__writable_calibrations,
-            non_default__ids,
-            non_default__writable_non_calibrations_non_ids,
-        ) = categorized
 
         return {
             "complete": annotated_fc_parameters,
@@ -1865,6 +2043,17 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
 
     # frontend_tkinter_parameter_editor_table.py API start
 
+    def _filter_derived_parameters_for_manual_overrides(self, derived_params: ParDict) -> ParDict:
+        """Exclude derived updates for parameters whose persisted value is manually overridden."""
+        return ParDict(
+            {
+                param_name: derived_par
+                for param_name, derived_par in derived_params.items()
+                if param_name not in self.current_step_parameters
+                or not self.current_step_parameters[param_name].is_manual_override
+            }
+        )
+
     def _repopulate_configuration_step_parameters(  # pylint: disable=too-many-locals, too-many-branches
         self,
     ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -1881,9 +2070,17 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         self._connection_renames.clear()
 
         # Process configuration step and get operations to apply
-        self.current_step_parameters, ui_errors, ui_infos, duplicates_to_remove, renames_to_apply, derived_params = (
-            self._config_step_processor.process_configuration_step(self.current_file, self.fc_parameters)
-        )
+        (
+            self.current_step_parameters,
+            ui_errors,
+            ui_infos,
+            duplicates_to_remove,
+            renames_to_apply,
+            derived_params,
+            autoimported_parameters,
+        ) = self._config_step_processor.process_configuration_step(self.current_file, self.fc_parameters)
+        self._added_parameters.update(autoimported_parameters)
+        derived_params = self._filter_derived_parameters_for_manual_overrides(derived_params)
 
         # Apply derived parameters to domain model using specialized setters
         for param_name, derived_par in derived_params.items():
@@ -2045,12 +2242,42 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             for param_name, par in file_parameters.items()
         }
 
+    def get_fc_parameters_for_export(self) -> dict[str, ArduPilotParameter]:
+        """Create independent parameter objects for the current FC values."""
+        return data_model_parameter_export.create_fc_parameter_snapshot(self._config_step_processor, self.fc_parameters)
+
+    @staticmethod
+    def filter_parameters_for_export(
+        parameters: dict[str, ArduPilotParameter], filters: data_model_parameter_export.ParameterExportFilters
+    ) -> dict[str, ArduPilotParameter]:
+        """Return parameters matching every selected export filter row."""
+        return data_model_parameter_export.filter_parameters_for_export(parameters, filters)
+
+    def export_parameters(
+        self,
+        parameters: dict[str, ArduPilotParameter],
+        filename: str,
+        annotate_doc: bool,
+    ) -> None:
+        """Export selected FC parameters without changing AMC project state."""
+        data_model_parameter_export.export_parameters(
+            parameters,
+            filename,
+            data_model_parameter_export.ParameterExportContext(
+                annotate_doc=annotate_doc,
+                doc_dict=self._local_filesystem.doc_dict,
+                param_default_dict=self._local_filesystem.param_default_dict,
+                vehicle_name=(
+                    self._local_filesystem.get_vehicle_directory_name() if self._local_filesystem.vehicle_dir else ""
+                ),
+                flight_controller_info=self._flight_controller.info,
+            ),
+        )
+
     @staticmethod
     def parameters_as_par_dict(parameters: dict[str, ArduPilotParameter]) -> ParDict:
         """Convert parameter objects to the values expected by the FC upload workflow."""
-        return ParDict(
-            {name: Par(parameter.get_new_value(), parameter.change_reason_for_file) for name, parameter in parameters.items()}
-        )
+        return convert_parameters_to_par_dict(parameters)
 
     def get_different_parameters(self) -> dict[str, ArduPilotParameter]:
         """
@@ -2341,6 +2568,11 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
     def parameter_documentation_available(self) -> bool:
         return bool(self._local_filesystem.doc_dict)
 
+    def get_parameter_choices(self, parameter_name: str) -> dict[str, str]:
+        """Return loaded enum choices without exposing filesystem internals."""
+        metadata = self._local_filesystem.doc_dict.get(parameter_name, {})
+        return dict(metadata.get("values", {}))
+
     def configuration_phases(self) -> dict[str, PhaseData]:
         return self._local_filesystem.configuration_phases
 
@@ -2385,12 +2617,14 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
     def get_why_why_now_tooltip(self) -> str:
         why_tooltip_text = self._local_filesystem.get_seq_tooltip_text(self.current_file, "why")
         why_now_tooltip_text = self._local_filesystem.get_seq_tooltip_text(self.current_file, "why_now")
-        tooltip_text = ""
+        tooltip_lines: list[str] = []
         if why_tooltip_text:
-            tooltip_text += _("Why: ") + _(why_tooltip_text) + "\n"
+            label = _("Why: ")
+            tooltip_lines.append(textwrap.fill(label + _(why_tooltip_text), width=80, subsequent_indent=" " * len(label)))
         if why_now_tooltip_text:
-            tooltip_text += _("Why now: ") + _(why_now_tooltip_text)
-        return tooltip_text
+            label = _("Why now: ")
+            tooltip_lines.append(textwrap.fill(label + _(why_now_tooltip_text), width=80, subsequent_indent=" " * len(label)))
+        return "\n".join(tooltip_lines)
 
     def get_documentation_frame_title(self) -> str:
         if self.current_file:
@@ -2701,7 +2935,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             plugin_name: The name of the plugin to create a data model for
 
         Returns:
-            The data model instance, or None if the flight controller is disconnected.
+            The data model instance, or None if this plugin requires an FC connection that is unavailable.
 
         Raises:
             ValueError when plugin name is unknown/unsupported
@@ -2711,7 +2945,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
             raise ValueError(
                 _("data_model_parameter_editor: Unsupported plugin name: {plugin_name}").format(plugin_name=plugin_name)
             )
-        if not self.is_fc_connected:
+        if plugin_factory.requires_flight_controller(plugin_name) and not self.is_fc_connected:
             return None
         model = plugin_factory.create_model(
             plugin_name,

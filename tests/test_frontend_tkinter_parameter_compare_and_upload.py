@@ -12,12 +12,24 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 # pylint: disable=protected-access
 
+from argparse import Namespace
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import pytest
+
+from ardupilot_methodic_configurator import frontend_tkinter_parameter_compare_and_upload as compare_module
+from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.data_model_ardupilot_parameter import ArduPilotParameter
 from ardupilot_methodic_configurator.data_model_par_dict import Par, ParDict
-from ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload import ParameterFileUploadWindow
-from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
+from ardupilot_methodic_configurator.data_model_parameter_editor import ParameterEditor
+from ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload import (
+    ParameterFileUploadWindow,
+    StandaloneUploadHost,
+)
+from ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload import main as standalone_main
+from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorUiServices, ParameterEditorWindow
 from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor_table import (
     ParameterEditorTable,
     ParameterTableOptions,
@@ -248,6 +260,7 @@ def test_external_upload_defaults_select_only_parameters_changed_from_fc() -> No
     table._upload_selection_defaults = {}
     table.upload_checkbutton_var = {}
     changed_variable = MagicMock()
+    table._bulk_upload_selected = None
     unchanged_variable = MagicMock()
     missing_variable = MagicMock()
 
@@ -286,6 +299,7 @@ def test_external_readonly_parameter_cannot_be_selected_for_upload() -> None:
     table.upload_checkbutton_var = {}
     variable = MagicMock()
     checkbox = MagicMock()
+    table._bulk_upload_selected = None
 
     with (
         patch(
@@ -404,6 +418,60 @@ def test_successful_external_upload_updates_fc_values_before_closing() -> None:
     window.close.assert_called_once_with()
 
 
+def test_standalone_upload_host_closes_the_event_loop() -> None:
+    """The shared host callback retains the standalone upload close behavior."""
+    root = MagicMock()
+    host = StandaloneUploadHost(root, MagicMock(), MagicMock(), on_close=root.quit)
+
+    host.repopulate_parameter_table()
+    host.on_skip_click()
+
+    root.quit.assert_called_once_with()
+
+
+@pytest.mark.parametrize("operation", ["reset", "upload"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "exception"])
+def test_standalone_fc_operations_reject_reentry_and_allow_retry(operation: str, outcome: str) -> None:
+    """
+    Keep standalone FC operations exclusive while progress services Tk callbacks.
+
+    GIVEN: A reset or upload is in progress
+    WHEN: Another reset and upload are requested from a nested event loop
+    THEN: Both are rejected and the original guard is released for retries
+    """
+    ui = MagicMock()
+    host = StandaloneUploadHost(MagicMock(), MagicMock(), ui)
+    progress = ui.reset_all_parameters_to_default_with_progress if operation == "reset" else ui.upload_params_with_progress
+
+    def run() -> bool:
+        return host.reset_all_parameters_to_default() if operation == "reset" else host.upload_external_params({})
+
+    def nested_operation(*_args: object) -> bool:
+        assert host.reset_all_parameters_to_default() is False
+        assert host.upload_external_params({}) is False
+        if outcome == "exception":
+            message = "Transport failed"
+            raise RuntimeError(message)
+        return outcome == "success"
+
+    progress.side_effect = nested_operation
+    if operation == "reset" and outcome == "exception":
+        with pytest.raises(RuntimeError, match="Transport failed"):
+            run()
+    else:
+        assert run() is (outcome == "success")
+    progress.assert_called_once()
+    if operation == "reset":
+        ui.upload_params_with_progress.assert_not_called()
+    else:
+        ui.reset_all_parameters_to_default_with_progress.assert_not_called()
+
+    progress.side_effect = None
+    progress.return_value = True
+    assert run() is True
+    assert progress.call_count == 2
+
+
 def test_closing_external_upload_window_refreshes_parent_table() -> None:
     """Refresh the normal parameter table after the modal is closed."""
     window = _window_without_tk()
@@ -468,6 +536,67 @@ def test_reset_defaults_is_cancelled_without_confirmation() -> None:
     window.parent.parameter_editor.reset_all_parameters_to_default.assert_not_called()
 
 
+@pytest.mark.parametrize("use_current_directory", [False, True])
+def test_standalone_reset_preserves_project_defaults_when_defaults_become_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_current_directory: bool
+) -> None:
+    """
+    Reset the FC without overwriting a user's project defaults.
+
+    GIVEN: Startup returns no defaults and a project contains ROLL_P,9
+    WHEN: Defaults become available after a standalone FC reset
+    THEN: Downloads stay in scratch storage and the project file is unchanged.
+    """
+    vehicle_path = tmp_path / "vehicle"
+    vehicle_path.mkdir()
+    monkeypatch.chdir(vehicle_path)
+    vehicle_dir = "." if use_current_directory else str(vehicle_path)
+    default_file = vehicle_path / "00_default.param"
+    original_defaults = b"ROLL_P,9\n"
+    default_file.write_bytes(original_defaults)
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir()
+    flight_controller = MagicMock()
+    flight_controller.info.vehicle_type = "ArduCopter"
+    flight_controller.info.flight_sw_version = "4.6.0"
+    flight_controller.reset_all_parameters_to_default_and_reconnect.return_value = (True, "")
+    downloaded_defaults = ParDict({"ROLL_P": Par(0.1)})
+
+    def download_params(
+        _progress_callback=None,
+        parameter_values_filename: Path | None = None,
+        parameter_defaults_filename: Path | None = None,
+        **_kwargs,
+    ) -> tuple[dict, ParDict]:
+        assert parameter_values_filename == scratch_dir / "complete.param"
+        assert parameter_defaults_filename == scratch_dir / "00_default.param"
+        defaults = downloaded_defaults if flight_controller.download_params.call_count > 1 else ParDict()
+        flight_controller.fc_parameters = {"ROLL_P": 0.1}
+        ParDict({"ROLL_P": Par(0.1)}).export_to_param(str(parameter_values_filename))
+        if defaults:
+            defaults.export_to_param(str(parameter_defaults_filename))
+        return flight_controller.fc_parameters, defaults
+
+    flight_controller.download_params.side_effect = download_params
+    with patch.object(LocalFilesystem, "load_parameter_metadata_for_flight_controller", return_value=""):
+        editor = ParameterEditor.for_connected_flight_controller(
+            flight_controller, vehicle_dir, parameter_download_dir=scratch_dir
+        )
+    ui = ParameterEditorUiServices.__new__(ParameterEditorUiServices)
+    ui.create_progress_window = MagicMock()
+    ui.show_error = MagicMock()
+    host = StandaloneUploadHost(MagicMock(), editor, ui, gui_complexity="simple")
+
+    assert host.reset_all_parameters_to_default() is True
+
+    assert flight_controller.download_params.call_count == 2
+    assert editor.fc_parameters == {"ROLL_P": 0.1}
+    assert default_file.read_bytes() == original_defaults
+    assert ParDict.from_file(str(scratch_dir / "00_default.param")) == downloaded_defaults
+    ui.show_error.assert_not_called()
+    ui.create_progress_window.return_value.destroy.assert_called()
+
+
 def test_parameter_editor_propagates_external_workflow_failure() -> None:
     """
     Propagate the external workflow result through the UI layer.
@@ -477,6 +606,9 @@ def test_parameter_editor_propagates_external_workflow_failure() -> None:
     THEN it returns False to its modal caller.
     """
     editor = ParameterEditorWindow.__new__(ParameterEditorWindow)
+    editor._connection_recovery = None
+    editor.navigation_lock = MagicMock(locked=False)
+    editor.current_plugin_view = None
     editor.root = MagicMock()
     editor.parameter_editor = MagicMock()
     editor.parameter_editor.upload_external_params_workflow = MagicMock()
@@ -492,3 +624,197 @@ def test_parameter_editor_propagates_external_workflow_failure() -> None:
         editor.parameter_editor.upload_external_params_workflow,
         selected,
     )
+
+
+def test_standalone_main_uses_shared_parameter_application() -> None:
+    """Standalone compare and upload delegates connection and model startup to shared layers."""
+    args = Namespace(
+        loglevel="INFO",
+        reboot_time=8,
+        baudrate=115200,
+        device="test",
+        vehicle_dir="vehicle",
+        vehicle_type="ArduPlane",
+        allow_editing_template_files=False,
+        save_component_to_system_templates=False,
+    )
+    with (
+        patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.argument_parser",
+            return_value=args,
+        ),
+        patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload."
+            "run_standalone_parameter_application"
+        ) as run_application,
+    ):
+        standalone_main()
+
+    run_application.assert_called_once()
+    called_args, kwargs = run_application.call_args
+    assert called_args[0] is args
+    assert kwargs["root_factory"]
+    assert kwargs["flight_controller_factory"]
+    initialize_editor = called_args[1]
+    open_window = called_args[2]
+    root = MagicMock()
+    flight_controller = MagicMock()
+    ui = MagicMock()
+    ui.askopenfilename.return_value = "external.param"
+    parameter_editor = MagicMock()
+    parameter_editor.load_external_parameter_file.return_value = {"ROLL_P": MagicMock()}
+
+    with (
+        patch(
+            "ardupilot_methodic_configurator.data_model_parameter_editor.ParameterEditor.for_connected_flight_controller",
+            return_value=parameter_editor,
+        ) as create_editor,
+        patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.ParameterFileUploadWindow",
+        ) as dialog,
+    ):
+        assert initialize_editor(root, flight_controller, ui) is parameter_editor
+        opened_window = open_window(root, parameter_editor, ui)
+
+    ui.askopenfilename.assert_called_once()
+    assert ui.askopenfilename.call_args.kwargs["parent"] is root
+    create_editor.assert_called_once()
+    assert create_editor.call_args.args == (flight_controller, "vehicle", "ArduPlane")
+    download_dir = create_editor.call_args.kwargs["parameter_download_dir"]
+    assert download_dir.name.startswith("amc-parameter-compare-")
+    assert download_dir != Path("vehicle")
+    parameter_editor.load_external_parameter_file.assert_called_once_with("external.param")
+    dialog.assert_called_once()
+    assert opened_window is dialog.return_value
+
+
+@pytest.mark.parametrize("parent_visible", [False, True])
+def test_upload_dialog_centers_on_visible_parent_or_screen(parent_visible: bool) -> None:
+    """A withdrawn standalone root must not be used as the centering anchor."""
+    host = MagicMock()
+    host.root.winfo_viewable.return_value = parent_visible
+
+    def initialize_window(window: ParameterFileUploadWindow, _parent_root: object) -> None:
+        window.root = MagicMock()
+        window.main_frame = MagicMock()
+        window.calculate_scaled_geometry = MagicMock(return_value="500x620")
+        window.center_window = MagicMock()
+        window.center_window_on_screen = MagicMock()
+
+    with (
+        patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.BaseWindow.__init__",
+            initialize_window,
+        ),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.tk.BooleanVar"),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.ttk.Label"),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.ttk.Frame"),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.ttk.Checkbutton"),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.ttk.Button"),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.ParameterEditorTable"),
+        patch("ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.show_tooltip"),
+    ):
+        dialog = ParameterFileUploadWindow(host, "external.param", {})
+
+    if parent_visible:
+        dialog.center_window.assert_called_once_with(dialog.root, host.root)
+        dialog.center_window_on_screen.assert_not_called()
+        dialog.root.transient.assert_called_once_with(host.root)
+    else:
+        dialog.center_window_on_screen.assert_called_once_with(dialog.root)
+        dialog.center_window.assert_not_called()
+        dialog.root.transient.assert_not_called()
+
+
+@pytest.fixture(name="standalone_callbacks")
+def _standalone_callbacks() -> tuple:
+    """Capture the compare/upload callbacks supplied to the shared application."""
+    args = Namespace(loglevel="INFO", reboot_time=8, baudrate=115200, device="", vehicle_dir="vehicle", vehicle_type="Copter")
+    with (
+        patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.argument_parser",
+            return_value=args,
+        ),
+        patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload."
+            "run_standalone_parameter_application"
+        ) as run,
+    ):
+        standalone_main()
+    return run.call_args.args[1:]
+
+
+def test_cancelling_external_file_selection_skips_model_setup(standalone_callbacks) -> None:
+    """
+    Cancel standalone compare/upload file selection without loading parameters.
+
+    GIVEN: The flight controller is connected and the file chooser is open
+    WHEN: The user cancels the chooser
+    THEN: The callback returns no editor and does not start metadata setup
+    """
+    initialize, _open_dialog = standalone_callbacks
+    root = MagicMock()
+    ui = MagicMock()
+    ui.askopenfilename.return_value = ""
+    with patch(
+        "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.initialize_standalone_parameter_editor"
+    ) as create_editor:
+        result = initialize(root, MagicMock(), ui)
+
+    assert result is None
+    assert ui.askopenfilename.call_args.kwargs["parent"] is root
+    create_editor.assert_not_called()
+
+
+def test_invalid_external_file_reports_error_before_opening_dialog(standalone_callbacks) -> None:
+    """
+    Keep the standalone comparison closed when a selected file cannot be loaded.
+
+    GIVEN: The user selected an invalid parameter file
+    WHEN: The model rejects the file
+    THEN: The UI reports the file error and no dialog is created
+    """
+    initialize, open_dialog = standalone_callbacks
+    editor = MagicMock()
+    editor.load_external_parameter_file.side_effect = ValueError("invalid parameter syntax")
+    ui = MagicMock()
+    ui.askopenfilename.return_value = "invalid.param"
+    with (
+        patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload."
+            "initialize_standalone_parameter_editor",
+            return_value=editor,
+        ),
+        patch(
+            "ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload.ParameterFileUploadWindow"
+        ) as dialog_type,
+    ):
+        initialize(MagicMock(), MagicMock(), ui)
+        result = open_dialog(MagicMock(), editor, ui)
+
+    assert result is False
+    ui.show_error.assert_called_once_with("Parameter file error", "invalid parameter syntax")
+    dialog_type.assert_not_called()
+
+
+def test_standalone_compare_keeps_parameter_download_directory_until_window_closes() -> None:
+    """Private FC snapshots stay available for upload validation and resets."""
+    ui = MagicMock()
+    ui.askopenfilename.return_value = "selected.param"
+    editor = MagicMock()
+    initialize = MagicMock(return_value=editor)
+
+    def run_tool(_args, initialize_editor, _open_window, **_kwargs) -> None:
+        initialize_editor(MagicMock(), MagicMock(), ui)
+        download_dir = initialize.call_args.kwargs["parameter_download_dir"]
+        assert download_dir.exists()
+
+    with (
+        patch.object(compare_module, "argument_parser", return_value=SimpleNamespace()),
+        patch.object(compare_module, "initialize_standalone_parameter_editor", new=initialize),
+        patch.object(compare_module, "run_standalone_parameter_application", side_effect=run_tool),
+    ):
+        compare_module.main()
+
+    download_dir = initialize.call_args.kwargs["parameter_download_dir"]
+    assert not download_dir.exists()

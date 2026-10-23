@@ -8,8 +8,8 @@ Calls five sub-applications in sequence:
   1. Check for software updates
   2. Connect to the flight controller and read the parameters
   3. Select the vehicle directory
-  4. Component and connection editor
-  5. Parameter editor and uploader
+  4. Component and connection editor for newly created projects
+  5. Parameter editor and uploader, with on-demand component editing
 
 This file is part of ArduPilot Methodic Configurator. https://github.com/ArduPilot/MethodicConfigurator
 
@@ -19,12 +19,14 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import argparse
+import importlib
 import os
+import sys
 import tempfile
+from collections.abc import Callable
 from logging import basicConfig as logging_basicConfig
 from logging import debug as logging_debug
 from logging import error as logging_error
-from logging import getLevelName as logging_getLevelName
 from logging import info as logging_info
 from logging import warning as logging_warning
 from pathlib import Path
@@ -48,13 +50,19 @@ from ardupilot_methodic_configurator.data_model_parameter_editor import Paramete
 from ardupilot_methodic_configurator.data_model_parameter_upgrade import upgrade_parameters_for_firmware_version
 from ardupilot_methodic_configurator.data_model_software_updates import UpdateManager, check_for_software_updates
 from ardupilot_methodic_configurator.data_model_vehicle_project import VehicleProjectManager
+from ardupilot_methodic_configurator.data_model_vehicle_project_creator import VehicleProjectCreationError
 from ardupilot_methodic_configurator.frontend_tkinter_component_editor import ComponentEditorWindow
+from ardupilot_methodic_configurator.frontend_tkinter_component_editor_base import (
+    ComponentEditorCloseAction,
+    ComponentEditorCloseResult,
+)
 from ardupilot_methodic_configurator.frontend_tkinter_connection_selection import ConnectionSelectionWindow
 from ardupilot_methodic_configurator.frontend_tkinter_flightcontroller_connection_progress import (
+    PROGRESS_FC_INIT_COMPLETE,
     FlightControllerConnectionProgress,
 )
 from ardupilot_methodic_configurator.frontend_tkinter_flightcontroller_info import FlightControllerInfoWindow
-from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
+from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorAction, ParameterEditorWindow
 from ardupilot_methodic_configurator.frontend_tkinter_project_opener import VehicleProjectOpenerWindow
 from ardupilot_methodic_configurator.frontend_tkinter_show import (
     show_error_message,
@@ -62,6 +70,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_show import (
 )
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_window import PopupWindow
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_windows import display_workflow_explanation
+from ardupilot_methodic_configurator.plugins import plugin_constants
 from ardupilot_methodic_configurator.plugins.plugin_factory import plugin_factory
 
 
@@ -77,41 +86,46 @@ def register_plugins() -> None:
       2. Here (``register_plugins``)                      - import and call its register function.
       3. The plugin's ``frontend_tkinter_*.py`` module    - register its view and data-model factories.
       4. On ``ardupilot_methodic_configurator\configuration_steps_schema.json`` - add the plugin name to
-         ``plugin > properties > enum`` in the configuration steps schema.
+         ``plugin > properties > name > enum`` in the configuration steps schema.
     """
-    # Imports are intentionally deferred to avoid circular imports: the frontend_tkinter_* modules
-    # import plugin_factory at module level, so top-level imports here would form a cycle.
-    # pylint: disable=import-outside-toplevel, cyclic-import
-    from ardupilot_methodic_configurator.plugins.frontend_tkinter_accelerometer_calibration import (  # noqa: PLC0415
-        register_accelerometer_calibration_plugin,
+    # Import each plugin lazily and independently. A missing optional dependency or a broken plugin
+    # must not prevent the remaining plugins from being registered.
+    registrations = (
+        ("frontend_tkinter_accelerometer_calibration", "register_accelerometer_calibration_plugin"),
+        ("frontend_tkinter_ahrs_orientation", "register_ahrs_orientation_plugin"),
+        ("frontend_tkinter_autotune_gain_backoff", "register_autotune_gain_backoff_plugin"),
+        ("frontend_tkinter_battery_monitor", "register_battery_monitor_plugin"),
+        ("frontend_tkinter_compass_calibration", "register_compass_calibration_plugin"),
+        ("frontend_tkinter_data_telemetry", "register_data_telemetry_plugin"),
+        ("frontend_tkinter_esc_rpm_scale", "register_esc_rpm_scale_plugin"),
+        ("frontend_tkinter_level_calibration", "register_level_calibration_plugin"),
+        ("frontend_tkinter_motor_test", "register_motor_test_plugin"),
+        ("frontend_tkinter_rc_calibration", "register_rc_calibration_plugin"),
+        ("frontend_tkinter_rc_receiver", "register_rc_receiver_plugin"),
+        ("frontend_tkinter_servo_out", "register_servo_out_plugin"),
     )
-    from ardupilot_methodic_configurator.plugins.frontend_tkinter_ahrs_orientation import (  # noqa: PLC0415
-        register_ahrs_orientation_plugin,
-    )
-    from ardupilot_methodic_configurator.plugins.frontend_tkinter_battery_monitor import (  # noqa: PLC0415
-        register_battery_monitor_plugin,
-    )
-    from ardupilot_methodic_configurator.plugins.frontend_tkinter_compass_calibration import (  # noqa: PLC0415
-        register_compass_calibration_plugin,
-    )
-    from ardupilot_methodic_configurator.plugins.frontend_tkinter_esc_rpm_scale import (  # noqa: PLC0415
-        register_esc_rpm_scale_plugin,
-    )
-    from ardupilot_methodic_configurator.plugins.frontend_tkinter_motor_test import register_motor_test_plugin  # noqa: PLC0415
-    from ardupilot_methodic_configurator.plugins.frontend_tkinter_rc_calibration import (  # noqa: PLC0415
-        register_rc_calibration_plugin,
-    )
-    # pylint: enable=import-outside-toplevel, cyclic-import
-
-    register_accelerometer_calibration_plugin()
-    register_ahrs_orientation_plugin()
-    register_battery_monitor_plugin()
-    register_compass_calibration_plugin()
-    register_esc_rpm_scale_plugin()
-    register_motor_test_plugin()
-    register_rc_calibration_plugin()
+    for module_name, registration_name in registrations:
+        module_path = f"ardupilot_methodic_configurator.plugins.{module_name}"
+        try:
+            plugin_module = importlib.import_module(module_path)
+            getattr(plugin_module, registration_name)()
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            logging_error("Failed to register plugin %s: %s", module_name, error)
 
     # Add more plugin registrations here in the future
+
+
+def validate_plugin_registration() -> None:
+    """Verify all declared plugins register, without creating windows or connecting to a vehicle."""
+    register_plugins()
+    expected = {
+        value for name, value in vars(plugin_constants).items() if name.startswith("PLUGIN_") and isinstance(value, str)
+    }
+    missing = expected - set(plugin_factory.available_plugins())
+    if not expected or missing:
+        logging_error("Plugin registration validation failed. Missing plugins: %s", ", ".join(sorted(missing)))
+        sys_exit(1)
+    logging_info("Validated registration of all %d plugins", len(expected))
 
 
 class ApplicationState:  # pylint: disable=too-few-public-methods
@@ -160,6 +174,31 @@ def create_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_bin_log_validation(logfile: str) -> None:
+    """Run the isolated DataFlash validator requested by a frozen child process."""
+    from pymavlink import mavutil  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+
+    try:
+        mlog = mavutil.mavlink_connection(logfile)
+        close_method = getattr(mlog, "close", None)
+        if callable(close_method):
+            close_method()
+    except (OSError, ValueError, SystemExit) as error:
+        raise SystemExit(str(error)) from None
+
+
+def _validate_command_line_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject combinations that are invalid for offline .bin-log imports."""
+    if getattr(args, "template_dir", "") and not getattr(args, "bin_log", ""):
+        parser.error(_("--template-dir can only be used together with --bin-log"))
+    if getattr(args, "bin_log", "") and getattr(args, "device", ""):
+        parser.error(_("--device cannot be used together with --bin-log"))
+    if getattr(args, "bin_log", "") and getattr(args, "vehicle_type", "") in {"SITL", "AP_Periph"}:
+        parser.error(
+            _("--vehicle-type {vehicle_type} cannot be used together with --bin-log").format(vehicle_type=args.vehicle_type)
+        )
+
+
 def setup_logging(state: ApplicationState) -> None:
     """
     Set up logging.
@@ -168,7 +207,7 @@ def setup_logging(state: ApplicationState) -> None:
         state: Application state containing parsed arguments
 
     """
-    logging_basicConfig(level=logging_getLevelName(state.args.loglevel), format="%(asctime)s - %(levelname)s - %(message)s")
+    logging_basicConfig(level=state.args.loglevel, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def check_updates(state: ApplicationState) -> bool:
@@ -210,23 +249,30 @@ def connect_to_fc(args: argparse.Namespace) -> tuple[FlightController, str]:
     """
     # Create UI components with automatic cleanup via context manager
     with FlightControllerConnectionProgress() as connection_progress:
-        # Update progress for FC initialization start
-        connection_progress.update_init_progress_bar(0, 100)
 
-        flight_controller = FlightController(
-            reboot_time=args.reboot_time,
-            baudrate=args.baudrate,
-            progress_callback=connection_progress.update_init_progress_bar,
-        )
+        def initialize_and_connect(report: Callable[[int, int], None]) -> tuple[FlightController, str]:
+            """Keep blocking FC work off Tk's thread and report normalized progress."""
 
-        # FC init done, starting connect
-        connection_progress.update_init_progress_bar(100, 100)
+            def report_init(value: int, total: int) -> None:
+                if total > 0:
+                    report(value * PROGRESS_FC_INIT_COMPLETE // 100, total)
 
-        error_str = flight_controller.connect(
-            args.device, progress_callback=connection_progress.update_connect_progress_bar, log_errors=False
-        )
+            def report_connect(value: int, total: int) -> None:
+                if total > 0:
+                    report(PROGRESS_FC_INIT_COMPLETE + value * (100 - PROGRESS_FC_INIT_COMPLETE) // 100, total)
 
-        connection_progress.update_connect_progress_bar(100, 100)
+            report_init(0, 100)
+            flight_controller = FlightController(
+                reboot_time=args.reboot_time,
+                baudrate=args.baudrate,
+                progress_callback=report_init,
+            )
+            report_init(100, 100)
+            error_str = flight_controller.connect(args.device, progress_callback=report_connect, log_errors=False)
+            report_connect(100, 100)
+            return flight_controller, error_str
+
+        flight_controller, error_str = connection_progress.progress_window.run_task(initialize_and_connect)
 
     return flight_controller, error_str
 
@@ -337,6 +383,11 @@ def initialize_flight_controller(state: ApplicationState) -> None:
         SystemExit: If there's a fatal error reading parameter files
 
     """
+    if getattr(state.args, "bin_log", ""):
+        logging_info(_("Creating a vehicle project from a .bin log without connecting to a flight controller."))
+        state.flight_controller = FlightController(reboot_time=state.args.reboot_time, baudrate=state.args.baudrate)
+        return
+
     # Connect to the flight controller and read the parameters
     state.flight_controller, state.vehicle_type = connect_to_fc_and_set_vehicle_type(state.args)
 
@@ -362,6 +413,19 @@ def initialize_filesystem(state: ApplicationState) -> None:
         SystemExit: If there's a fatal error reading parameter files
 
     """
+    # A .bin import must not inspect or modify the directory from which the command
+    # was launched. The import workflow creates its own project and re-initializes
+    # this empty filesystem after the log has been parsed.
+    if getattr(state.args, "bin_log", ""):
+        state.local_filesystem = LocalFilesystem(
+            None,  # type: ignore[arg-type]
+            state.vehicle_type,
+            state.flight_controller.info.flight_sw_version,
+            state.args.allow_editing_template_files,
+            state.args.save_component_to_system_templates,
+        )
+        return
+
     # Migrate the vehicle project to the latest format version if needed.
     # This must run before LocalFilesystem is created so that parameter files are
     # in their new locations when rename_parameter_files() runs inside re_init().
@@ -423,6 +487,33 @@ def vehicle_directory_selection(state: ApplicationState) -> VehicleProjectOpener
             state.param_default_values = ParDict(default_values) if default_values else ParDict()
 
     return vehicle_dir_window
+
+
+def create_vehicle_project_from_bin_log(state: ApplicationState) -> str:
+    """Create and open a vehicle project directly from the command-line .bin log."""
+    state.vehicle_project_manager = VehicleProjectManager(state.local_filesystem, state.flight_controller)
+    template_dir = getattr(state.args, "template_dir", "") or None
+    expected_vehicle_type = getattr(state.args, "vehicle_type", "") or None
+    vehicle_dir = None
+    if getattr(state.args, "vehicle_dir_explicit", False):
+        vehicle_dir = os.path.expanduser(state.args.vehicle_dir)
+    elif getattr(state.args, "vehicle_dir", None) and Path(state.args.vehicle_dir) != Path.cwd():
+        # Keep manually constructed Namespaces and callers compatible with the
+        # parser's historical current-working-directory default.
+        vehicle_dir = os.path.expanduser(state.args.vehicle_dir)
+    try:
+        new_vehicle_dir = state.vehicle_project_manager.create_new_vehicle_from_bin_log(
+            state.args.bin_log,
+            template_dir=template_dir,
+            vehicle_dir=vehicle_dir,
+            expected_vehicle_type=expected_vehicle_type,
+        )
+    except VehicleProjectCreationError as exc:
+        logging_error("%s: %s", exc.title, exc.message)
+        logging_debug("", exc_info=exc)
+        raise SystemExit(1) from exc
+    logging_info(_("Created vehicle project at %s"), new_vehicle_dir)
+    return new_vehicle_dir
 
 
 def create_and_configure_component_editor(
@@ -518,40 +609,52 @@ def open_firmware_documentation(firmware_type: str) -> bool:
     return url_found
 
 
-def component_editor(state: ApplicationState) -> None:
-    """
-    Run the component editor workflow.
+def run_initial_component_editor(state: ApplicationState) -> None:
+    """Run initial component setup with the project-creation preferences."""
+    project_manager = state.vehicle_project_manager
+    if project_manager is None or not project_manager.is_new_project:
+        process_component_editor_results(state.flight_controller, state.local_filesystem)
+        return
 
-    Args:
-        state: Application state containing all necessary objects
-
-    Raises:
-        SystemExit: If there's an error in derived parameters
-
-    """
     # Create and configure the component editor window
     component_editor_window = create_and_configure_component_editor(
         __version__,
         state.local_filesystem,
         state.flight_controller,
         state.local_filesystem.vehicle_type,
-        state.vehicle_project_manager,
+        project_manager,
     )
 
-    # Handle skip component editor option
-    should_skip_editor = state.args.skip_component_editor and not (
-        state.vehicle_project_manager is not None and state.vehicle_project_manager.blank_component_data
-    )
-    if should_skip_editor:
-        component_editor_window.root.after(10, component_editor_window.root.destroy)
-    elif should_open_firmware_documentation(state.flight_controller):
+    if should_open_firmware_documentation(state.flight_controller):
         open_firmware_documentation(state.flight_controller.info.firmware_type)
 
         # Set up startup notification for the component editor window
         FreeDesktop.setup_startup_notification(component_editor_window.root)  # type: ignore[arg-type]
 
-    # Run the GUI
-    component_editor_window.root.mainloop()
+    close_result = _run_component_editor(component_editor_window)
+    if close_result.action is ComponentEditorCloseAction.QUIT_WORKFLOW:
+        sys_exit(close_result.exit_code)
+        return  # pylint: disable=unreachable
+    process_component_editor_results(state.flight_controller, state.local_filesystem)
+
+
+def edit_vehicle_components(state: ApplicationState) -> None:
+    """Edit existing components and return without applying creation preferences."""
+    window = create_and_configure_component_editor(
+        __version__,
+        state.local_filesystem,
+        state.flight_controller,
+        state.local_filesystem.vehicle_type,
+        None,
+    )
+    _run_component_editor(window)
+    process_component_editor_results(state.flight_controller, state.local_filesystem)
+
+
+def _run_component_editor(window: ComponentEditorWindow) -> ComponentEditorCloseResult:
+    """Run the component editor and return its close outcome to the application."""
+    window.root.mainloop()
+    return window.close_result
 
 
 def process_component_editor_results(
@@ -676,25 +779,48 @@ def parameter_editor_and_uploader(state: ApplicationState) -> None:
     simple_gui: bool = ProgramSettings.get_setting("gui_complexity") == "simple"
     start_file = state.local_filesystem.get_start_file(state.args.n, imu_tcal_available and not simple_gui)
 
-    # Call the GUI function with the starting intermediate parameter file
-    parameter_editor = ParameterEditor(
-        start_file,
-        state.flight_controller,
-        state.local_filesystem,
-        export_fc_params_missing_or_different=state.args.export_fc_params_missing_or_different,
-    )
-    window = ParameterEditorWindow(parameter_editor)
-    window.run()
+    # Recreate the parameter data model after each component-editor visit so all
+    # component-derived values and evaluator references use the freshly saved data.
+    current_file = start_file
+    while True:
+        parameter_editor = ParameterEditor(
+            current_file,
+            state.flight_controller,
+            state.local_filesystem,
+            export_fc_params_missing_or_different=state.args.export_fc_params_missing_or_different,
+        )
+        window = ParameterEditorWindow(parameter_editor)
+        if window.run() is ParameterEditorAction.FINISHED:
+            return
+
+        current_file = parameter_editor.current_file
+        edit_vehicle_components(state)
 
 
-def main() -> None:
+def _run_validation_command() -> bool:
+    """Handle headless validation modes before normal application startup."""
+    if sys.argv[1:] == ["--validate-plugins"]:
+        validate_plugin_registration()
+        return True
+    if len(sys.argv) == 3 and sys.argv[1] == "--validate-bin-log":
+        _run_bin_log_validation(sys.argv[2])
+        return True
+    return False
+
+
+def main() -> None:  # pylint: disable=too-many-branches
     """
     Main application entry point.
 
     Orchestrates the entire application startup process by calling specialized functions
     for each major step.
     """
-    args = create_argument_parser().parse_args()
+    if _run_validation_command():
+        return
+
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    _validate_command_line_args(parser, args)
 
     # Register plugins early, before any UI creation
     register_plugins()
@@ -726,12 +852,15 @@ def main() -> None:
 
     initialize_filesystem(state)
 
-    # Get the list of intermediate parameter files that will be processed sequentially
-    files = list(state.local_filesystem.file_parameters.keys()) if state.local_filesystem.file_parameters else []
+    if getattr(args, "bin_log", ""):
+        create_vehicle_project_from_bin_log(state)
+    else:
+        # Get the list of intermediate parameter files that will be processed sequentially
+        files = list(state.local_filesystem.file_parameters.keys()) if state.local_filesystem.file_parameters else []
 
-    # Handle vehicle directory selection if no vehicle configuration files are present in the current working directory
-    if not files:
-        vehicle_directory_selection(state)
+        # Handle vehicle directory selection if no vehicle configuration files are present in the current working directory
+        if not files:
+            vehicle_directory_selection(state)
 
     # Validate that all configured plugins are registered after the filesystem has loaded configuration steps.
     plugin_factory.validate_configuration_steps(state.local_filesystem.configuration_steps)
@@ -740,6 +869,23 @@ def main() -> None:
     # must be done before the component editor workflow updates the file with information from the connected FC
     parameter_files_version_str = state.local_filesystem.get_fc_fw_version_from_vehicle_components_json()
     logging_info(_("Parameter files firmware version from vehicle_components.json: %s"), parameter_files_version_str)
+
+    # Keep existing projects' component metadata aligned with the connected FC. A missing
+    # project manager means the project was opened directly; retain the old version above
+    # for this startup's parameter-file upgrade comparison.
+    project_manager = state.vehicle_project_manager
+    fc_info = state.flight_controller.info
+    if (
+        (project_manager is None or not project_manager.is_new_project)
+        and fc_info is not None
+        and fc_info.flight_sw_version
+        and state.local_filesystem.vehicle_type
+    ):
+        state.local_filesystem.set_fc_fw_version_and_type_in_components_json(
+            fc_info.flight_sw_version,
+            state.local_filesystem.vehicle_type,
+            state.local_filesystem.vehicle_dir,
+        )
 
     if (
         state.flight_controller.fc_parameters
@@ -761,11 +907,7 @@ def main() -> None:
             os.remove(file_path)
         sys_exit(1)
 
-    # Run component editor workflow
-    component_editor(state)
-
-    # Process results after component editor GUI closes
-    process_component_editor_results(state.flight_controller, state.local_filesystem)
+    run_initial_component_editor(state)
 
     # Write parameter default values to file if they have been modified
     if state.param_default_values_dirty:

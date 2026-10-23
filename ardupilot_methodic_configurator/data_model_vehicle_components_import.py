@@ -76,6 +76,12 @@ class BatteryVoltageSpecs:
     fc_parameters: dict[str, float]
 
 
+MOTOR_BATTERY_VOLTAGE_PARAMETERS = {
+    "Volt per cell max": ("Q_M_BAT_VOLT_MAX", "MOT_BAT_VOLT_MAX"),
+    "Volt per cell min": ("Q_M_BAT_VOLT_MIN", "MOT_BAT_VOLT_MIN"),
+}
+
+
 class ComponentDataModelImport(ComponentDataModelBase):
     """
     A class to handle component data import from FC parameters separate from UI logic.
@@ -116,6 +122,7 @@ class ComponentDataModelImport(ComponentDataModelBase):
             or (code_protocol == "MAVLink" and doc_protocol == "MAV")
             or (code_protocol == "Septentrio-DualAntenna(SBF)" and doc_protocol == "SBF-DualAntenna")
             or (code_protocol == "Gimbal" and doc_protocol == "SToRM32 Gimbal Serial")
+            or (code_protocol == "INA2XX" and doc_protocol == "INA2XX (INA226 INA228 INA238 INA231 INA260)")
         )
 
     def _verify_dict_is_uptodate(
@@ -191,12 +198,17 @@ class ComponentDataModelImport(ComponentDataModelBase):
         frame_class_doc_key = "Q_FRAME_CLASS" if fw_type == "ArduPlane" else "FRAME_CLASS"
         self._verify_dict_is_uptodate(doc, frame_class_dict, frame_class_doc_key, "values")
 
-        # Process frame information if FRAME_CLASS or Q_FRAME_CLASS is present in FC parameters
+        # Process frame information if FRAME_CLASS or Q_FRAME_CLASS is present in FC parameters.
+        # A regular ArduPlane does not have a multirotor frame class; when the log
+        # contains no frame-class parameter, do not retain a Quad value from the
+        # generic empty template.
         if "FRAME_CLASS" in fc_parameters or "Q_FRAME_CLASS" in fc_parameters:
             frame_class, _ = get_frame_info(fc_parameters, fw_type)
             frame_class_entry = frame_class_dict.get(str(frame_class))
             frame_class_label = frame_class_entry.get("protocol") if isinstance(frame_class_entry, dict) else "Undefined"
             self.set_component_value(("Frame", "Specifications", "Frame class"), frame_class_label)
+        elif fw_type == "ArduPlane" and not float(fc_parameters.get("Q_ENABLE", 0)):
+            self.set_component_value(("Frame", "Specifications", "Frame class"), "Undefined")
 
         # Process parameters in sequence
         self._set_gnss_type_from_fc_parameters(fc_parameters)
@@ -498,21 +510,34 @@ class ComponentDataModelImport(ComponentDataModelBase):
                     logging_warning(_("BATT_CAPACITY is zero or negative: %s"), batt_capacity)
             except (ValueError, TypeError) as e:
                 logging_error(_("Error processing BATT_CAPACITY parameter: %s"), str(e))
-        else:
-            logging_warning(_("BATT_CAPACITY parameter not found in fc_parameters"))
-
         if specs.estimated_cell_count > 0:
-            self.import_bat_voltage(specs, "MOT_BAT_VOLT_MAX", "Volt per cell max")
+            self.import_bat_voltage(
+                specs, self._get_motor_battery_voltage_parameter(fc_parameters, "Volt per cell max"), "Volt per cell max"
+            )
             self.import_bat_voltage(specs, "BATT_ARM_VOLT", "Volt per cell arm")
             self.import_bat_voltage(specs, "BATT_LOW_VOLT", "Volt per cell low")
             self.import_bat_voltage(specs, "BATT_CRT_VOLT", "Volt per cell crit")
-            self.import_bat_voltage(specs, "MOT_BAT_VOLT_MIN", "Volt per cell min")
+            self.import_bat_voltage(
+                specs, self._get_motor_battery_voltage_parameter(fc_parameters, "Volt per cell min"), "Volt per cell min"
+            )
         else:
             self.set_component_value(("Battery", "Specifications", "Volt per cell max"), "0")
             self.set_component_value(("Battery", "Specifications", "Volt per cell arm"), "0")
             self.set_component_value(("Battery", "Specifications", "Volt per cell low"), "0")
             self.set_component_value(("Battery", "Specifications", "Volt per cell crit"), "0")
             self.set_component_value(("Battery", "Specifications", "Volt per cell min"), "0")
+
+    @staticmethod
+    def _get_motor_battery_voltage_parameter(fc_parameters: dict[str, float], voltage_type: str) -> str:
+        """Return the available QuadPlane or Copter motor battery-voltage parameter for a voltage type."""
+        return next(
+            (
+                parameter_name
+                for parameter_name in MOTOR_BATTERY_VOLTAGE_PARAMETERS[voltage_type]
+                if parameter_name in fc_parameters
+            ),
+            "",
+        )
 
     def import_bat_voltage(self, specs: BatteryVoltageSpecs, param_name: str, voltage_type: str) -> None:
         if param_name in specs.fc_parameters:
@@ -555,16 +580,18 @@ class ComponentDataModelImport(ComponentDataModelBase):
 
         """
         # FC param → voltage type mapping, in priority order
-        # Priority: MOT_BAT_VOLT_MAX > BATT_LOW_VOLT > BATT_CRT_VOLT > BATT_ARM_VOLT > MOT_BAT_VOLT_MIN
+        # Priority: Q_M_BAT_VOLT_MAX/MOT_BAT_VOLT_MAX > BATT_LOW_VOLT > BATT_CRT_VOLT > BATT_ARM_VOLT >
+        # Q_M_BAT_VOLT_MIN/MOT_BAT_VOLT_MIN
         voltage_params = [
-            ("MOT_BAT_VOLT_MAX", "Volt per cell max"),
+            (self._get_motor_battery_voltage_parameter(fc_parameters, "Volt per cell max"), "Volt per cell max"),
             ("BATT_LOW_VOLT", "Volt per cell low"),
             ("BATT_CRT_VOLT", "Volt per cell crit"),
             (
                 "BATT_ARM_VOLT",
                 "Volt per cell arm",
             ),  # lower priority, less commonly set, but can provide additional clues if available
-            ("MOT_BAT_VOLT_MIN", "Volt per cell min"),  # lowest priority, but can be a last resort for detection
+            (self._get_motor_battery_voltage_parameter(fc_parameters, "Volt per cell min"), "Volt per cell min"),
+            # lowest priority, but can be a last resort for detection
         ]
 
         # Try each voltage parameter in priority order
@@ -641,7 +668,8 @@ class ComponentDataModelImport(ComponentDataModelBase):
         """
         Estimate battery cell count from voltage parameters.
 
-        Uses MOT_BAT_VOLT_MAX, BATT_LOW_VOLT, BATT_CRT_VOLT, BATT_ARM_VOLT, or MOT_BAT_VOLT_MIN
+        Uses Q_M_BAT_VOLT_MAX/MOT_BAT_VOLT_MAX, BATT_LOW_VOLT, BATT_CRT_VOLT, BATT_ARM_VOLT, or
+        Q_M_BAT_VOLT_MIN/MOT_BAT_VOLT_MIN
         along with default volt-per-cell values for the given chemistry to estimate the number of cells.
 
         Args:
@@ -650,12 +678,14 @@ class ComponentDataModelImport(ComponentDataModelBase):
 
         """
         # Try to estimate cell count from available voltage parameters
-        # Priority: MOT_BAT_VOLT_MAX > BATT_LOW_VOLT > BATT_CRT_VOLT > BATT_ARM_VOLT > MOT_BAT_VOLT_MIN
+        # Priority: Q_M_BAT_VOLT_MAX/MOT_BAT_VOLT_MAX > BATT_LOW_VOLT > BATT_CRT_VOLT > BATT_ARM_VOLT >
+        # Q_M_BAT_VOLT_MIN/MOT_BAT_VOLT_MIN
         estimated_cells = None
 
-        if "MOT_BAT_VOLT_MAX" in fc_parameters:
+        max_voltage_parameter = self._get_motor_battery_voltage_parameter(fc_parameters, "Volt per cell max")
+        if max_voltage_parameter:
             estimated_cells = self._estimate_cells_from_voltage_param_default(
-                "MOT_BAT_VOLT_MAX", fc_parameters["MOT_BAT_VOLT_MAX"], "Volt per cell max", chemistry
+                max_voltage_parameter, fc_parameters[max_voltage_parameter], "Volt per cell max", chemistry
             )
 
         if estimated_cells is None and "BATT_LOW_VOLT" in fc_parameters:
@@ -674,13 +704,27 @@ class ComponentDataModelImport(ComponentDataModelBase):
                 "BATT_ARM_VOLT", fc_parameters["BATT_ARM_VOLT"], "Volt per cell arm", chemistry
             )
 
-        if estimated_cells is None and "MOT_BAT_VOLT_MIN" in fc_parameters:
+        min_voltage_parameter = self._get_motor_battery_voltage_parameter(fc_parameters, "Volt per cell min")
+        if estimated_cells is None and min_voltage_parameter:
             estimated_cells = self._estimate_cells_from_voltage_param_default(
-                "MOT_BAT_VOLT_MIN", fc_parameters["MOT_BAT_VOLT_MIN"], "Volt per cell min", chemistry
+                min_voltage_parameter, fc_parameters[min_voltage_parameter], "Volt per cell min", chemistry
             )
 
-        # If no estimation succeeded, all volt per cell values must be invalid
+        # Sparse imported parameter files may not contain any battery voltage values because
+        # those values are already present in the selected vehicle template. Preserve the
+        # template's validated cell count instead of destroying its battery specifications.
         if estimated_cells is None:
+            cell_path = ("Battery", "Specifications", "Number of cells")
+            try:
+                existing_cells = int(float(str(self.get_component_value(cell_path))))
+            except (ValueError, TypeError):
+                existing_cells = 0
+
+            if cell_path in ComponentDataModelValidation.VALIDATION_RULES:
+                _type, (min_cells, max_cells), _doc = ComponentDataModelValidation.VALIDATION_RULES[cell_path]
+                if min_cells <= existing_cells <= max_cells:
+                    return existing_cells
+
             logging_error(_("All volt per cell values are zero or invalid; cannot estimate battery cell count"))
             return 0
 

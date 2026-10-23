@@ -113,7 +113,7 @@ class TestWindowsUserInstallsUpdate:
     @patch("platform.system")
     @patch("ardupilot_methodic_configurator.data_model_software_updates.download_and_install_on_windows")
     @patch("ardupilot_methodic_configurator.data_model_software_updates.get_expected_sha256_from_release")
-    def test_windows_user_can_download_verified_update(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    def test_windows_user_can_download_verified_update(
         self, mock_get_sha256, mock_download, mock_platform, update_manager, mock_release_info
     ) -> None:
         """
@@ -159,7 +159,7 @@ class TestWindowsUserInstallsUpdate:
         update_manager.dialog = MagicMock()
 
         # Act
-        update_manager._perform_download(mock_release_info)
+        update_manager._perform_download(mock_release_info, update_manager.dialog.update_progress)
 
         # Assert
         call_kwargs = mock_download.call_args.kwargs

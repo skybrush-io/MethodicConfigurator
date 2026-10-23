@@ -53,8 +53,8 @@ from ardupilot_methodic_configurator.backend_flightcontroller_factory_mavftp imp
     create_mavftp_safe,
 )
 from ardupilot_methodic_configurator.backend_flightcontroller_factory_mavlink import SystemMavlinkConnectionFactory
-from ardupilot_methodic_configurator.backend_flightcontroller_files import FlightControllerFiles
-from ardupilot_methodic_configurator.backend_mavftp import ERR_FileExists
+from ardupilot_methodic_configurator.backend_flightcontroller_files import FlightControllerFiles, LastLogDownloadResult
+from ardupilot_methodic_configurator.backend_mavftp import FtpError
 from ardupilot_methodic_configurator.data_model_flightcontroller_info import FlightControllerInfo
 
 if TYPE_CHECKING:
@@ -87,7 +87,7 @@ def _ensure_remote_logs_directory(mavftp) -> None:
         if result is None:
             continue
         error_code = getattr(result, "error_code", 0)
-        if error_code not in (0, ERR_FileExists):
+        if error_code not in (FtpError.Success, FtpError.FileExists):
             pytest.skip(f"Unable to create required directory {directory}: MAVFTP error {error_code}")
 
 
@@ -210,7 +210,7 @@ def test_user_can_monitor_battery_status_from_real_sitl(sitl_flight_controller: 
     # Use the constant instead of magic number
     time.sleep(sitl_flight_controller.BATTERY_STATUS_CACHE_TIME / 3)  # Wait for battery data
 
-    battery_status, status_error = sitl_flight_controller.get_battery_status()
+    battery_status, status_error = sitl_flight_controller.get_battery_statuses()
     assert battery_status is not None, f"Battery status retrieval failed: {status_error}"
 
 
@@ -1013,18 +1013,18 @@ def test_battery_status_retrieval_with_real_sitl(sitl_flight_controller: FlightC
         # Wait for SITL to start sending battery messages and poll until data arrives
         wait_window = max(5.0, sitl_flight_controller.BATTERY_STATUS_TIMEOUT * 10)
         deadline = time.time() + wait_window
-        battery_status: tuple[float, float] | None = None
+        battery_status: dict[int, tuple[float, float]] | None = None
         error = ""
         while time.time() < deadline and battery_status is None:
-            battery_status, error = sitl_flight_controller.get_battery_status()
+            battery_status, error = sitl_flight_controller.get_battery_statuses()
             if battery_status is None:
                 time.sleep(0.25)
 
         # Then: Battery status should be retrieved
         assert battery_status is not None, f"Battery status should be available from SITL, got error: {error}"
-        assert len(battery_status) == 2, "Battery status should contain voltage and current"
+        assert len(battery_status[0]) == 2, "Battery status should contain voltage and current"
 
-        voltage, current = battery_status
+        voltage, current = battery_status[0]
         assert isinstance(voltage, (int, float)), f"Voltage should be numeric, got {type(voltage)}"
         assert isinstance(current, (int, float)), f"Current should be numeric, got {type(current)}"
 
@@ -1176,8 +1176,8 @@ def test_user_can_upload_files_via_files_manager(sitl_flight_controller: FlightC
 
         assert result is True
         cleanup_needed = True
-        if progress_updates:
-            assert max(current for current, _total in progress_updates) == 100
+        assert progress_updates
+        assert progress_updates[-1] == (local_file.stat().st_size, local_file.stat().st_size)
 
         verification_file = tmp_path / "copilot_upload_verify.txt"
         mavftp.cmd_get([remote_filename, str(verification_file)])
@@ -1227,8 +1227,8 @@ def test_user_can_upload_script_to_apm_scripts_via_files_manager(
 
         assert result is True
         cleanup_needed = True
-        if progress_updates:
-            assert max(current for current, _total in progress_updates) == 100
+        assert progress_updates
+        assert progress_updates[-1] == (local_file.stat().st_size, local_file.stat().st_size)
 
         mavftp.cmd_get([remote_filename, str(verification_file)])
         ret = mavftp.process_ftp_reply("OpenFileRO", timeout=FlightControllerFiles.MAVFTP_FILE_OPERATION_TIMEOUT)
@@ -1268,13 +1268,13 @@ def test_user_can_download_synthetic_log_via_files_manager(sitl_flight_controlle
     mavftp.cmd_rm([remote_filename])
 
     mavftp.cmd_put([str(local_source), remote_filename])
-    put_reply = mavftp.process_ftp_reply("CreateFile", timeout=FlightControllerFiles.MAVFTP_FILE_OPERATION_TIMEOUT)
+    put_reply = mavftp.process_ftp_reply("put", timeout=FlightControllerFiles.MAVFTP_FILE_OPERATION_TIMEOUT)
     assert put_reply.error_code == 0
 
     staged_lastlog = tmp_path / "lastlog_staged.txt"
     staged_lastlog.write_text(f"{remote_log_number}\n", encoding="UTF-8")
     mavftp.cmd_put([str(staged_lastlog), lastlog_remote])
-    lastlog_reply = mavftp.process_ftp_reply("CreateFile", timeout=FlightControllerFiles.MAVFTP_FILE_OPERATION_TIMEOUT)
+    lastlog_reply = mavftp.process_ftp_reply("put", timeout=FlightControllerFiles.MAVFTP_FILE_OPERATION_TIMEOUT)
     assert lastlog_reply.error_code == 0
 
     downloaded_file = tmp_path / "downloaded_synthetic_log.bin"
@@ -1289,16 +1289,16 @@ def test_user_can_download_synthetic_log_via_files_manager(sitl_flight_controlle
             progress_callback=download_progress,
         )
 
-        assert result is True
+        assert result is LastLogDownloadResult.SUCCESS
         assert downloaded_file.read_bytes() == local_source.read_bytes()
-        if progress_updates:
-            assert max(current for current, _total in progress_updates) == 100
+        assert progress_updates
+        assert progress_updates[-1] == (local_source.stat().st_size, local_source.stat().st_size)
     finally:
         mavftp.cmd_rm([remote_filename])
         if lastlog_backed_up:
             mavftp.cmd_put([str(lastlog_backup), lastlog_remote])
             restore_reply = mavftp.process_ftp_reply(
-                "CreateFile",
+                "put",
                 timeout=FlightControllerFiles.MAVFTP_FILE_OPERATION_TIMEOUT,
             )
             assert restore_reply.error_code == 0
