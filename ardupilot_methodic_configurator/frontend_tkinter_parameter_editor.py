@@ -79,6 +79,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_progress_window import (
 from ardupilot_methodic_configurator.frontend_tkinter_rich_text import RichText, get_widget_font_family_and_size
 from ardupilot_methodic_configurator.frontend_tkinter_scroll_frame import ScrollFrame
 from ardupilot_methodic_configurator.frontend_tkinter_show import get_monitor_bounds, show_tooltip
+from ardupilot_methodic_configurator.frontend_tkinter_skybrush_log_analysis import SkybrushLogAnalysisWindow
 from ardupilot_methodic_configurator.frontend_tkinter_stage_progress import StageProgressBar
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_window import UsagePopupWindow
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_windows import (
@@ -403,6 +404,7 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
         self._close_pending = False
         self._param_download_progress_window: ProgressWindow | None = None
         self._log_availability_report_window: LogAvailabilityReportWindow | None = None
+        self._skybrush_log_analysis_window: SkybrushLogAnalysisWindow | None = None
         self._log_analysis_running = False
         self._file_browser_window: FileBrowserWindow | None = None
         self._log_report_return_pending: bool = False
@@ -932,6 +934,14 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
             if (self.parameter_editor.is_fc_connected and self.parameter_editor.is_mavftp_supported)
             else _("No flight controller connected or MAVFTP not supported"),
         )
+        # Create Skybrush log analysis button
+        skybrush_log_button = ttk.Button(
+            buttons_frame,
+            text=_("Analyze log\nwith Skybrush"),
+            command=self.on_analyse_log_with_skybrush_click,
+        )
+        skybrush_log_button.pack(side=tk.LEFT, padx=(8, 8))
+        show_tooltip(skybrush_log_button, _("Select a .bin flight log to open the Skybrush log analysis window"))
         # Create skip buttons
         self.skip_button = ttk.Button(buttons_frame, text=_("Skip >"), command=self.on_skip_click)
         self.skip_button.configure(
@@ -1065,6 +1075,16 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
         if not filepath:
             return
         self._analyse_log_file(filepath)
+
+    def on_analyse_log_with_skybrush_click(self) -> None:
+        """Open the Skybrush log analysis window for a selected log."""
+        filepath = self.ui.askopenfilename(
+            title=_("Select a flight log"),
+            filetypes=[(_("ArduPilot binary log files"), "*.bin"), (_("All files"), "*.*")],
+        )
+        if not filepath:
+            return
+        self._skybrush_log_analysis_window = SkybrushLogAnalysisWindow(self.root, filepath)
 
     def _navigate_to_config_step(self, step: str) -> None:
         if self.navigation_lock.locked:
