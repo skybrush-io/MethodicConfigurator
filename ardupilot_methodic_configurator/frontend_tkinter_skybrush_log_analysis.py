@@ -302,6 +302,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._feedback_runner = BackgroundTaskRunner(self.root.after)
         self._analysis_reused = False
         self._version_info: dict[str, Any] = {}
+        #: True while the header version/log-in state has never been fetched successfully.
+        self._version_check_pending = True
 
         self.root.title(_("Skybrush Log Analysis"))
         self.root.geometry(self.calculate_scaled_geometry(1050, 800))
@@ -480,6 +482,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             return
         self._display_analysis_results(result)
         self._set_status(_("Existing Skybrush account analysis reused") if self._analysis_reused else _("Analysis completed"))
+        # Successful server communication: silently retry a header version check that failed earlier.
+        self._retry_pending_version_check()
 
     def _on_open_in_browser_click(self) -> None:
         """Open the Skybrush Log Analyzer in the default browser."""
@@ -518,6 +522,11 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         version = client.version()
         return version if isinstance(version, dict) else {"app_version": str(version)}
 
+    def _retry_pending_version_check(self) -> None:
+        """Retry the header version/log-in check after any successful server communication."""
+        if self._version_check_pending and not self._auth_runner.active:
+            self._start_header_status_checks()
+
     def _on_version_auth_done(self, result: object | None, error: Exception | None) -> None:
         if error is not None:
             logging_error(_("Skybrush log-in or API version check failed: %s"), error)
@@ -530,6 +539,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             return
 
         self._version_info = result
+        self._version_check_pending = False
         self._version_label.configure(text=_format_api_version(result), foreground="")
         self._set_auth_status(_("Authenticated at {account_url}").format(account_url=load_config().account_url), "dark green")
 
@@ -563,10 +573,17 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self, category: str, title: str, description: str, on_done: Callable[[object | None, Exception | None], None]
     ) -> bool:
         """Submit the suggestion through the Skybrush API in the background."""
+
+        def on_suggestion_done(result: object | None, error: Exception | None) -> None:
+            # A submitted suggestion proves the server was reached; use it to retry a pending version check.
+            if error is None:
+                self._retry_pending_version_check()
+            on_done(result, error)
+
         if self._feedback_runner.active:
             return False
         return self._feedback_runner.start(
-            lambda _progress: self._submit_suggestion(category, title, description), None, on_done
+            lambda _progress: self._submit_suggestion(category, title, description), None, on_suggestion_done
         )
 
     def _submit_suggestion(self, category: str, title: str, description: str) -> dict[str, Any]:
@@ -599,6 +616,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
                 parent=self.root,
             )
             return
+        # Acquiring the login link proves the server was reached; retry a pending header version check.
+        self._retry_pending_version_check()
         if webbrowser_open_url(result):
             self._set_status(_("Skybrush Log Analyzer opened in the default browser"))
         else:
