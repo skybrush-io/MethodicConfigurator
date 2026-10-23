@@ -383,7 +383,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._open_web_button.pack(side=tk.LEFT, padx=(8, 0))
         show_tooltip(
             self._open_web_button,
-            _("Open the Skybrush Log Analyzer in the default browser"),
+            _("Open the analysis of the selected log in the Skybrush Log Analyzer web application"),
         )
 
         self._open_account_button = ttk.Button(actions, text=_("Open Skybrush Account"), command=self._on_open_account_click)
@@ -546,20 +546,25 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self._on_run_analysis_click()
 
     def _on_open_in_browser_click(self) -> None:
-        """Open the Skybrush Log Analyzer in the default browser."""
+        """Open the analysis of the selected log in the Skybrush Log Analyzer in the default browser."""
         if self._web_login_runner.active:
             return
 
         self._open_web_button.configure(state="disabled")
-        self._set_status(_("Requesting a log-in link for the Skybrush Log Analyzer"))
+        self._set_status(_("Requesting a log-in link for the Skybrush Log Analyzer web application"))
         if not self._web_login_runner.start(lambda _progress: self._fetch_web_login_url(), None, self._on_web_login_done):
             self._open_web_button.configure(state="normal")
             self._set_status("")
 
     def _fetch_web_login_url(self) -> str:
-        """Acquire a single-sign-on URL for the Skybrush Log Analyzer. Worker thread."""
+        """Acquire a single-sign-on URL for the Skybrush Log Analyzer, deep-linking to this log's analysis."""
         client, _auth_client = _create_skybrush_clients()
-        return cast("str", client.get_web_login_url())
+        try:
+            intent = client.get_analysis_view_intent(Path(self.logfile))
+        except BadRequest:
+            # No stored analysis for this log within the account; open the generic analyzer view.
+            intent = None
+        return cast("str", client.get_web_login_url(intent=intent))
 
     def _start_header_status_checks(self) -> None:
         """Fill the header version/log-in labels; the network part runs as background tasks."""
