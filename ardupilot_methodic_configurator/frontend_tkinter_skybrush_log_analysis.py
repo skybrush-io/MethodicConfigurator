@@ -256,8 +256,13 @@ class FeedbackDialog:
         self._title_entry.pack(anchor=tk.W, fill=tk.X, pady=(0, 8))
 
         ttk.Label(body, text=_("Description")).pack(anchor=tk.W)
-        self._description_text = tk.Text(body, wrap=tk.WORD, height=8)
-        self._description_text.pack(anchor=tk.W, fill=tk.BOTH, expand=True, pady=(0, 4))
+        description_row = ttk.Frame(body)
+        description_row.pack(anchor=tk.W, fill=tk.BOTH, expand=True, pady=(0, 4))
+        self._description_text = tk.Text(description_row, wrap=tk.WORD, height=8)
+        description_scrollbar = ttk.Scrollbar(description_row, orient=tk.VERTICAL, command=self._description_text.yview)
+        self._description_text.configure(yscrollcommand=description_scrollbar.set)
+        description_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._description_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         actions = ttk.Frame(body)
         actions.pack(side=tk.BOTTOM, fill=tk.X)
@@ -266,6 +271,7 @@ class FeedbackDialog:
         ttk.Button(actions, text=_("Cancel"), command=self._root.destroy).pack(side=tk.RIGHT)
         self._submit_button = ttk.Button(actions, text=_("Submit"), command=self._on_submit_click)
         self._submit_button.pack(side=tk.RIGHT, padx=(0, 8))
+        self._title_entry.focus_set()
 
     def _on_category_selected(self, event: "tk.Event[ttk.Combobox]") -> None:
         self._category = str(event.widget.get())
@@ -412,6 +418,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             height=20,
             state=tk.DISABLED,
             font=("TkDefaultFont", 12),
+            padx=10,
+            pady=8,
         )
         scrollbar = ttk.Scrollbar(results_row, orient=tk.VERTICAL, command=self.results_text.yview)
         self.results_text.configure(yscrollcommand=scrollbar.set)
@@ -452,7 +460,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self.results_text.yview_moveto(0.0)
 
     def _on_run_analysis_click(self) -> None:
-        """Upload the selected log to the Skybrush API and display the results."""
+        """Fetch the stored analysis of the log, uploading and analyzing it freshly when none exists yet."""
         if self._analysis_runner.active:
             return
 
