@@ -67,7 +67,6 @@ from ardupilot_methodic_configurator.frontend_tkinter_font import get_safe_font_
 from ardupilot_methodic_configurator.frontend_tkinter_log_availability import LogAvailabilityReportWindow
 from ardupilot_methodic_configurator.frontend_tkinter_mavlink_inspector import open_mavlink_inspector_window
 from ardupilot_methodic_configurator.frontend_tkinter_navigation_lock import NavigationLock
-from ardupilot_methodic_configurator.frontend_tkinter_paplan_log_analysis import PaplanLogAnalysisWindow
 from ardupilot_methodic_configurator.frontend_tkinter_parameter_compare_and_upload import ParameterFileUploadWindow
 from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor_documentation_frame import DocumentationFrame
 from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor_table import ParameterEditorTable
@@ -80,6 +79,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_progress_window import (
 from ardupilot_methodic_configurator.frontend_tkinter_rich_text import RichText, get_widget_font_family_and_size
 from ardupilot_methodic_configurator.frontend_tkinter_scroll_frame import ScrollFrame
 from ardupilot_methodic_configurator.frontend_tkinter_show import get_monitor_bounds, show_tooltip
+from ardupilot_methodic_configurator.frontend_tkinter_skybrush_log_analysis import SkybrushLogAnalysisWindow
 from ardupilot_methodic_configurator.frontend_tkinter_stage_progress import StageProgressBar
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_window import UsagePopupWindow
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_windows import (
@@ -404,7 +404,7 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
         self._close_pending = False
         self._param_download_progress_window: ProgressWindow | None = None
         self._log_availability_report_window: LogAvailabilityReportWindow | None = None
-        self._paplan_log_analysis_window: PaplanLogAnalysisWindow | None = None
+        self._skybrush_log_analysis_window: SkybrushLogAnalysisWindow | None = None
         self._log_analysis_running = False
         self._file_browser_window: FileBrowserWindow | None = None
         self._log_report_return_pending: bool = False
@@ -944,14 +944,14 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
         analyse_log_button.pack(side=tk.LEFT, padx=(8, 8))
         show_tooltip(analyse_log_button, _("Open a .bin flight log and analyse its availability"))
 
-        # Create Paplan log analysis button
-        paplan_log_button = ttk.Button(
+        # Create Skybrush log analysis button
+        skybrush_log_button = ttk.Button(
             buttons_frame,
-            text=_("Analyze log\nin Paplan"),
-            command=self.on_analyse_log_in_paplan_click,
+            text=_("Analyze log\nwith Skybrush"),
+            command=self.on_analyse_log_with_skybrush_click,
         )
-        paplan_log_button.pack(side=tk.LEFT, padx=(8, 8))
-        show_tooltip(paplan_log_button, _("Select a .bin flight log to open the Paplan analysis window"))
+        skybrush_log_button.pack(side=tk.LEFT, padx=(8, 8))
+        show_tooltip(skybrush_log_button, _("Select a .bin flight log to open the Skybrush log analysis window"))
 
         # Create Zip file for forum button
         zip_vehicle_for_forum_button = ttk.Button(
@@ -1104,15 +1104,15 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
             return
         self._analyse_log_file(filepath)
 
-    def on_analyse_log_in_paplan_click(self) -> None:
-        """Open the placeholder Paplan log analysis window for a selected log."""
+    def on_analyse_log_with_skybrush_click(self) -> None:
+        """Open the Skybrush log analysis window for a selected log."""
         filepath = self.ui.askopenfilename(
             title=_("Select a flight log"),
             filetypes=[(_("ArduPilot binary log files"), "*.bin"), (_("All files"), "*.*")],
         )
         if not filepath:
             return
-        self._paplan_log_analysis_window = PaplanLogAnalysisWindow(self.root, filepath)
+        self._skybrush_log_analysis_window = SkybrushLogAnalysisWindow(self.root, filepath)
 
     def _navigate_to_config_step(self, step: str) -> None:
         if self.navigation_lock.locked:

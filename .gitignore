@@ -37,3 +37,6 @@ sitl/git-version.txt
 
 tuning_report.csv
 .pytest*/
+
+.python-version
+uv.lock
