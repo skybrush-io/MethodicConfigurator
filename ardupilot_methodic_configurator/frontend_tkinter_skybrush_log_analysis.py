@@ -47,7 +47,7 @@ _ACCOUNT_URL = "https://account.skybrush.io"
 #: Serializes truststore aliasing when two background tasks start concurrently.
 _TRUSTSTORE_ALIAS_LOCK = Lock()
 
-#: Display color for each test-case status returned by the analysis service.
+#: Display color for each test-case status returned by the Skybrush API.
 _STATUS_COLOR = {
     "FAIL": "red3",
     "WARN": "dark orange",
@@ -110,8 +110,8 @@ _SKYBRUSH_ERROR_MESSAGES: tuple[tuple[type[Exception], str], ...] = (
         _("Not logged in to the Skybrush Account. Run 'skybrush-log-analyzer login' to configure an API key."),
     ),
     (InvalidAPIKey, _("The Skybrush API key is invalid or has been revoked. Create a new one at {account_url}.")),
-    (AccountUnreachable, _("Could not reach the Skybrush account server at {account_url}.")),
-    (ConfigError, _("Skybrush log analyzer configuration error: {message}")),
+    (AccountUnreachable, _("Could not reach the Skybrush Account server at {account_url}.")),
+    (ConfigError, _("Invalid 'skybrush-log-analyzer' configuration: {message}")),
     (BadRequest, _("The Skybrush API rejected the request: {message}")),
     (ServerError, _("The Skybrush API is currently unavailable.")),
     (ResponseParsingFailed, _("The Skybrush API returned an unexpected response.")),
@@ -119,12 +119,12 @@ _SKYBRUSH_ERROR_MESSAGES: tuple[tuple[type[Exception], str], ...] = (
 
 
 def _skybrush_error_message(error: Exception) -> str:
-    """Translate a Skybrush analyzer error into a localized, user-facing message."""
+    """Translate a Skybrush API error into a localized, user-facing message."""
     for error_type, message_template in _SKYBRUSH_ERROR_MESSAGES:
         if isinstance(error, error_type):
             details = error.message if isinstance(error, ApplicationErrorWithMessage) else str(error)
             return message_template.format(message=details, account_url=_ACCOUNT_URL)
-    return _("Skybrush log analysis failed: {error}").format(error=error)
+    return _("Skybrush API analysis failed: {error}").format(error=error)
 
 
 def _format_status_counts(counts: dict[str, int]) -> str:
@@ -138,7 +138,7 @@ def _format_test_message(message: dict[str, Any]) -> str:
     """Render a single test-case message, with a leading timestamp and a trailing value with unit."""
     text = message.get("text") or message.get("message")
     if not isinstance(text, str) or not text.strip():
-        # Fallback for unexpected message shapes returned by the service.
+        # Fallback for unexpected message shapes returned by the Skybrush API.
         rendered = "; ".join(f"{key}: {value}" for key, value in message.items() if isinstance(value, str))
         return rendered or str(message)
     timestamp = message.get("timestamp")
@@ -157,7 +157,7 @@ def _format_test_message(message: dict[str, Any]) -> str:
 
 
 class SkybrushLogAnalysisWindow(BaseWindow):
-    """Main window of Skybrush log analysis integration."""
+    """Main window of the Skybrush log analysis integration."""
 
     def __init__(self, root_tk: tk.Tk | tk.Toplevel, logfile: str) -> None:
         super().__init__(root_tk)
@@ -222,7 +222,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._open_account_button.pack(side=tk.LEFT)
         show_tooltip(
             self._open_account_button,
-            _("Open the Skybrush account page for registration, login and API key management"),
+            _("Open the Skybrush Account page for registration, login and API key management"),
         )
 
     def _build_footer(self) -> None:
@@ -280,7 +280,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self.results_text.yview_moveto(0.0)
 
     def _on_run_analysis_click(self) -> None:
-        """Upload the selected log to the Skybrush service and display the results."""
+        """Upload the selected log to the Skybrush API and display the results."""
         if self._analysis_runner.active:
             return
 
@@ -300,7 +300,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self._set_status("")
 
     def _analyze_log_background(self) -> dict[str, Any]:
-        """Analyze the selected log with the Skybrush analyzer. Executed in a worker thread."""
+        """Analyze the selected log through the Skybrush API. Executed in a worker thread."""
         client, auth_client = _create_skybrush_clients()
         # Refresh the API token before the upload to avoid token expiration mid-operation.
         auth_client.refresh_token()
@@ -309,7 +309,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     def _on_analysis_done(self, result: object | None, error: Exception | None) -> None:
         self._run_analysis_button.configure(state="normal")
         if error is not None:
-            logging_error(_("Skybrush log analysis failed: %s"), error)
+            logging_error(_("Skybrush API analysis failed: %s"), error)
             self._show_analysis_error(_skybrush_error_message(error))
             return
         if not isinstance(result, dict):
@@ -319,18 +319,18 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._set_status(_("Analysis completed"))
 
     def _on_open_in_browser_click(self) -> None:
-        """Open the Skybrush Log Analyzer web interface in the default browser."""
+        """Open the Skybrush Log Analyzer in the default browser."""
         if self._web_login_runner.active:
             return
 
         self._open_web_button.configure(state="disabled")
-        self._set_status(_("Requesting a log-in link for the Skybrush Log Analyzer web interface"))
+        self._set_status(_("Requesting a log-in link for the Skybrush Log Analyzer"))
         if not self._web_login_runner.start(lambda _progress: self._fetch_web_login_url(), None, self._on_web_login_done):
             self._open_web_button.configure(state="normal")
             self._set_status("")
 
     def _fetch_web_login_url(self) -> str:
-        """Acquire a single-sign-on URL for the Skybrush Log Analyzer web interface. Worker thread."""
+        """Acquire a single-sign-on URL for the Skybrush Log Analyzer. Worker thread."""
         client, _auth_client = _create_skybrush_clients()
         return cast("str", client.get_web_login_url())
 
@@ -369,7 +369,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         app_version = result.get("app_version")
         paplan_version = result.get("paplan_version")
         if paplan_version:
-            version_text = _("Skybrush API version: {version} (test core version: {paplan_version})").format(
+            version_text = _("Skybrush API version: {version} (backend core: {paplan_version})").format(
                 version=app_version or "?", paplan_version=paplan_version
             )
         else:
@@ -382,10 +382,10 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._auth_status_label.configure(text=text, foreground=color)
 
     def _on_open_account_click(self) -> None:
-        """Open the Skybrush account page in the default browser (analyzer 'account' command equivalent)."""
+        """Open the Skybrush Account page in the default browser (analyzer 'account' command equivalent)."""
         url = load_config().account_url
         if webbrowser_open_url(url):
-            self._set_status(_("Skybrush account page opened in the default browser"))
+            self._set_status(_("Skybrush Account page opened in the default browser"))
         else:
             messagebox.showerror(
                 _("Skybrush Log Analysis"),
@@ -409,7 +409,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             )
             return
         if webbrowser_open_url(result):
-            self._set_status(_("Skybrush Log Analyzer web interface opened in the default browser"))
+            self._set_status(_("Skybrush Log Analyzer opened in the default browser"))
         else:
             messagebox.showerror(
                 _("Skybrush Log Analysis"),

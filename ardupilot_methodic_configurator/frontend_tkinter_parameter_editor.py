@@ -941,7 +941,7 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
             command=self.on_analyse_log_with_skybrush_click,
         )
         skybrush_log_button.pack(side=tk.LEFT, padx=(8, 8))
-        show_tooltip(skybrush_log_button, _("Select a .bin flight log to open the Skybrush log analysis window"))
+        show_tooltip(skybrush_log_button, _("Select a .bin flight log to open the Skybrush Log Analysis window"))
         # Create skip buttons
         self.skip_button = ttk.Button(buttons_frame, text=_("Skip >"), command=self.on_skip_click)
         self.skip_button.configure(
@@ -1077,7 +1077,7 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
         self._analyse_log_file(filepath)
 
     def on_analyse_log_with_skybrush_click(self) -> None:
-        """Open the Skybrush log analysis window for a selected log."""
+        """Open the Skybrush Log Analysis window for a selected log."""
         filepath = self.ui.askopenfilename(
             title=_("Select a flight log"),
             filetypes=[(_("ArduPilot binary log files"), "*.bin"), (_("All files"), "*.*")],
