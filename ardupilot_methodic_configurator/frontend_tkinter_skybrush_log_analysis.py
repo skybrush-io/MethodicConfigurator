@@ -11,11 +11,13 @@ SPDX-License-Identifier: GPL-3.0-or-later
 import ssl
 import sys
 import tkinter as tk
+from collections.abc import Callable
+from contextlib import suppress
 from logging import debug as logging_debug
 from logging import error as logging_error
 from pathlib import Path
 from threading import Lock
-from tkinter import messagebox, ttk
+from tkinter import Toplevel, messagebox, ttk
 from typing import TYPE_CHECKING, Any, cast
 
 from skybrush_log_analyzer.analysis import to_agent_view
@@ -30,8 +32,9 @@ from skybrush_log_analyzer.errors import (
     ServerError,
     Unauthenticated,
 )
+from skybrush_log_analyzer.utils import calculate_file_hash
 
-from ardupilot_methodic_configurator import _
+from ardupilot_methodic_configurator import _, __version__
 from ardupilot_methodic_configurator.backend_internet import webbrowser_open_url
 from ardupilot_methodic_configurator.formatting import format_elapsed_time
 from ardupilot_methodic_configurator.frontend_tkinter_base_window import BaseWindow
@@ -41,6 +44,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_show import show_tooltip
 if TYPE_CHECKING:
     from skybrush_log_analyzer.api_client import APIClient
     from skybrush_log_analyzer.auth_client import AuthClient
+    from skybrush_log_analyzer.typing import SuggestionCategory
 
 _ACCOUNT_URL = "https://account.skybrush.io"
 
@@ -127,6 +131,17 @@ def _skybrush_error_message(error: Exception) -> str:
     return _("Skybrush API analysis failed: {error}").format(error=error)
 
 
+def _format_api_version(version: dict[str, Any]) -> str:
+    """Format the Skybrush API version info into one display line."""
+    app_version = version.get("app_version") or "?"
+    backend_core = version.get("paplan_version")
+    if backend_core:
+        return _("Skybrush API version: {version} (backend core: {paplan_version})").format(
+            version=app_version, paplan_version=backend_core
+        )
+    return _("Skybrush API version: {version}").format(version=app_version)
+
+
 def _ordered_statuses(counts: dict[str, int]) -> list[str]:
     """Order test-case statuses by severity, then any unrecognized statuses alphabetically."""
     statuses = [status for status in _STATUS_DISPLAY_ORDER if status in counts]
@@ -176,6 +191,105 @@ def _format_test_message(message: dict[str, Any]) -> tuple[str, str]:
     return f"{text}:", bold
 
 
+class FeedbackDialog:
+    """Modal dialog that collects user feedback and submits it to the Skybrush team (analyzer 'suggest')."""
+
+    #: Categories accepted by the Skybrush suggestion endpoint, most relevant for analysis results first.
+    CATEGORIES = ("bug", "test_case", "improvement", "feature", "other")
+
+    def __init__(
+        self,
+        parent: tk.Tk | Toplevel,
+        submit: Callable[[str, str, str, Callable[[object | None, Exception | None], None]], bool],
+    ) -> None:
+        self._parent = parent
+        self._submit = submit
+        self._root = Toplevel(parent)
+        self._root.title(_("Send feedback"))
+        self._root.geometry(f"+{parent.winfo_rootx() + 80}+{parent.winfo_rooty() + 80}")
+
+        instructions = _(
+            "Technical, self-contained feedback helps the Skybrush team the most.\n"
+            "Describe what you did, what you expected, and what actually happened.\n"
+            "Reference affected test names, measured values and log messages where relevant.\n"
+            "If you miss a check, describe the new test that should examine the log (category 'test_case').\n"
+            "Never include secrets such as passwords, tokens or API keys.\n"
+            "The flight log name and its hash, plus version info, are appended automatically."
+        )
+        body = ttk.Frame(self._root)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=(12, 8))
+
+        header = ttk.Frame(body)
+        header.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(header, text=_("Send feedback"), font=("TkDefaultFont", 14, "bold")).pack(anchor=tk.W)
+        ttk.Label(header, text=instructions, foreground="gray50").pack(anchor=tk.W, pady=(4, 10))
+
+        ttk.Label(body, text=_("Category")).pack(anchor=tk.W)
+        self._category: str = self.CATEGORIES[0]
+        category_box = ttk.Combobox(body, values=self.CATEGORIES, state="readonly", width=20)
+        category_box.set(self._category)
+        category_box.pack(anchor=tk.W, fill=tk.X, pady=(0, 8))
+        category_box.bind("<<ComboboxSelected>>", self._on_category_selected)
+
+        ttk.Label(body, text=_("Title")).pack(anchor=tk.W)
+        self._title_entry = ttk.Entry(body)
+        self._title_entry.pack(anchor=tk.W, fill=tk.X, pady=(0, 8))
+
+        ttk.Label(body, text=_("Description")).pack(anchor=tk.W)
+        self._description_text = tk.Text(body, wrap=tk.WORD, height=8)
+        self._description_text.pack(anchor=tk.W, fill=tk.BOTH, expand=True, pady=(0, 4))
+
+        actions = ttk.Frame(body)
+        actions.pack(side=tk.BOTTOM, fill=tk.X)
+        self._progress_label = ttk.Label(actions, text="")
+        self._progress_label.pack(side=tk.LEFT)
+        ttk.Button(actions, text=_("Cancel"), command=self._root.destroy).pack(side=tk.RIGHT)
+        self._submit_button = ttk.Button(actions, text=_("Submit"), command=self._on_submit_click)
+        self._submit_button.pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _on_category_selected(self, event: "tk.Event[ttk.Combobox]") -> None:
+        self._category = str(event.widget.get())
+
+    def show(self) -> None:
+        """Show the dialog modally."""
+        self._root.transient(self._parent)
+        self._root.grab_set()
+        self._root.focus_set()
+        self._parent.wait_window(self._root)
+
+    def _on_submit_click(self) -> None:
+        """Validate the input and hand the suggestion over to the background submission runner."""
+        title = self._title_entry.get().strip()
+        description = self._description_text.get("1.0", tk.END).strip()
+        if not 1 <= len(title) <= 100 or not description:
+            message = (
+                _("Please provide a title between 1 and 100 characters.")
+                if not 1 <= len(title) <= 100
+                else _("Please describe the issue in the description field.")
+            )
+            messagebox.showerror(_("Send feedback"), message, parent=self._root)
+            return
+        if not self._submit(self._category, title, description, self._on_submitted):
+            return
+        self._submit_button.configure(state="disabled")
+        self._progress_label.configure(text=_("Sending feedback to the Skybrush team..."))
+
+    def _on_submitted(self, result: object | None, error: Exception | None) -> None:
+        if not self._root.winfo_exists():
+            return
+        self._submit_button.configure(state="normal")
+        self._progress_label.configure(text="")
+        if error is not None:
+            messagebox.showerror(_("Send feedback"), _skybrush_error_message(error), parent=self._root)
+            return
+        suggestion_id = result.get("id") if isinstance(result, dict) else None
+        detail = _("Thank you for your feedback! The Skybrush team will review your suggestion.")
+        if isinstance(suggestion_id, int):
+            detail = f"{detail} (#{suggestion_id})"
+        messagebox.showinfo(_("Send feedback"), detail, parent=self._root)
+        self._root.destroy()
+
+
 class SkybrushLogAnalysisWindow(BaseWindow):
     """Main window of the Skybrush log analysis integration."""
 
@@ -185,6 +299,9 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._analysis_runner = BackgroundTaskRunner(self.root.after)
         self._web_login_runner = BackgroundTaskRunner(self.root.after)
         self._auth_runner = BackgroundTaskRunner(self.root.after)
+        self._feedback_runner = BackgroundTaskRunner(self.root.after)
+        self._analysis_reused = False
+        self._version_info: dict[str, Any] = {}
 
         self.root.title(_("Skybrush Log Analysis"))
         self.root.geometry(self.calculate_scaled_geometry(1050, 800))
@@ -239,10 +356,17 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         )
 
         self._open_account_button = ttk.Button(actions, text=_("Open Skybrush Account"), command=self._on_open_account_click)
-        self._open_account_button.pack(side=tk.LEFT)
+        self._open_account_button.pack(side=tk.LEFT, padx=(8, 0))
         show_tooltip(
             self._open_account_button,
             _("Open the Skybrush Account page for registration, login and API key management"),
+        )
+
+        self._feedback_button = ttk.Button(actions, text=_("Send feedback"), command=self._on_send_feedback_click)
+        self._feedback_button.pack(side=tk.LEFT, padx=(8, 0))
+        show_tooltip(
+            self._feedback_button,
+            _("Report a suspicious analysis result or suggest an improvement directly to the Skybrush team"),
         )
 
     def _build_footer(self) -> None:
@@ -317,17 +441,32 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             return
 
         self._run_analysis_button.configure(state="disabled")
-        self._set_status(_("Uploading log and running analysis through the Skybrush API - this can take a while"))
-        if not self._analysis_runner.start(lambda _progress: self._analyze_log_background(), None, self._on_analysis_done):
+        self._set_status(_("Fetching the existing analysis from the Skybrush account"))
+        if not self._analysis_runner.start(self._fetch_or_upload_analysis, self._on_analysis_progress, self._on_analysis_done):
             self._run_analysis_button.configure(state="normal")
             self._set_status("")
 
-    def _analyze_log_background(self) -> dict[str, Any]:
-        """Analyze the selected log through the Skybrush API. Executed in a worker thread."""
+    def _on_analysis_progress(self, text: str) -> None:
+        """Show the background phase updates above the results window."""
+        self._set_status(text)
+
+    def _fetch_or_upload_analysis(self, report_progress: Callable[..., None]) -> dict[str, Any]:
+        """Reuse the stored account analysis when present, uploading the log otherwise. Worker thread."""
         client, auth_client = _create_skybrush_clients()
-        # Refresh the API token before the upload to avoid token expiration mid-operation.
+        # Refresh the API token before any request to avoid token expiration mid-operation.
         auth_client.refresh_token()
-        analysis = cast("dict[str, Any]", client.analyze(Path(self.logfile)))
+        logfile = Path(self.logfile)
+        try:
+            analysis = client.get_analysis(logfile)
+        except BadRequest:
+            # The by-hash lookup failing (404) means this log was never analyzed within the account.
+            analysis = None
+        if isinstance(analysis, dict) and analysis.get("test_results"):
+            self._analysis_reused = True
+            return _restore_pass_answers(cast("dict[str, Any]", to_agent_view(analysis)), analysis)
+        report_progress(_("Uploading log and running analysis through the Skybrush API - this can take a while"))
+        self._analysis_reused = False
+        analysis = cast("Any", client.analyze(logfile))
         return _restore_pass_answers(cast("dict[str, Any]", to_agent_view(analysis)), analysis)
 
     def _on_analysis_done(self, result: object | None, error: Exception | None) -> None:
@@ -340,7 +479,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self._show_analysis_error(_("The Skybrush API returned unexpected data."))
             return
         self._display_analysis_results(result)
-        self._set_status(_("Analysis completed"))
+        self._set_status(_("Existing Skybrush account analysis reused") if self._analysis_reused else _("Analysis completed"))
 
     def _on_open_in_browser_click(self) -> None:
         """Open the Skybrush Log Analyzer in the default browser."""
@@ -390,15 +529,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self._set_auth_status(_("The Skybrush API returned an unexpected response."), "red3")
             return
 
-        app_version = result.get("app_version")
-        paplan_version = result.get("paplan_version")
-        if paplan_version:
-            version_text = _("Skybrush API version: {version} (backend core: {paplan_version})").format(
-                version=app_version or "?", paplan_version=paplan_version
-            )
-        else:
-            version_text = _("Skybrush API version: {version}").format(version=app_version or "?")
-        self._version_label.configure(text=version_text, foreground="")
+        self._version_info = result
+        self._version_label.configure(text=_format_api_version(result), foreground="")
         self._set_auth_status(_("Authenticated at {account_url}").format(account_url=load_config().account_url), "dark green")
 
     def _set_auth_status(self, text: str, color: str) -> None:
@@ -416,6 +548,41 @@ class SkybrushLogAnalysisWindow(BaseWindow):
                 _("Could not open the default web browser."),
                 parent=self.root,
             )
+
+    def _on_send_feedback_click(self) -> None:
+        """Open the feedback dialog (analyzer 'suggest' command equivalent)."""
+
+        def submit(
+            category: str, title: str, description: str, on_done: Callable[[object | None, Exception | None], None]
+        ) -> bool:
+            return self._start_suggestion(category, title, description, on_done)
+
+        FeedbackDialog(self.root, submit).show()
+
+    def _start_suggestion(
+        self, category: str, title: str, description: str, on_done: Callable[[object | None, Exception | None], None]
+    ) -> bool:
+        """Submit the suggestion through the Skybrush API in the background."""
+        if self._feedback_runner.active:
+            return False
+        return self._feedback_runner.start(
+            lambda _progress: self._submit_suggestion(category, title, description), None, on_done
+        )
+
+    def _submit_suggestion(self, category: str, title: str, description: str) -> dict[str, Any]:
+        """Build a self-contained suggestion context and send it. Worker thread."""
+        content_lines = [description, "", "---"]
+        content_lines.append(_("ArduPilot Methodic Configurator {version}").format(version=__version__))
+        logfile = Path(self.logfile)
+        if logfile.is_file():
+            content_lines.append(_("Flight log: {filename}").format(filename=logfile.name))
+            with suppress(OSError):
+                content_lines.append(_("Log file SHA-256: {hash}").format(hash=calculate_file_hash(logfile.read_bytes())))
+        if self._version_info:
+            content_lines.append(_format_api_version(self._version_info))
+        client, _auth_client = _create_skybrush_clients()
+        result = client.suggest(category=cast("SuggestionCategory", category), title=title, content="\n".join(content_lines))
+        return cast("dict[str, Any]", result)
 
     def _on_web_login_done(self, result: object | None, error: Exception | None) -> None:
         self._open_web_button.configure(state="normal")
