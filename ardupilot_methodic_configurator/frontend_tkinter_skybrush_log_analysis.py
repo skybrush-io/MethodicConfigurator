@@ -127,20 +127,40 @@ def _skybrush_error_message(error: Exception) -> str:
     return _("Skybrush API analysis failed: {error}").format(error=error)
 
 
-def _format_status_counts(counts: dict[str, int]) -> str:
-    """Format test-case status counts in a stable, severity-first display order."""
+def _ordered_statuses(counts: dict[str, int]) -> list[str]:
+    """Order test-case statuses by severity, then any unrecognized statuses alphabetically."""
     statuses = [status for status in _STATUS_DISPLAY_ORDER if status in counts]
-    statuses += sorted(status for status in counts if status not in _STATUS_DISPLAY_ORDER)
-    return ", ".join(f"{status}: {counts[status]}" for status in statuses)
+    return statuses + sorted(status for status in counts if status not in _STATUS_DISPLAY_ORDER)
 
 
-def _format_test_message(message: dict[str, Any]) -> str:
-    """Render a single test-case message, with a leading timestamp and a trailing value with unit."""
+def _restore_pass_answers(view: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
+    """Re-attach the answer/value messages of PASS test results, omitted by the analyzer's agent view."""
+    answers: dict[str, list[dict[str, Any]]] = {}
+    for result in analysis.get("test_results") or []:
+        name = result.get("test_name")
+        messages = result.get("messages") or []
+        if not isinstance(name, str) or not messages or name in answers:
+            continue
+        answers[name] = [
+            {key: value for key, value in message.items() if key != "id" and value is not None}
+            for message in messages
+            if isinstance(message, dict)
+        ]
+    for result in view.get("test_results") or []:
+        if result.get("status") == "PASS" and not result.get("messages"):
+            messages = answers.get(result.get("test_name"))
+            if messages:
+                result["messages"] = messages
+    return view
+
+
+def _format_test_message(message: dict[str, Any]) -> tuple[str, str]:
+    """Render a test-case message into a plain part plus a bold trailing value-with-unit part."""
     text = message.get("text") or message.get("message")
     if not isinstance(text, str) or not text.strip():
         # Fallback for unexpected message shapes returned by the Skybrush API.
         rendered = "; ".join(f"{key}: {value}" for key, value in message.items() if isinstance(value, str))
-        return rendered or str(message)
+        return (rendered or str(message)), ""
     timestamp = message.get("timestamp")
     if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
         text = f"[{format_elapsed_time(timestamp)}] {text}"
@@ -148,12 +168,12 @@ def _format_test_message(message: dict[str, Any]) -> str:
         text = f"[{timestamp.strip()}] {text}"
     value = message.get("value")
     if value is None or str(value) == "":
-        return text
-    text = f"{text}: {value}"
+        return text, ""
+    bold = f" {value}"
     unit = message.get("unit")
     if isinstance(unit, str) and unit.strip():
-        return f"{text} {unit}"
-    return text
+        bold += f" {unit}"
+    return f"{text}:", bold
 
 
 class SkybrushLogAnalysisWindow(BaseWindow):
@@ -253,6 +273,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self.results_text.tag_configure(f"status_{status}", foreground=color)
         self.results_text.tag_configure("summary", font=("TkDefaultFont", 12, "bold"))
         self.results_text.tag_configure("heading", font=("TkDefaultFont", 14, "bold"))
+        self.results_text.tag_configure("bold", font=("TkDefaultFont", 12, "bold"))
         self.results_text.tag_configure("muted", foreground="gray50")
         self.results_text.tag_configure("bullet", foreground="#666666")
         self.results_text.tag_configure("error", foreground="red3")
@@ -269,11 +290,13 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self.results_text.configure(state=tk.NORMAL)
         self.results_text.delete("1.0", tk.END)
 
-    def _append_results_text(self, text: str, tag: str | None = None) -> None:
+    def _append_results_text(self, text: str, tag: str | tuple[str, ...] | None = None) -> None:
         if tag is None:
             self.results_text.insert(tk.END, text)
         else:
-            self.results_text.insert(tk.END, text, tag)
+            tags = (tag,) if isinstance(tag, str) else tag
+            # tags given as one Tcl list argument - multiple varargs would be read as extra chars.
+            self.results_text.insert(tk.END, text, " ".join(tags))
 
     def _finish_results_text(self) -> None:
         self.results_text.configure(state=tk.DISABLED)
@@ -304,7 +327,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         client, auth_client = _create_skybrush_clients()
         # Refresh the API token before the upload to avoid token expiration mid-operation.
         auth_client.refresh_token()
-        return cast("dict[str, Any]", to_agent_view(client.analyze(Path(self.logfile))))
+        analysis = cast("dict[str, Any]", client.analyze(Path(self.logfile)))
+        return _restore_pass_answers(cast("dict[str, Any]", to_agent_view(analysis)), analysis)
 
     def _on_analysis_done(self, result: object | None, error: Exception | None) -> None:
         self._run_analysis_button.configure(state="normal")
@@ -437,9 +461,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
         counts: dict[str, int] = view.get("status_counts") or {}
         if counts:
-            self._append_results_text(
-                _("Test cases: {counts}").format(counts=_format_status_counts(counts)) + "\n\n", "summary"
-            )
+            self._append_status_counts(counts)
 
         test_results = view.get("test_results") or []
         if not test_results:
@@ -453,14 +475,31 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
         self._finish_results_text()
 
+    def _append_status_counts(self, counts: dict[str, int]) -> None:
+        """Append the summary line, coloring each 'STATUS: n' segment with its status color."""
+        self._append_results_text(_("Test cases: "), "summary")
+        for index, status in enumerate(_ordered_statuses(counts)):
+            if index:
+                self._append_results_text(", ", "summary")
+            self._append_results_text(f"{status}: {counts[status]}", ("summary", f"status_{status}"))
+        self._append_results_text("\n\n", "summary")
+
     def _append_result(self, result: dict[str, Any]) -> None:
         status = str(result.get("status") or "UNKNOWN")
-        name = str(result.get("test_name") or "")
+        name = str(result.get("test_name") or "").removeprefix("paplan.tests.").removeprefix("paplan.tests:")
         title = result.get("title")
         line = f"[{status}] {name}"
         if isinstance(title, str) and title:
             line += f" - {title}"
-        self._append_results_text(line + "\n", f"status_{status}")
+        color_tag = f"status_{status}" if status in _STATUS_COLOR else "muted"
+        self._append_results_text(line + "\n", color_tag)
         for message in result.get("messages") or []:
-            self._append_results_text(f"    \u2022 {_format_test_message(message)}\n", "bullet")
+            # Each answer line carries its own severity: color it like the status line would be.
+            severity = str(message.get("severity") or "").upper()
+            severity_tag = f"status_{severity}" if severity in _STATUS_COLOR else "bullet"
+            plain, bold = _format_test_message(message)
+            self._append_results_text(f"    \u2022 {plain}", severity_tag)
+            if bold:
+                self._append_results_text(bold, f"{severity_tag} bold")
+            self._append_results_text("\n", severity_tag)
         self._append_results_text("\n")
