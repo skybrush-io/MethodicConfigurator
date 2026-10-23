@@ -142,6 +142,26 @@ def _format_api_version(version: dict[str, Any]) -> str:
     return _("Skybrush API version: {version}").format(version=app_version)
 
 
+def _version_tuple(version: object) -> tuple[int, ...] | None:
+    """Parse a dotted version string into comparable integers; None when it is not parsable."""
+    if not isinstance(version, str) or not version.strip():
+        return None
+    try:
+        return tuple(int(part) for part in version.strip().split("."))
+    except ValueError:
+        return None
+
+
+def _stored_analysis_is_stale(analysis: dict[str, Any], current_version: dict[str, Any]) -> tuple[bool, str, str]:
+    """Whether stored results were produced by an older backend core than the Skybrush API currently runs."""
+    stored_core = str(analysis.get("paplan_version") or "")
+    current_core = str(current_version.get("paplan_version") or "")
+    stored_tuple = _version_tuple(stored_core)
+    current_tuple = _version_tuple(current_core)
+    is_stale = bool(stored_tuple and current_tuple and stored_tuple < current_tuple)
+    return is_stale, stored_core, current_core
+
+
 def _ordered_statuses(counts: dict[str, int]) -> list[str]:
     """Order test-case statuses by severity, then any unrecognized statuses alphabetically."""
     statuses = [status for status in _STATUS_DISPLAY_ORDER if status in counts]
@@ -304,6 +324,9 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._version_info: dict[str, Any] = {}
         #: True while the header version/log-in state has never been fetched successfully.
         self._version_check_pending = True
+        self._force_refresh = False
+        self._analysis_is_stale = False
+        self._stale_version_details: tuple[str, str] = ("", "")
 
         self.root.title(_("Skybrush Log Analysis"))
         self.root.geometry(self.calculate_scaled_geometry(1050, 800))
@@ -457,14 +480,26 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         client, auth_client = _create_skybrush_clients()
         # Refresh the API token before any request to avoid token expiration mid-operation.
         auth_client.refresh_token()
+        force_refresh = self._force_refresh
+        self._force_refresh = False
+        self._analysis_is_stale = False
         logfile = Path(self.logfile)
-        try:
-            analysis = client.get_analysis(logfile)
-        except BadRequest:
-            # The by-hash lookup failing (404) means this log was never analyzed within the account.
-            analysis = None
+        analysis = None
+        if not force_refresh:
+            try:
+                analysis = client.get_analysis(logfile)
+            except BadRequest:
+                # The by-hash lookup failing (404) means this log was never analyzed within the account.
+                analysis = None
         if isinstance(analysis, dict) and analysis.get("test_results"):
             self._analysis_reused = True
+            try:
+                current_version = cast("dict[str, Any]", client.version())
+            except Exception as exception:  # pylint: disable=broad-exception-caught
+                logging_debug(_("Fetching the Skybrush API version failed: %s"), exception)
+                current_version = {}
+            self._analysis_is_stale, stored_core, current_core = _stored_analysis_is_stale(analysis, current_version)
+            self._stale_version_details = (stored_core, current_core)
             return _restore_pass_answers(cast("dict[str, Any]", to_agent_view(analysis)), analysis)
         report_progress(_("Uploading log and running analysis through the Skybrush API - this can take a while"))
         self._analysis_reused = False
@@ -482,8 +517,25 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             return
         self._display_analysis_results(result)
         self._set_status(_("Existing Skybrush log analysis reused") if self._analysis_reused else _("Analysis completed"))
+        if self._analysis_reused and self._analysis_is_stale:
+            self._offer_fresh_analysis()
         # Successful server communication: silently retry a header version check that failed earlier.
         self._retry_pending_version_check()
+
+    def _offer_fresh_analysis(self) -> None:
+        """Ask the user whether to re-run an analysis that an older backend core produced."""
+        stored_core, current_core = self._stale_version_details
+        if messagebox.askyesno(
+            _("Skybrush Log Analysis"),
+            _(
+                "This log was analyzed with backend core {stored},"
+                " but the Skybrush API now runs backend core {current}.\n\n"
+                "Re-run the analysis with the current backend core?"
+            ).format(stored=stored_core or "?", current=current_core or "?"),
+            parent=self.root,
+        ):
+            self._force_refresh = True
+            self._on_run_analysis_click()
 
     def _on_open_in_browser_click(self) -> None:
         """Open the Skybrush Log Analyzer in the default browser."""
