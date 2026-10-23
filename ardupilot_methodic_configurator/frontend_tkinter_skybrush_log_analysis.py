@@ -481,7 +481,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self._show_analysis_error(_("The Skybrush API returned unexpected data."))
             return
         self._display_analysis_results(result)
-        self._set_status(_("Existing Skybrush account analysis reused") if self._analysis_reused else _("Analysis completed"))
+        self._set_status(_("Existing Skybrush log analysis reused") if self._analysis_reused else _("Analysis completed"))
         # Successful server communication: silently retry a header version check that failed earlier.
         self._retry_pending_version_check()
 
