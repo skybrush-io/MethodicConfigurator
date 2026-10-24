@@ -102,7 +102,9 @@ def _align_truststore_with_system_cert_injection() -> None:
                 alias = f"truststore{name[len(prefix) :]}"
                 if sys.modules.get(alias) is not module:
                     sys.modules[alias] = module
-                    logging_debug(_("%s Aliasing module '%s' to '%s' to reuse the visible truststore copy"), _LOG_TAG, alias, name)
+                    logging_debug(
+                        _("%s Aliasing module '%s' to '%s' to reuse the visible truststore copy"), _LOG_TAG, alias, name
+                    )
 
 
 # ---------------- Skybrush API clients ----------------
@@ -125,7 +127,7 @@ def _create_skybrush_clients() -> tuple["APIClient", "AuthClient"]:
 _SKYBRUSH_ERROR_MESSAGES: tuple[tuple[type[Exception], str], ...] = (
     (
         Unauthenticated,
-        _("Not logged in to the Skybrush Account. Use the Login button to configure your API key."),
+        _("Not logged in. Use the Log in button to configure the API key."),
     ),
     (InvalidAPIKey, _("The Skybrush API key is invalid or has been revoked. Create a new one at {account_url}.")),
     (AccountUnreachable, _("Could not reach the Skybrush Account server at {account_url}.")),
@@ -371,7 +373,7 @@ class LoginDialog:
         developer_row.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(
             developer_row,
-            text=_("Open developer area"),
+            text=_("Open Skybrush Account"),
             command=lambda: webbrowser_open_url(self.DEVELOPER_AREA_URL),
         ).pack(side=tk.LEFT)
         ttk.Label(developer_row, text=_("Create or manage your API keys there"), foreground="gray50").pack(
@@ -478,7 +480,13 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         )
         self._version_label.pack(anchor=tk.W, pady=(4, 0))
         self._auth_status_label = ttk.Label(
-            left_column, text=_("Checking log-in status..."), font=("TkDefaultFont", 12), foreground="gray50"
+            left_column,
+            text=_("Checking log-in status..."),
+            font=("TkDefaultFont", 12),
+            foreground="gray50",
+            # Keep the status line narrow: an unwrapped 'not logged in' error message would widen the
+            # left column beyond the window width and the packer would then clip the button row.
+            wraplength=450,
         )
         self._auth_status_label.pack(anchor=tk.W)
 
@@ -506,15 +514,6 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         show_tooltip(
             self._open_web_button,
             _("Open the analysis of the selected log in the Skybrush Log Analyzer web application"),
-        )
-
-        self._open_account_button = ttk.Button(
-            buttons_row, text=_("Open Skybrush Account"), command=self._on_open_account_click
-        )
-        self._open_account_button.pack(side=tk.LEFT, padx=(8, 0))
-        show_tooltip(
-            self._open_account_button,
-            _("Open the Skybrush Account page for registration, login and API key management"),
         )
 
         self._feedback_button = ttk.Button(buttons_row, text=_("Send feedback"), command=self._on_send_feedback_click)
@@ -719,7 +718,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._run_analysis_button.configure(state="disabled")
         self._set_status(_("Fetching the existing analysis from the Skybrush account"))
         if not self._analysis_runner.start(self._fetch_or_upload_analysis, self._on_analysis_progress, self._on_analysis_done):
-            self._run_analysis_button.configure(state="normal")
+            self._update_action_buttons()
             self._set_status("")
 
     def _on_analysis_progress(self, text: str) -> None:
@@ -758,7 +757,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         return _restore_pass_answers(cast("dict[str, Any]", to_agent_view(analysis)), analysis)
 
     def _on_analysis_done(self, result: object | None, error: Exception | None) -> None:
-        self._run_analysis_button.configure(state="normal")
+        self._update_action_buttons()
         if error is not None:
             logging_error(_("%s Skybrush API analysis failed: %s"), _LOG_TAG, error)
             self._show_analysis_error(_skybrush_error_message(error))
@@ -791,7 +790,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     # ---------------- login / logout ----------------
 
     def _login_button_text(self) -> str:
-        return _("Log out") if self._logged_in else _("Login")
+        return _("Log out from Skybrush Account") if self._logged_in else _("Log in to Skybrush Account")
 
     def _login_button_tooltip_text(self) -> str:
         return (
@@ -801,9 +800,20 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         )
 
     def _update_login_button(self) -> None:
-        """Sync the header login/logout button label with the current authentication state."""
+        """Sync the header login/logout button label and the service buttons with the authentication state."""
         self._login_button.configure(text=self._login_button_text())
         self._login_tooltip.text = self._login_button_tooltip_text()
+        self._update_action_buttons()
+
+    def _update_action_buttons(self) -> None:
+        """Enable the Skybrush service buttons only when logged in; in-flight buttons stay disabled."""
+        state = "normal" if self._logged_in else "disabled"
+        if not self._analysis_runner.active:
+            self._run_analysis_button.configure(state=state)
+        if not self._web_login_runner.active:
+            self._open_web_button.configure(state=state)
+        if not self._feedback_runner.active:
+            self._feedback_button.configure(state=state)
 
     def _on_login_logout_click(self) -> None:
         """Open the login dialog or perform the logout (analyzer 'login'/'logout' equivalents)."""
@@ -887,7 +897,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._open_web_button.configure(state="disabled")
         self._set_status(_("Requesting a log-in link for the Skybrush Log Analyzer web application"))
         if not self._web_login_runner.start(lambda _progress: self._fetch_web_login_url(), None, self._on_web_login_done):
-            self._open_web_button.configure(state="normal")
+            self._update_action_buttons()
             self._set_status("")
 
     def _fetch_web_login_url(self) -> str:
@@ -901,7 +911,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         return cast("str", client.get_web_login_url(intent=intent))
 
     def _on_web_login_done(self, result: object | None, error: Exception | None) -> None:
-        self._open_web_button.configure(state="normal")
+        self._update_action_buttons()
         if error is not None:
             logging_error(_("%s Could not acquire a Skybrush web log-in link: %s"), _LOG_TAG, error)
             self._set_status("")
@@ -986,18 +996,6 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     def _set_auth_status(self, text: str, color: str) -> None:
         """Set the header log-in status line with its severity color."""
         self._auth_status_label.configure(text=text, foreground=color)
-
-    def _on_open_account_click(self) -> None:
-        """Open the Skybrush Account page in the default browser (analyzer 'account' command equivalent)."""
-        url = load_config().account_url
-        if webbrowser_open_url(url):
-            self._set_status(_("Skybrush Account page opened in the default browser"))
-        else:
-            messagebox.showerror(
-                _("Skybrush Log Analysis"),
-                _("Could not open the default web browser."),
-                parent=self.root,
-            )
 
     # ---------------- feedback (analyzer 'suggest' equivalent) ----------------
 
