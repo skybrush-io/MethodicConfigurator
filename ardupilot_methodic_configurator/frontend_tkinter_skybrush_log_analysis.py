@@ -65,6 +65,9 @@ _STATUS_COLOR = {
 _STATUS_DISPLAY_ORDER = ("FAIL", "WARN", "INFO", "PASS", "SKIP", "NOT_APPLICABLE")
 
 
+# ---------------- truststore handling ----------------
+
+
 def _align_truststore_with_system_cert_injection() -> None:
     """
     Point the `truststore` module at the copy already injected into ssl, to avoid a second injection.
@@ -97,6 +100,9 @@ def _align_truststore_with_system_cert_injection() -> None:
                     logging_debug(_("Aliasing module '%s' to '%s' to reuse the visible truststore copy"), alias, name)
 
 
+# ---------------- Skybrush API clients ----------------
+
+
 def _create_skybrush_clients() -> tuple["APIClient", "AuthClient"]:
     """Create Skybrush API and authentication clients from the local analyzer configuration."""
     _align_truststore_with_system_cert_injection()
@@ -106,6 +112,9 @@ def _create_skybrush_clients() -> tuple["APIClient", "AuthClient"]:
     config = load_config()
     auth_client = AuthClient(config)
     return APIClient(config, auth_client), auth_client
+
+
+# ---------------- Skybrush API error messages ----------------
 
 
 _SKYBRUSH_ERROR_MESSAGES: tuple[tuple[type[Exception], str], ...] = (
@@ -129,6 +138,9 @@ def _skybrush_error_message(error: Exception) -> str:
             details = error.message if isinstance(error, ApplicationErrorWithMessage) else str(error)
             return message_template.format(message=details, account_url=_ACCOUNT_URL)
     return _("Skybrush API analysis failed: {error}").format(error=error)
+
+
+# ---------------- display formatting helpers ----------------
 
 
 def _format_api_version(version: dict[str, Any]) -> str:
@@ -209,6 +221,9 @@ def _format_test_message(message: dict[str, Any]) -> tuple[str, str]:
     if isinstance(unit, str) and unit.strip():
         bold += f" {unit}"
     return f"{text}:", bold
+
+
+# ---------------- feedback dialog ----------------
 
 
 class FeedbackDialog:
@@ -333,6 +348,13 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._force_refresh = False
         self._analysis_is_stale = False
         self._stale_version_details: tuple[str, str] = ("", "")
+        self._find_bar: ttk.Frame | None = None
+        self._find_entry: ttk.Entry | None = None
+        self._find_count_label: ttk.Label | None = None
+        self._find_matches: list[tuple[str, str]] = []
+        self._find_index = -1
+        self._last_find_query: str | None = None
+        self._find_bar_visible = False
 
         self.root.title(_("Skybrush Log Analysis"))
         self.root.geometry(self.calculate_scaled_geometry(1050, 800))
@@ -343,6 +365,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._build_footer()
         self._build_results_area()
         self._start_header_status_checks()
+
+    # ---------------- window layout ----------------
 
     def _build_header(self) -> None:
         header = ttk.Frame(self.main_frame)
@@ -420,6 +444,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     def _build_results_area(self) -> None:
         results_row = ttk.Frame(self.main_frame)
         results_row.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(0, 8))
+        self._results_row = results_row
 
         self.results_text = tk.Text(
             results_row,
@@ -443,10 +468,19 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self.results_text.tag_configure("muted", foreground="gray50")
         self.results_text.tag_configure("bullet", foreground="#666666")
         self.results_text.tag_configure("error", foreground="red3")
+        self.results_text.tag_configure("search_all", background="#fff3a0")
+        self.results_text.tag_configure("search_current", background="#ffb36b")
+
+        self.root.bind("<Control-f>", self._show_find_bar)
+        self.root.bind("<F3>", self._on_find_next_key)
+        self.root.bind("<Shift-F3>", self._on_find_prev_key)
+        self.root.bind("<Escape>", self._on_escape_key)
 
         self._replace_results_text()
         self._append_results_text(_("No analysis results yet - click 'Run analysis' to analyze the selected log.\n"), "muted")
         self._finish_results_text()
+
+    # ---------------- results text helpers ----------------
 
     def _set_status(self, text: str) -> None:
         """Update the status line above the results text window."""
@@ -467,6 +501,111 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     def _finish_results_text(self) -> None:
         self.results_text.configure(state=tk.DISABLED)
         self.results_text.yview_moveto(0.0)
+        if self._find_bar_visible:
+            self._refresh_find_matches(jump=False)
+
+    # ---------------- find bar (Ctrl-F) ----------------
+
+    def _show_find_bar(self, _event: object | None = None) -> None:
+        """Show the browser-like find bar above the results text and focus its field."""
+        if self._find_bar is None:
+            self._find_bar = ttk.Frame(self.main_frame)
+            ttk.Label(self._find_bar, text=_("Find:")).pack(side=tk.LEFT)
+            self._find_entry = ttk.Entry(self._find_bar)
+            self._find_entry.pack(side=tk.LEFT, padx=(6, 8), fill=tk.X, expand=True)
+            self._find_count_label = ttk.Label(self._find_bar, foreground="gray50")
+            self._find_count_label.pack(side=tk.LEFT)
+            self._find_entry.bind("<Return>", lambda _event: self._jump_to_match(1))
+            self._find_entry.bind("<Shift-Return>", lambda _event: self._jump_to_match(-1))
+            self._find_entry.bind("<Escape>", lambda _event: self._hide_find_bar())
+            self._find_entry.bind("<KeyRelease>", self._on_find_query_changed)
+            ttk.Button(self._find_bar, text="\u2715", width=3, command=self._hide_find_bar).pack(side=tk.RIGHT, padx=(6, 0))
+            ttk.Button(self._find_bar, text="\u2193", width=3, command=lambda: self._jump_to_match(1)).pack(side=tk.RIGHT)
+            ttk.Button(self._find_bar, text="\u2191", width=3, command=lambda: self._jump_to_match(-1)).pack(side=tk.RIGHT)
+        self._find_bar.pack_configure(side=tk.TOP, fill=tk.X, before=self._results_row, padx=20, pady=(0, 8))
+        self._find_bar_visible = True
+        if self._find_entry is not None:
+            self._find_entry.focus_set()
+            self._find_entry.select_range(0, tk.END)
+            self._refresh_find_matches(jump=self._find_entry.get() != "")
+
+    def _hide_find_bar(self) -> None:
+        """Remove the find bar and all of its highlights."""
+        self._find_bar_visible = False
+        self._find_index = -1
+        self._find_matches = []
+        self._clear_find_highlights()
+        if self._find_bar is not None:
+            self._find_bar.pack_forget()
+
+    def _clear_find_highlights(self) -> None:
+        self.results_text.tag_remove("search_all", "1.0", tk.END)
+        self.results_text.tag_remove("search_current", "1.0", tk.END)
+        self.results_text.tag_remove("sel", "1.0", tk.END)
+        if self._find_count_label is not None:
+            self._find_count_label.configure(text="")
+
+    def _on_find_query_changed(self, _event: "tk.Event[tk.Entry]") -> None:
+        """Re-run the search only when the query text actually changed (e.g. not on F3/arrow key releases)."""
+        current = self._find_entry.get() if self._find_entry is not None else ""
+        if current == self._last_find_query:
+            return
+        self._refresh_find_matches(jump=True)
+
+    def _refresh_find_matches(self, jump: bool) -> None:
+        """Locate and highlight all occurrences of the find-bar query."""
+        self._clear_find_highlights()
+        self._find_matches = []
+        self._find_index = -1
+        query = self._find_entry.get() if self._find_entry is not None else ""
+        self._last_find_query = query
+        if not query:
+            return
+        widget = self.results_text
+        matches: list[tuple[str, str]] = []
+        start = str(widget.search(query, "1.0", nocase=True, stopindex=tk.END))
+        while start:
+            end = f"{start}+{len(query)}c"
+            matches.append((start, end))
+            widget.tag_add("search_all", start, end)
+            start = str(widget.search(query, end, nocase=True, stopindex=tk.END))
+        self._find_matches = matches
+        if not matches:
+            if self._find_count_label is not None:
+                self._find_count_label.configure(text=_("No matches"))
+            return
+        if jump:
+            self._jump_to_match(1)
+
+    def _jump_to_match(self, step: int) -> None:
+        """Select, highlight and scroll to the next/previous match, wrapping around."""
+        total = len(self._find_matches)
+        if total == 0:
+            return
+        self._find_index = (self._find_index + step) % total
+        start, end = self._find_matches[self._find_index]
+        self.results_text.tag_remove("search_current", "1.0", tk.END)
+        self.results_text.tag_add("search_current", start, end)
+        self.results_text.tag_remove("sel", "1.0", tk.END)
+        self.results_text.tag_add("sel", start, end)
+        self.results_text.see(end)
+        self.results_text.see(start)
+        if self._find_count_label is not None:
+            self._find_count_label.configure(text=f"{self._find_index + 1}/{total}")
+
+    def _on_find_next_key(self, _event: object) -> None:
+        if self._find_bar_visible:
+            self._jump_to_match(1)
+
+    def _on_find_prev_key(self, _event: object) -> None:
+        if self._find_bar_visible:
+            self._jump_to_match(-1)
+
+    def _on_escape_key(self, _event: object) -> None:
+        if self._find_bar_visible:
+            self._hide_find_bar()
+
+    # ---------------- analysis run ----------------
 
     def _on_run_analysis_click(self) -> None:
         """Fetch the stored analysis of the log, uploading and analyzing it freshly when none exists yet."""
@@ -554,6 +693,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self._force_refresh = True
             self._on_run_analysis_click()
 
+    # ---------------- browser links ----------------
+
     def _on_open_in_browser_click(self) -> None:
         """Open the analysis of the selected log in the Skybrush Log Analyzer in the default browser."""
         if self._web_login_runner.active:
@@ -574,6 +715,34 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             # No stored analysis for this log within the account; open the generic analyzer view.
             intent = None
         return cast("str", client.get_web_login_url(intent=intent))
+
+    def _on_web_login_done(self, result: object | None, error: Exception | None) -> None:
+        self._open_web_button.configure(state="normal")
+        if error is not None:
+            logging_error(_("Could not acquire a Skybrush web log-in link: %s"), error)
+            self._set_status("")
+            messagebox.showerror(_("Skybrush Log Analysis"), _skybrush_error_message(error), parent=self.root)
+            return
+        if not isinstance(result, str) or not result:
+            self._set_status("")
+            messagebox.showerror(
+                _("Skybrush Log Analysis"),
+                _("The Skybrush API returned an unexpected response."),
+                parent=self.root,
+            )
+            return
+        # Acquiring the login link proves the server was reached; retry a pending header version check.
+        self._retry_pending_version_check()
+        if webbrowser_open_url(result):
+            self._set_status(_("Skybrush Log Analyzer opened in the default browser"))
+        else:
+            messagebox.showerror(
+                _("Skybrush Log Analysis"),
+                _("Could not open the default web browser."),
+                parent=self.root,
+            )
+
+    # ---------------- header status checks ----------------
 
     def _start_header_status_checks(self) -> None:
         """Fill the header version/log-in labels; the network part runs as background tasks."""
@@ -633,6 +802,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
                 parent=self.root,
             )
 
+    # ---------------- feedback (analyzer 'suggest' equivalent) ----------------
+
     def _on_send_feedback_click(self) -> None:
         """Open the feedback dialog (analyzer 'suggest' command equivalent)."""
 
@@ -675,31 +846,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         result = client.suggest(category=cast("SuggestionCategory", category), title=title, content="\n".join(content_lines))
         return cast("dict[str, Any]", result)
 
-    def _on_web_login_done(self, result: object | None, error: Exception | None) -> None:
-        self._open_web_button.configure(state="normal")
-        if error is not None:
-            logging_error(_("Could not acquire a Skybrush web log-in link: %s"), error)
-            self._set_status("")
-            messagebox.showerror(_("Skybrush Log Analysis"), _skybrush_error_message(error), parent=self.root)
-            return
-        if not isinstance(result, str) or not result:
-            self._set_status("")
-            messagebox.showerror(
-                _("Skybrush Log Analysis"),
-                _("The Skybrush API returned an unexpected response."),
-                parent=self.root,
-            )
-            return
-        # Acquiring the login link proves the server was reached; retry a pending header version check.
-        self._retry_pending_version_check()
-        if webbrowser_open_url(result):
-            self._set_status(_("Skybrush Log Analyzer opened in the default browser"))
-        else:
-            messagebox.showerror(
-                _("Skybrush Log Analysis"),
-                _("Could not open the default web browser."),
-                parent=self.root,
-            )
+    # ---------------- results rendering ----------------
 
     def _show_analysis_error(self, message: str) -> None:
         self._set_status("")
