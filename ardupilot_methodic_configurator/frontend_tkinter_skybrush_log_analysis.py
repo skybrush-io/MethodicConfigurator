@@ -256,8 +256,8 @@ class FeedbackDialog:
             "Never include secrets such as passwords, tokens or API keys.\n"
             "The flight log name and its hash, plus version info, are appended automatically."
         )
-        body = ttk.Frame(self._root)
-        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=(12, 8))
+        body = ttk.Frame(self._root, padding=(16, 12, 16, 12))
+        body.pack(fill=tk.BOTH, expand=True)
 
         header = ttk.Frame(body)
         header.pack(side=tk.TOP, fill=tk.X)
