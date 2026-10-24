@@ -120,7 +120,7 @@ def _create_skybrush_clients() -> tuple["APIClient", "AuthClient"]:
 _SKYBRUSH_ERROR_MESSAGES: tuple[tuple[type[Exception], str], ...] = (
     (
         Unauthenticated,
-        _("Not logged in to the Skybrush Account. Run 'skybrush-log-analyzer login' to configure an API key."),
+        _("Not logged in to the Skybrush Account. Use the Login button to configure your API key."),
     ),
     (InvalidAPIKey, _("The Skybrush API key is invalid or has been revoked. Create a new one at {account_url}.")),
     (AccountUnreachable, _("Could not reach the Skybrush Account server at {account_url}.")),
@@ -331,6 +331,90 @@ class FeedbackDialog:
         self._root.destroy()
 
 
+# ---------------- login dialog ----------------
+
+
+class LoginDialog:
+    """Modal dialog that stores the Skybrush API key (analyzer 'login --api-key' equivalent)."""
+
+    #: The account area where users can generate and revoke API keys.
+    DEVELOPER_AREA_URL = "https://account.skybrush.io/developer"
+
+    def __init__(
+        self, parent: tk.Tk | Toplevel, login: Callable[[str, Callable[[object | None, Exception | None], None]], bool]
+    ) -> None:
+        self._parent = parent
+        self._login = login
+        self._root = Toplevel(parent)
+        self._root.title(_("Log in"))
+        self._root.geometry(f"+{parent.winfo_rootx() + 80}+{parent.winfo_rooty() + 80}")
+        self._root.minsize(400, 0)
+
+        instructions = _(
+            "A Skybrush API key is required to analyze flight logs.\n"
+            "Generate it in the Skybrush Account developer area, then paste it here."
+        )
+        body = ttk.Frame(self._root, padding=(16, 12, 16, 12))
+        body.pack(fill=tk.BOTH, expand=True)
+
+        header = ttk.Frame(body)
+        header.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(header, text=_("Log in"), font=("TkDefaultFont", 14, "bold")).pack(anchor=tk.W)
+        ttk.Label(header, text=instructions, foreground="gray50").pack(anchor=tk.W, pady=(4, 10))
+
+        developer_row = ttk.Frame(body)
+        developer_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(
+            developer_row,
+            text=_("Open developer area"),
+            command=lambda: webbrowser_open_url(self.DEVELOPER_AREA_URL),
+        ).pack(side=tk.LEFT)
+        ttk.Label(developer_row, text=_("Create or manage your API keys there"), foreground="gray50").pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+
+        ttk.Label(body, text=_("API key")).pack(anchor=tk.W, pady=(12, 0))
+        self._key_entry = ttk.Entry(body, show="\u2022", width=50)
+        self._key_entry.pack(anchor=tk.W, fill=tk.X, pady=(0, 8))
+
+        actions = ttk.Frame(body)
+        actions.pack(side=tk.BOTTOM, fill=tk.X)
+        self._progress_label = ttk.Label(actions, text="")
+        self._progress_label.pack(side=tk.LEFT)
+        ttk.Button(actions, text=_("Cancel"), command=self._root.destroy).pack(side=tk.RIGHT)
+        self._login_button = ttk.Button(actions, text=_("Log in"), command=self._on_login_click)
+        self._login_button.pack(side=tk.RIGHT, padx=(0, 8))
+
+    def show(self) -> None:
+        """Show the dialog modally."""
+        self._root.transient(self._parent)
+        self._root.grab_set()
+        self._root.focus_set()
+        self._key_entry.focus_set()
+        self._parent.wait_window(self._root)
+
+    def _on_login_click(self) -> None:
+        """Validate the input and start the background key validation and storing."""
+        api_key = self._key_entry.get().strip()
+        if not api_key:
+            messagebox.showerror(_("Log in"), _("Please paste your API key."), parent=self._root)
+            return
+        if not self._login(api_key, self._on_login_done):
+            return
+        self._login_button.configure(state="disabled")
+        self._progress_label.configure(text=_("Validating the API key and logging in..."))
+
+    def _on_login_done(self, _result: object | None, error: Exception | None) -> None:
+        if not self._root.winfo_exists():
+            return
+        self._login_button.configure(state="normal")
+        self._progress_label.configure(text="")
+        if error is not None:
+            messagebox.showerror(_("Log in"), _skybrush_error_message(error), parent=self._root)
+            return
+        self._root.destroy()
+
+
 class SkybrushLogAnalysisWindow(BaseWindow):
     """Main window of the Skybrush log analysis integration."""
 
@@ -341,6 +425,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._web_login_runner = BackgroundTaskRunner(self.root.after)
         self._auth_runner = BackgroundTaskRunner(self.root.after)
         self._feedback_runner = BackgroundTaskRunner(self.root.after)
+        self._login_runner = BackgroundTaskRunner(self.root.after)
+        self._logged_in = load_config().api_key is not None
         self._analysis_reused = False
         self._version_info: dict[str, Any] = {}
         #: True while the header version/log-in state has never been fetched successfully.
@@ -396,6 +482,10 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
         buttons_row = ttk.Frame(actions)
         buttons_row.pack(side=tk.TOP, anchor=tk.NE)
+
+        self._login_button = ttk.Button(buttons_row, text=self._login_button_text(), command=self._on_login_logout_click)
+        self._login_button.pack(side=tk.LEFT)
+        self._login_tooltip = show_tooltip(self._login_button, self._login_button_tooltip_text())
 
         self._run_analysis_button = ttk.Button(buttons_row, text=_("Run analysis"), command=self._on_run_analysis_click)
         self._run_analysis_button.pack(side=tk.LEFT, padx=(8, 0))
@@ -693,6 +783,90 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self._force_refresh = True
             self._on_run_analysis_click()
 
+    # ---------------- login / logout ----------------
+
+    def _login_button_text(self) -> str:
+        return _("Log out") if self._logged_in else _("Login")
+
+    def _login_button_tooltip_text(self) -> str:
+        return (
+            _("Log out of the Skybrush analysis service and remove the stored API key")
+            if self._logged_in
+            else _("Log in to the Skybrush analysis service with a Skybrush Account API key")
+        )
+
+    def _update_login_button(self) -> None:
+        """Sync the header login/logout button label with the current authentication state."""
+        self._login_button.configure(text=self._login_button_text())
+        self._login_tooltip.text = self._login_button_tooltip_text()
+
+    def _on_login_logout_click(self) -> None:
+        """Open the login dialog or perform the logout (analyzer 'login'/'logout' equivalents)."""
+        if self._logged_in:
+            self._apply_logout()
+            return
+        LoginDialog(self.root, self._start_login).show()
+        # Refresh the header state in case the authentication outcome changed the labels.
+        self._update_login_button()
+
+    def _start_login(self, api_key: str, on_done: Callable[[object | None, Exception | None], None]) -> bool:
+        """Validate a candidate API key against the account, storing it only when accepted."""
+        if self._login_runner.active:
+            return False
+
+        def on_login_done(result: object | None, error: Exception | None) -> None:
+            if error is None:
+                self._logged_in = True
+                self._version_check_pending = False
+                self._update_login_button()
+                self._set_status(_("Logged in to the Skybrush Account"))
+                self._start_header_status_checks()
+            on_done(result, error)
+
+        return self._login_runner.start(lambda _progress: self._validate_and_store_api_key(api_key), None, on_login_done)
+
+    def _validate_and_store_api_key(self, api_key: str) -> dict[str, Any]:
+        """Run the analyzer 'login --api-key' command in-process, validating and storing the key. Worker thread."""
+        _align_truststore_with_system_cert_injection()  # before the CLI imports its own truststore copy
+        from skybrush_log_analyzer.cli import login_cmd  # noqa: PLC0415
+
+        try:
+            login_cmd(api_key=api_key, local=False)
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            # The CLI command reports failures as typer.Exit; the underlying cause is what is displayed.
+            cause = getattr(error, "__cause__", None)
+            if isinstance(cause, Exception):
+                raise cause from None
+            raise
+        return {}
+
+    def _apply_logout(self) -> None:
+        """Run the analyzer 'logout' operation in-process, removing the stored API key and token."""
+        _align_truststore_with_system_cert_injection()  # before the analyzer imports its own truststore copy
+        from skybrush_log_analyzer.config import logout  # noqa: PLC0415
+        from skybrush_log_analyzer.errors import ConfigError  # noqa: PLC0415
+
+        # Do not use logout_cmd(): the CLI reads a config snapshot taken at its module import time,
+        # which in this application predates the API key being stored (it is first imported when
+        # logging in), so logout_cmd() wrongly believes the user is not logged in.
+        config = load_config()
+        if config.api_key is None:
+            self._logged_in = False
+            self._update_login_button()
+            self._set_logged_out_header()
+            return
+        try:
+            logout(config)
+        except (OSError, ConfigError) as error:
+            messagebox.showerror(_("Skybrush Log Analysis"), _skybrush_error_message(error), parent=self.root)
+            return
+        self._logged_in = False
+        self._version_info = {}
+        self._version_check_pending = False
+        self._update_login_button()
+        self._set_logged_out_header()
+        self._set_status(_("Logged out"))
+
     # ---------------- browser links ----------------
 
     def _on_open_in_browser_click(self) -> None:
@@ -754,8 +928,14 @@ class SkybrushLogAnalysisWindow(BaseWindow):
                 self._set_auth_status("", "gray50")
         else:
             # Mirrors the not-logged-in state of the analyzer 'auth-status' command.
-            self._version_label.configure(text=_("Skybrush API version: requires logging in"))
-            self._set_auth_status(_skybrush_error_message(Unauthenticated()), "red3")
+            self._logged_in = False
+            self._update_login_button()
+            self._set_logged_out_header()
+
+    def _set_logged_out_header(self) -> None:
+        """Show the header in the not-logged-in state (analyzer 'auth-status' equivalent)."""
+        self._version_label.configure(text=_("Skybrush API version: requires logging in"))
+        self._set_auth_status(_skybrush_error_message(Unauthenticated()), "red3")
 
     def _fetch_version_and_auth_state(self) -> dict[str, Any]:
         """Verify log-in and fetch the Skybrush API version. Executed in a worker thread."""
@@ -773,6 +953,10 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     def _on_version_auth_done(self, result: object | None, error: Exception | None) -> None:
         if error is not None:
             logging_error(_("Skybrush log-in or API version check failed: %s"), error)
+            if isinstance(error, (Unauthenticated, InvalidAPIKey, ConfigError)):
+                # Definitively logged out: flip the header button to the Login state.
+                self._logged_in = False
+                self._update_login_button()
             self._version_label.configure(text=_("Skybrush API version unknown"), foreground="gray50")
             self._set_auth_status(_skybrush_error_message(error), "red3")
             return
@@ -783,6 +967,9 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
         self._version_info = result
         self._version_check_pending = False
+        if not self._logged_in:
+            self._logged_in = True
+            self._update_login_button()
         self._version_label.configure(text=_format_api_version(result), foreground="")
         self._set_auth_status(_("Authenticated at {account_url}").format(account_url=load_config().account_url), "dark green")
 
