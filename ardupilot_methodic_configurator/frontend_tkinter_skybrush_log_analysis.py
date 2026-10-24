@@ -12,9 +12,11 @@ import ssl
 import sys
 import tkinter as tk
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import redirect_stdout, suppress
+from io import StringIO
 from logging import debug as logging_debug
 from logging import error as logging_error
+from logging import info as logging_info
 from pathlib import Path
 from threading import Lock
 from tkinter import Toplevel, messagebox, ttk
@@ -64,6 +66,9 @@ _STATUS_COLOR = {
 #: Display order of test-case statuses, most severe first.
 _STATUS_DISPLAY_ORDER = ("FAIL", "WARN", "INFO", "PASS", "SKIP", "NOT_APPLICABLE")
 
+#: Prefix prepended to every console (logging) line emitted by the Skybrush log analysis integration.
+_LOG_TAG = "[Skybrush log analysis]"
+
 
 # ---------------- truststore handling ----------------
 
@@ -97,7 +102,7 @@ def _align_truststore_with_system_cert_injection() -> None:
                 alias = f"truststore{name[len(prefix) :]}"
                 if sys.modules.get(alias) is not module:
                     sys.modules[alias] = module
-                    logging_debug(_("Aliasing module '%s' to '%s' to reuse the visible truststore copy"), alias, name)
+                    logging_debug(_("%s Aliasing module '%s' to '%s' to reuse the visible truststore copy"), _LOG_TAG, alias, name)
 
 
 # ---------------- Skybrush API clients ----------------
@@ -742,7 +747,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             try:
                 current_version = cast("dict[str, Any]", client.version())
             except Exception as exception:  # pylint: disable=broad-exception-caught
-                logging_debug(_("Fetching the Skybrush API version failed: %s"), exception)
+                logging_debug(_("%s Fetching the Skybrush API version failed: %s"), _LOG_TAG, exception)
                 current_version = {}
             self._analysis_is_stale, stored_core, current_core = _stored_analysis_is_stale(analysis, current_version)
             self._stale_version_details = (stored_core, current_core)
@@ -755,7 +760,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     def _on_analysis_done(self, result: object | None, error: Exception | None) -> None:
         self._run_analysis_button.configure(state="normal")
         if error is not None:
-            logging_error(_("Skybrush API analysis failed: %s"), error)
+            logging_error(_("%s Skybrush API analysis failed: %s"), _LOG_TAG, error)
             self._show_analysis_error(_skybrush_error_message(error))
             return
         if not isinstance(result, dict):
@@ -831,7 +836,12 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         from skybrush_log_analyzer.cli import login_cmd  # noqa: PLC0415
 
         try:
-            login_cmd(api_key=api_key, local=False)
+            # login_cmd() prints to stdout; capture it and re-emit with the tag prefix on the logging channel.
+            with redirect_stdout(StringIO()) as captured:
+                login_cmd(api_key=api_key, local=False)
+            for line in captured.getvalue().splitlines():
+                if line:
+                    logging_info(_("%s API key validation message: %s"), _LOG_TAG, line)
         except BaseException as error:  # pylint: disable=broad-exception-caught
             # The CLI command reports failures as typer.Exit; the underlying cause is what is displayed.
             cause = getattr(error, "__cause__", None)
@@ -893,7 +903,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     def _on_web_login_done(self, result: object | None, error: Exception | None) -> None:
         self._open_web_button.configure(state="normal")
         if error is not None:
-            logging_error(_("Could not acquire a Skybrush web log-in link: %s"), error)
+            logging_error(_("%s Could not acquire a Skybrush web log-in link: %s"), _LOG_TAG, error)
             self._set_status("")
             messagebox.showerror(_("Skybrush Log Analysis"), _skybrush_error_message(error), parent=self.root)
             return
@@ -952,7 +962,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
     def _on_version_auth_done(self, result: object | None, error: Exception | None) -> None:
         if error is not None:
-            logging_error(_("Skybrush log-in or API version check failed: %s"), error)
+            logging_error(_("%s Skybrush log-in or API version check failed: %s"), _LOG_TAG, error)
             if isinstance(error, (Unauthenticated, InvalidAPIKey, ConfigError)):
                 # Definitively logged out: flip the header button to the Login state.
                 self._logged_in = False
