@@ -346,7 +346,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
     def _build_header(self) -> None:
         header = ttk.Frame(self.main_frame)
-        header.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(16, 4))
+        header.pack(side=tk.TOP, fill=tk.X, padx=20, pady=(16, 8))
 
         left_column = ttk.Frame(header)
         left_column.pack(side=tk.LEFT, anchor=tk.NW)
@@ -368,9 +368,12 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._auth_status_label.pack(anchor=tk.W)
 
         actions = ttk.Frame(header)
-        actions.pack(side=tk.RIGHT, anchor=tk.NE)
+        actions.pack(side=tk.RIGHT, fill=tk.Y, anchor=tk.NE)
 
-        self._run_analysis_button = ttk.Button(actions, text=_("Run analysis"), command=self._on_run_analysis_click)
+        buttons_row = ttk.Frame(actions)
+        buttons_row.pack(side=tk.TOP, anchor=tk.NE)
+
+        self._run_analysis_button = ttk.Button(buttons_row, text=_("Run analysis"), command=self._on_run_analysis_click)
         self._run_analysis_button.pack(side=tk.LEFT, padx=(8, 0))
         show_tooltip(
             self._run_analysis_button,
@@ -378,7 +381,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         )
 
         self._open_web_button = ttk.Button(
-            actions, text=_("Open in Skybrush Log Analyzer"), command=self._on_open_in_browser_click
+            buttons_row, text=_("Open in Skybrush Log Analyzer"), command=self._on_open_in_browser_click
         )
         self._open_web_button.pack(side=tk.LEFT, padx=(8, 0))
         show_tooltip(
@@ -386,19 +389,28 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             _("Open the analysis of the selected log in the Skybrush Log Analyzer web application"),
         )
 
-        self._open_account_button = ttk.Button(actions, text=_("Open Skybrush Account"), command=self._on_open_account_click)
+        self._open_account_button = ttk.Button(
+            buttons_row, text=_("Open Skybrush Account"), command=self._on_open_account_click
+        )
         self._open_account_button.pack(side=tk.LEFT, padx=(8, 0))
         show_tooltip(
             self._open_account_button,
             _("Open the Skybrush Account page for registration, login and API key management"),
         )
 
-        self._feedback_button = ttk.Button(actions, text=_("Send feedback"), command=self._on_send_feedback_click)
+        self._feedback_button = ttk.Button(buttons_row, text=_("Send feedback"), command=self._on_send_feedback_click)
         self._feedback_button.pack(side=tk.LEFT, padx=(8, 0))
         show_tooltip(
             self._feedback_button,
             _("Report a suspicious analysis result or suggest an improvement directly to the Skybrush team"),
         )
+
+        # Status/command feedback right-aligned in the header, bottom-aligned with the log-in status line.
+        self.status_label = ttk.Label(actions, text="", anchor=tk.E, justify="right", wraplength=400)
+        self.status_label.pack(side=tk.BOTTOM, anchor=tk.SE)
+        # Wrap no wider than the button row above it.
+        self.root.update_idletasks()
+        self.status_label.configure(wraplength=max(buttons_row.winfo_reqwidth(), 200))
 
     def _build_footer(self) -> None:
         footer = ttk.Frame(self.main_frame)
@@ -406,9 +418,6 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         ttk.Button(footer, text=_("Close"), command=self.root.destroy).pack(side=tk.RIGHT)
 
     def _build_results_area(self) -> None:
-        self.status_label = ttk.Label(self.main_frame, text="", font=("TkDefaultFont", 13))
-        self.status_label.pack(side=tk.TOP, anchor=tk.W, padx=20, pady=(10, 6))
-
         results_row = ttk.Frame(self.main_frame)
         results_row.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(0, 8))
 
