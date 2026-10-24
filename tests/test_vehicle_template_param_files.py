@@ -6,8 +6,8 @@ Tests for vehicle template parameter file structure and content validity.
 Each vehicle template subdirectory must contain parameter files whose names follow the
 ``\d\d_*.param`` convention with two-digit numeric prefixes that:
 
-- Are monotonically increasing (no number used twice, no prefix outside 00-66)
-- Have exactly the known gaps: 01, 58, and 59 must never appear
+- Are monotonically increasing (no number used twice, prefixes within the format's range)
+- Respect reserved step numbers for their format and vehicle type
 - Contain valid content (parseable, no intra-file duplicate parameter names)
 
 This file is part of ArduPilot Methodic Configurator. https://github.com/ArduPilot/MethodicConfigurator
@@ -17,6 +17,7 @@ SPDX-FileCopyrightText: 2024-2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -33,7 +34,7 @@ TEMPLATES_ROOT = Path(__file__).parent.parent / "ardupilot_methodic_configurator
 # Two-digit prefix pattern for parameter files
 _NUMBERED_PARAM_RE = re.compile(r"^(\d{2})_.+\.param$")
 
-# Numbers that must NEVER appear as a file prefix in any template.
+# Reserved prefixes for formats 0/1.
 # 01 and 58 are reserved / never used. 59 is reserved outside ArduPlane,
 # where it is used by the range-finder step in the empty template.
 ALWAYS_ABSENT: frozenset[int] = frozenset({1, 58, 59})
@@ -44,6 +45,7 @@ VEHICLE_SPECIFIC_PREFIXES: dict[int, str] = {59: "ArduPlane"}
 # Valid range for numeric prefixes
 PREFIX_MIN = 0
 PREFIX_MAX = 66
+PREFIX_MAX_V2 = 70
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +77,13 @@ def _numbered_param_files(template_dir: Path) -> list[tuple[int, Path]]:
     return sorted(result, key=lambda t: t[0])
 
 
+@pytest.fixture(name="template_format_version")
+def read_template_format_version(template_dir: Path) -> int:
+    """Read the template format independently of the application's migration target."""
+    with (template_dir / "vehicle_components.json").open(encoding="utf-8-sig") as components_file:
+        return int(json.load(components_file).get("Format version", 0))
+
+
 # ---------------------------------------------------------------------------
 # Parametrize over template directories
 # ---------------------------------------------------------------------------
@@ -83,36 +92,34 @@ _LEAF_DIRS = _collect_leaf_template_dirs()
 _LEAF_IDS = [d.relative_to(TEMPLATES_ROOT).as_posix() for d in _LEAF_DIRS]
 
 # Template directories whose duplicate-prefix issues are known and not yet fixed.
-_KNOWN_DUPLICATE_PREFIX_TEMPLATES: frozenset[str] = frozenset(
-    {
-        "Heli/OMP_M4",
-        "ArduPlane/normal_plane",
-    }
-)
+_KNOWN_DUPLICATE_PREFIX_TEMPLATES: frozenset[str] = frozenset()
 
 
 @pytest.mark.parametrize("template_dir", _LEAF_DIRS, ids=_LEAF_IDS)
 class TestVehicleTemplateParamFiles:
     """Validate parameter file naming and content for each vehicle template."""
 
-    def test_param_file_prefixes_are_within_valid_range(self, template_dir: Path) -> None:
+    def test_param_file_prefixes_are_within_valid_range(self, template_dir: Path, template_format_version: int) -> None:
         """
-        Every numbered parameter file has a prefix in the range 00-66.
+        Every numbered parameter file has a prefix within its format's range.
 
         GIVEN: A vehicle template directory with numbered parameter files
         WHEN: The two-digit numeric prefixes of all .param files are inspected
-        THEN: Every prefix must be within the inclusive range 00-66
+        THEN: Every prefix is in 00-66 for formats 0/1, or the vehicle workflow range for format 2
         """
         # Arrange
         numbered = _numbered_param_files(template_dir)
 
         # Act
-        out_of_range = [(n, f.name) for n, f in numbered if not PREFIX_MIN <= n <= PREFIX_MAX]
+        prefix_max = PREFIX_MAX
+        if template_format_version >= 2:
+            prefix_max = 92 if template_dir.parent.name == "Heli" else PREFIX_MAX_V2
+        out_of_range = [(n, f.name) for n, f in numbered if not PREFIX_MIN <= n <= prefix_max]
 
         # Assert
         assert not out_of_range, (
             f"[{template_dir.relative_to(TEMPLATES_ROOT)}] "
-            f"Prefix(es) outside [{PREFIX_MIN:02d}-{PREFIX_MAX:02d}]: {out_of_range}"
+            f"Prefix(es) outside [{PREFIX_MIN:02d}-{prefix_max:02d}]: {out_of_range}"
         )
 
     def test_param_file_prefixes_are_unique(self, template_dir: Path) -> None:
@@ -162,22 +169,21 @@ class TestVehicleTemplateParamFiles:
         # Assert
         assert not violations, f"[{template_dir.relative_to(TEMPLATES_ROOT)}] Non-increasing prefix pair(s): {violations}"
 
-    def test_always_absent_prefixes_are_not_present(self, template_dir: Path) -> None:
+    def test_always_absent_prefixes_are_not_present(self, template_dir: Path, template_format_version: int) -> None:
         """
-        Reserved step numbers 01 and 58 are never used, and 59 is only valid for ArduPlane.
+        Reserved step numbers respect the template format and vehicle type.
 
         GIVEN: A vehicle template directory with numbered parameter files
         WHEN: The two-digit numeric prefixes of all .param files are inspected
-        THEN: Prefixes 01 and 58 must not appear, and prefix 59 must only appear for ArduPlane
+        THEN: Prefix 01 is absent; formats 0/1 also reserve 58 and restrict 59 to ArduPlane
         """
         # Arrange
         numbered = _numbered_param_files(template_dir)
 
         # Act
         vehicle_type = template_dir.relative_to(TEMPLATES_ROOT).parts[0]
-        forbidden = [
-            (n, f.name) for n, f in numbered if n in ALWAYS_ABSENT and VEHICLE_SPECIFIC_PREFIXES.get(n) != vehicle_type
-        ]
+        reserved = frozenset({1}) if template_format_version >= 2 else ALWAYS_ABSENT
+        forbidden = [(n, f.name) for n, f in numbered if n in reserved and VEHICLE_SPECIFIC_PREFIXES.get(n) != vehicle_type]
 
         # Assert
         assert not forbidden, f"[{template_dir.relative_to(TEMPLATES_ROOT)}] Forbidden prefix(es) found: {forbidden}"
@@ -198,3 +204,36 @@ class TestVehicleTemplateParamFiles:
         # Act & Assert: each file must load without error
         for _n, f in numbered:
             ParDict.load_param_file_into_dict(str(f))
+
+
+@pytest.mark.parametrize("template_id", ["Heli/OMP_M4", "Rover/AION_R1", "Rover/Carisma_SCA-1E"])
+def test_separate_calibration_steps_preserve_the_existing_vehicle_settings(template_id: str) -> None:
+    """
+    Splitting hardware configuration preserves the vehicle's effective settings.
+
+    GIVEN: An independently captured historical template with measured calibration and output settings
+    WHEN: The packaged template uses separate calibration, output and mode steps
+    THEN: Its final parameter values match the historical vehicle configuration
+    """
+    fixture = Path(__file__).parent / "fixtures" / "vehicle_templates_v1.json"
+    historical_files = json.loads(fixture.read_text(encoding="utf-8"))[template_id]["files"]
+    expected: dict[str, float] = {}
+    for filename, content in sorted(historical_files.items()):
+        if filename == "00_default.param":
+            continue
+        for line in content.splitlines():
+            if line.strip() and not line.startswith("#"):
+                name, _, value = line.partition(",")
+                expected[name] = float(value.partition("#")[0])
+
+    template_dir = TEMPLATES_ROOT / template_id
+    actual: dict[str, float] = {}
+    for parameter_file in sorted(template_dir.glob("*.param")):
+        if parameter_file.name != "00_default.param":
+            actual.update({name: parameter.value for name, parameter in ParDict.from_file(str(parameter_file)).items()})
+
+    assert actual == expected
+    vehicle_type = template_id.split("/", maxsplit=1)[0]
+    configuration = TEMPLATES_ROOT.parent / f"configuration_steps_{vehicle_type}.json"
+    steps = json.loads(configuration.read_text(encoding="utf-8"))["steps"]
+    assert {path.name for path in template_dir.glob("*.param")} - {"00_default.param"} <= set(steps)

@@ -10,21 +10,32 @@ SPDX-FileCopyrightText: 2024-2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+import errno
 import json
 import logging
+import os
+import subprocess
+import sys
+from collections.abc import Iterable
 from pathlib import Path
+from shutil import copyfile
+from stat import S_IMODE
+from typing import IO, BinaryIO
 
 import pytest
 
+import ardupilot_methodic_configurator.backend_filesystem_migration as migration_module
+from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.backend_filesystem_migration import (
     VEHICLE_COMPONENTS_FORMAT_VERSION,
     _line_matches_any,
     _param_name_from_line,
     migrate_vehicle_project_if_needed,
 )
+from ardupilot_methodic_configurator.data_model_par_dict import ParDict
 
 # pylint: disable=redefined-outer-name, unused-argument
-
+# pylint: disable=too-many-lines
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -63,6 +74,205 @@ def vehicle_components_current(vehicle_dir: Path) -> Path:
     json_path = vehicle_dir / "vehicle_components.json"
     json_path.write_text(json.dumps(data, indent=4), encoding="utf-8")
     return json_path
+
+
+@pytest.fixture
+def historical_configuration_package(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Supply historical test layouts without requiring aliases in unreleased production layouts."""
+    fixture = Path(__file__).parent / "fixtures" / "migration_configuration_steps.json"
+    configurations = json.loads(fixture.read_text(encoding="utf-8"))["configurations"]
+    package = tmp_path_factory.mktemp("historical-configuration-package")
+    for vehicle_type, frozen_configuration in configurations.items():
+        configuration = frozen_configuration
+        if vehicle_type in {"Heli", "Rover"}:
+            current_configuration = (
+                Path(__file__).parents[1] / "ardupilot_methodic_configurator" / (f"configuration_steps_{vehicle_type}.json")
+            )
+            configuration = json.loads(current_configuration.read_text(encoding="utf-8"))
+            # These synthetic V1 projects declare their own aliases. Unreleased
+            # vehicle layouts do not need to ship backward-compatibility entries.
+            historical_aliases = {
+                "remote_controller_controller.param": ["07_remote_controller_controller.param"],
+                "general_configuration.param": ["15_general_configuration.param"],
+                "safety_setup.param": ["16_safety_setup.param"],
+            }
+            for filename, step in configuration["steps"].items():
+                if filename[3:] in historical_aliases:
+                    step["old_filenames"] = historical_aliases[filename[3:]]
+        (package / f"configuration_steps_{vehicle_type}.json").write_text(json.dumps(configuration), encoding="utf-8")
+    monkeypatch.setattr(migration_module, "_PACKAGE_DIR", package)
+    return package
+
+
+@pytest.mark.parametrize(("source_version", "target_version"), [(0, 1), (1, 2), (0, 2)], ids=["v0-v1", "v1-v2", "v0-v2"])
+def test_frozen_project_migrates_between_supported_versions(
+    vehicle_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    historical_configuration_package: Path,
+    source_version: int,
+    target_version: int,
+) -> None:
+    """
+    Old project formats migrate independently of which templates ship today.
+
+    GIVEN: A frozen v0 or v1 project, migration-era aliases and a separate destination template
+    WHEN: The real migration entry point upgrades it to v1 or v2
+    THEN: Measured values and comments match fixed expectations and reopening changes nothing
+    """
+    fixture = Path(__file__).parent / "fixtures" / "versioned_migration_project.json"
+    snapshot = json.loads(fixture.read_text(encoding="utf-8"))
+    for filename, content in snapshot["inputs"][str(source_version)].items():
+        (vehicle_dir / filename).write_text(content, encoding="utf-8")
+    components = vehicle_dir / "vehicle_components.json"
+    components.write_text(
+        json.dumps({"Format version": source_version, "Components": snapshot["components"]}), encoding="utf-8"
+    )
+    template = historical_configuration_package / "destination-template"
+    template.mkdir()
+    if target_version == 2:
+        for filename, content in snapshot["v2_template_files"].items():
+            (template / filename).write_text(content, encoding="utf-8")
+    monkeypatch.setattr(migration_module, "VEHICLE_COMPONENTS_FORMAT_VERSION", target_version)
+    monkeypatch.setattr(
+        migration_module.VehicleProjectCreator,
+        "template_dir_for_bin_import",
+        staticmethod(lambda _vehicle_type, _major, _minor: str(template)),
+    )
+
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+    if target_version == 2:
+        configuration = historical_configuration_package / "configuration_steps_ArduCopter.json"
+        filesystem = LocalFilesystem.__new__(LocalFilesystem)
+        filesystem.vehicle_dir = str(vehicle_dir)
+        filesystem.configuration_steps = json.loads(configuration.read_text(encoding="utf-8"))["steps"]
+        filesystem.rename_parameter_files()
+
+    for filename, expected in snapshot["expected"][str(target_version)].items():
+        assert (vehicle_dir / filename).read_text(encoding="utf-8") == expected, filename
+    assert json.loads(components.read_bytes())["Format version"] == target_version
+    before_retry = {path.name: path.read_bytes() for path in vehicle_dir.iterdir()}
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+    assert {path.name: path.read_bytes() for path in vehicle_dir.iterdir()} == before_retry
+
+
+def _interrupt_migration_write(monkeypatch: pytest.MonkeyPatch, destination: Path, failure_stage: str) -> None:
+    """Inject a storage failure after a real write begins, without mocking migration logic."""
+    original_open = open
+    original_fsync = migration_module.fsync
+    original_replace = Path.replace
+    failing_descriptors: set[int] = set()
+    message = f"simulated migration {failure_stage} failure"
+
+    def open_with_failure(path: Path, mode: str = "r", *, encoding: str | None = None, newline: str | None = None) -> IO[str]:
+        # Ownership passes to the caller's context manager, just like builtins.open.
+        stream = original_open(path, mode, encoding=encoding, newline=newline)  # pylint: disable=consider-using-with
+        if mode in {"w", "x"} and (path == destination or path.name.startswith(f".migration-{destination.name}-")):
+            failing_descriptors.add(stream.fileno())
+            original_write = stream.write
+
+            def partial_write(content: str) -> int:
+                original_write(content[:10])
+                stream.flush()
+                raise OSError(message)
+
+            def partial_writelines(lines: Iterable[str]) -> None:
+                partial_write("".join(lines))
+
+            if failure_stage == "write":
+                monkeypatch.setattr(stream, "write", partial_write)
+                monkeypatch.setattr(stream, "writelines", partial_writelines)
+        return stream
+
+    def failing_fsync(descriptor: int) -> None:
+        if failure_stage == "fsync" and descriptor in failing_descriptors:
+            raise OSError(message)
+        original_fsync(descriptor)
+
+    def failing_replace(temporary: Path, target: Path) -> Path:
+        if failure_stage == "replace" and target == destination:
+            raise OSError(message)
+        return original_replace(temporary, target)
+
+    monkeypatch.setattr(migration_module, "open", open_with_failure, raising=False)
+    monkeypatch.setattr(migration_module, "fsync", failing_fsync)
+    monkeypatch.setattr(Path, "replace", failing_replace)
+
+
+# ---------------------------------------------------------------------------
+# Atomic migration file publication
+# ---------------------------------------------------------------------------
+
+
+class TestAtomicMigrationFileWrites:
+    """Migration saves preserve file contents and project permission policies."""
+
+    @pytest.mark.parametrize("lines", [[], ["VALUE,17  # measured °C\n"]], ids=["empty", "utf8"])
+    def test_new_parameter_files_follow_normal_creation_permissions(self, vehicle_dir: Path, lines: list[str]) -> None:
+        """
+        Atomic saves create empty and UTF-8 parameter files with normal project permissions.
+
+        GIVEN: A missing parameter file and a normally created comparison file
+        WHEN: Migration publishes the requested contents
+        THEN: Contents match exactly and creation permissions match the normal file
+        """
+        destination = vehicle_dir / "new.param"
+        comparison = vehicle_dir / "comparison.param"
+        comparison.write_bytes(b"normal creation")
+
+        migration_module._write_param_file_lines(destination, lines)  # pylint: disable=protected-access
+
+        assert destination.read_bytes() == "".join(lines).encode("utf-8")
+        assert S_IMODE(destination.stat().st_mode) == S_IMODE(comparison.stat().st_mode)
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits are not meaningful on Windows")
+    @pytest.mark.parametrize("permission_mode", [0o600, 0o640, 0o660])
+    def test_saving_existing_parameter_files_preserves_permissions(self, vehicle_dir: Path, permission_mode: int) -> None:
+        """
+        Atomic replacement must not broaden or restrict existing project file permissions.
+
+        GIVEN: A parameter file with private or shared permissions
+        WHEN: Migration replaces its contents
+        THEN: Its original permission bits survive
+        """
+        destination = vehicle_dir / "existing.param"
+        destination.write_bytes(b"VALUE,1\n")
+        destination.chmod(permission_mode)
+
+        migration_module._write_param_file_lines(destination, ["VALUE,2\n"])  # pylint: disable=protected-access
+
+        assert destination.read_bytes() == b"VALUE,2\n"
+        assert S_IMODE(destination.stat().st_mode) == permission_mode
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    def test_user_can_retry_save_without_overwriting_an_occupied_temporary_name(
+        self, vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A temporary-name collision cannot destroy unrelated files or existing project values.
+
+        GIVEN: A project parameter file and an occupied temporary filename
+        WHEN: Saving collides with that name, then retries with a fresh name
+        THEN: Both original files survive the failure and only the project file changes on retry
+        """
+        destination = vehicle_dir / "existing.param"
+        destination.write_bytes(b"VALUE,1\n")
+        occupied = vehicle_dir / ".migration-existing.param-occupied.tmp"
+        occupied.write_bytes(b"unrelated file")
+
+        with monkeypatch.context() as collision:
+            collision.setattr(migration_module, "token_hex", lambda *_args: "occupied")
+            with pytest.raises(FileExistsError):
+                migration_module._write_param_file_lines(destination, ["VALUE,2\n"])  # pylint: disable=protected-access
+
+        assert destination.read_bytes() == b"VALUE,1\n"
+        assert occupied.read_bytes() == b"unrelated file"
+
+        migration_module._write_param_file_lines(destination, ["VALUE,2\n"])  # pylint: disable=protected-access
+
+        assert destination.read_bytes() == b"VALUE,2\n"
+        assert occupied.read_bytes() == b"unrelated file"
+        assert list(vehicle_dir.glob("*.tmp")) == [occupied]
 
 
 # ---------------------------------------------------------------------------
@@ -167,10 +377,10 @@ class TestMigrationSuccess:
         self, vehicle_dir: Path, vehicle_components_v0: Path
     ) -> None:
         """
-        Migration writes the current format version back to vehicle_components.json.
+        Migration persists the latest format version after applying all supported steps.
 
         GIVEN: A vehicle directory with vehicle_components.json at format version 0
-        WHEN: migrate_vehicle_project_if_needed is called
+        WHEN: migrate_vehicle_project_if_needed is called once
         THEN: vehicle_components.json has 'Format version' equal to VEHICLE_COMPONENTS_FORMAT_VERSION
         """
         migrate_vehicle_project_if_needed(str(vehicle_dir))
@@ -195,12 +405,11 @@ class TestMigrationSuccess:
 
     def test_migration_is_idempotent(self, vehicle_dir: Path, vehicle_components_v0: Path) -> None:
         """
-        Running migration twice on the same project does not duplicate param lines.
+        Running migrations through all versions does not duplicate param lines.
 
         GIVEN: A vehicle directory at format version 0 with a param that will be extracted
-        WHEN: migrate_vehicle_project_if_needed is called twice in succession
-        THEN: The first call returns True, the second returns False, and the destination
-              param file contains no duplicate entries
+        WHEN: migrate_vehicle_project_if_needed is called until no migration remains
+        THEN: Each format transition runs once, and the destination has no duplicate entries
         """
         (vehicle_dir / "04_board_orientation.param").write_text("BRD_HEAT_TARG,45\n", encoding="utf-8")
 
@@ -233,7 +442,7 @@ class TestMigrationSuccess:
 
         GIVEN: A vehicle_components.json with no 'Format version' key
         WHEN: migrate_vehicle_project_if_needed is called
-        THEN: True is returned and the format version key is written
+        THEN: True is returned and the latest format version is written
         """
         data = {"Components": {}}
         (vehicle_dir / "vehicle_components.json").write_text(json.dumps(data), encoding="utf-8")
@@ -765,8 +974,1388 @@ class TestV0ToV1ObsoleteFileDeletion:
 
 
 # ---------------------------------------------------------------------------
+# V1 → V2 parameter file migrations
+# ---------------------------------------------------------------------------
+
+
+class TestV1ToV2ParameterExtractions:
+    """Tests that consecutive format migrations are persisted as separate steps."""
+
+    @pytest.mark.parametrize(
+        ("existing_safety", "expected_safety"),
+        [
+            ("", "FENCE_ALT_MAX,30 # project altitude\nFENCE_RADIUS,150 # project radius\n"),
+            (
+                "FENCE_ALT_MAX,120 # v2 default\nFENCE_RADIUS,300 # v2 default\n",
+                "FENCE_ALT_MAX,120 # v2 default\nFENCE_RADIUS,300 # v2 default\n",
+            ),
+        ],
+    )
+    def test_copter_fence_values_move_to_safety_without_overriding_existing_values(
+        self, vehicle_dir: Path, existing_safety: str, expected_safety: str
+    ) -> None:
+        """Fence values move from the legacy hardware step without forcing conflicts."""
+        hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        hardware.write_text("FENCE_ALT_MAX,30 # project altitude\nFENCE_RADIUS,150 # project radius\n", encoding="utf-8")
+        safety = vehicle_dir / "24_safety_setup.param"
+        if existing_safety:
+            safety.write_text(existing_safety, encoding="utf-8")
+
+        migration_module._migrate_v1_to_v2(vehicle_dir, "ArduCopter")  # pylint: disable=protected-access
+
+        assert safety.read_text(encoding="utf-8") == expected_safety
+        assert not hardware.exists()
+
+    def test_copter_keeps_configured_hardware_values_when_v2_steps_have_defaults(self, vehicle_dir: Path) -> None:
+        """
+        Existing hardware settings override V2 template defaults without losing their comments.
+
+        GIVEN: A legacy hardware step and V2 steps with default values for the same parameters
+        WHEN: The hardware step is split
+        THEN: The user's fence, frame, battery, and hover settings reach the new steps unchanged
+        """
+        hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        values_by_step = {
+            "24_safety_setup.param": "FENCE_ACTION,3 # return home\nFENCE_ENABLE,1 # enabled\n",
+            "11_servo_outputs.param": "FRAME_TYPE,12 # custom frame\n",
+            "10_battery.param": "MOT_BAT_VOLT_MAX,52.2 # full pack\nMOT_BAT_VOLT_MIN,42 # low pack\n",
+            "13_initial_atc.param": "MOT_THST_HOVER,0.28 # measured hover\n",
+        }
+        hardware.write_text("".join(values_by_step.values()), encoding="utf-8")
+        for filename, lines in values_by_step.items():
+            defaults = "".join(f"{line.split(',', 1)[0]},0 # template default\n" for line in lines.splitlines())
+            (vehicle_dir / filename).write_text(defaults, encoding="utf-8")
+
+        migration_module._migrate_v1_to_v2(  # pylint: disable=protected-access
+            vehicle_dir, "ArduCopter", preexisting_filenames={hardware.name}
+        )
+
+        assert not hardware.exists()
+        for filename, lines in values_by_step.items():
+            assert (vehicle_dir / filename).read_text(encoding="utf-8") == lines
+
+    @pytest.mark.parametrize(
+        "hardware_filename",
+        [
+            "11_mp_setup_mandatory_hardware.param",
+            "12_mp_setup_mandatory_hardware.param",
+            "14_mp_setup_mandatory_hardware.param",
+        ],
+    )
+    def test_copter_preserves_effective_safety_values_from_a_later_existing_step(
+        self, vehicle_dir: Path, hardware_filename: str
+    ) -> None:
+        """
+        A configured safety step retains the effective values it supplied before migration.
+
+        GIVEN: Different fence values in the legacy hardware and later safety steps
+        WHEN: The V1 project migrates to V2
+        THEN: The configured safety values and comments remain unchanged
+        """
+        hardware = vehicle_dir / hardware_filename
+        safety = vehicle_dir / "24_safety_setup.param"
+        hardware.write_text("FENCE_ACTION,3 # legacy\nFENCE_ENABLE,1 # legacy\n", encoding="utf-8")
+        safety.write_text("FENCE_ACTION,4 # configured\nFENCE_ENABLE,0 # configured\n", encoding="utf-8")
+        (vehicle_dir / "vehicle_components.json").write_text(
+            json.dumps({"Format version": 1, "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter"}}}}),
+            encoding="utf-8",
+        )
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        assert safety.read_text(encoding="utf-8") == "FENCE_ACTION,4 # configured\nFENCE_ENABLE,0 # configured\n"
+        assert not hardware.exists()
+
+    def test_moved_parameter_lines_are_separated_when_input_has_no_final_newline(self, vehicle_dir: Path) -> None:
+        """Appending migrated settings must not concatenate an unterminated destination row."""
+        hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        hardware.write_bytes(b"RC1_MIN,982\n")
+        controller = vehicle_dir / "06_remote_controller_controller.param"
+        controller.write_bytes(b"RC2_MIN,1000")
+
+        migration_module._migrate_v1_to_v2(vehicle_dir, "ArduCopter")  # pylint: disable=protected-access
+
+        assert controller.read_bytes() == b"RC2_MIN,1000\nRC1_MIN,982\n"
+
+    def test_user_keeps_manual_rate_filter_values_when_migrating_to_v2(self, vehicle_dir: Path) -> None:
+        """
+        Existing filter settings move unless a destination value already takes precedence.
+
+        GIVEN: A V1 mandatory-hardware file with hand-set gyro and rate-filter values
+        WHEN: The ArduCopter project migrates to V2
+        THEN: Non-conflicting values move, the existing destination value remains, and hardware settings move
+        """
+        (vehicle_dir / "configuration_steps_ArduCopter.json").write_text(
+            json.dumps(
+                {"steps": {"29_motor_notch_filter_results.param": {"old_filenames": ["25_motor_notch_filter_results.param"]}}}
+            ),
+            encoding="utf-8",
+        )
+        hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        hardware.write_text(
+            "INS_GYRO_FILTER,150 # hand-set\n"
+            "ATC_RAT_PIT_FLTD,60\n"
+            "ATC_RAT_PIT_FLTT,0\n"
+            "ATC_RAT_RLL_FLTD,75\n"
+            "ATC_RAT_RLL_FLTT,0\n"
+            "ATC_RAT_YAW_FLTD,12\n"
+            "ATC_RAT_YAW_FLTT,0\n"
+            "COMPASS_EXTERNAL,1\n",
+            encoding="utf-8",
+        )
+        legacy_results = vehicle_dir / "25_motor_notch_filter_results.param"
+        legacy_results.write_text("INS_GYRO_FILTER,20\nINS_HNTCH_FREQ,42\n", encoding="utf-8")
+
+        migration_module._migrate_v1_to_v2(vehicle_dir, "ArduCopter")  # pylint: disable=protected-access
+
+        filters = legacy_results.read_text(encoding="utf-8")
+        remaining_hardware = hardware.read_text(encoding="utf-8") if hardware.exists() else ""
+        compass = (vehicle_dir / "19_compass_calibration.param").read_text(encoding="utf-8")
+        assert "INS_GYRO_FILTER,20\n" in filters
+        assert "INS_GYRO_FILTER,150 # hand-set\n" not in filters
+        for parameter in (
+            "ATC_RAT_PIT_FLTD,60",
+            "ATC_RAT_PIT_FLTT,0",
+            "ATC_RAT_RLL_FLTD,75",
+            "ATC_RAT_RLL_FLTT,0",
+            "ATC_RAT_YAW_FLTD,12",
+            "ATC_RAT_YAW_FLTT,0",
+        ):
+            assert parameter in filters
+            assert parameter not in remaining_hardware
+        assert "INS_HNTCH_FREQ,42\n" in filters
+        assert "COMPASS_EXTERNAL,1\n" in compass
+
+    @pytest.mark.parametrize(
+        "step_migration",
+        [
+            ("07_remote_controller_controller.param", "06_remote_controller_controller.param", "RC1_MIN"),
+            ("11_initial_atc.param", "13_initial_atc.param", "ATC_ACC_P_MAX"),
+            ("15_general_configuration.param", "23_general_configuration.param", "FLOW_TYPE"),
+        ],
+    )
+    @pytest.mark.parametrize("configuration_location", ["project", "package"])
+    def test_existing_v1_step_values_survive_parameter_splits_and_filename_renames(
+        self,
+        vehicle_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        step_migration: tuple[str, str, str],
+        configuration_location: str,
+    ) -> None:
+        """
+        Splitting hardware values must not block renaming a customized V1 step.
+
+        GIVEN: A V1 step with custom values and a hardware source with a conflicting value
+        WHEN: The V2 split runs before the normal filename rename, then is retried
+        THEN: The later original value wins while comments and unrelated user settings survive
+        """
+        old_filename, new_filename, moved_parameter = step_migration
+        steps = {new_filename: {"old_filenames": [old_filename]}}
+        configuration_dir = vehicle_dir
+        if configuration_location == "package":
+            configuration_dir = vehicle_dir / "package"
+            configuration_dir.mkdir()
+            monkeypatch.setattr(migration_module, "_PACKAGE_DIR", configuration_dir)
+        (configuration_dir / "configuration_steps_ArduCopter.json").write_text(json.dumps({"steps": steps}), encoding="utf-8")
+        old_step = vehicle_dir / old_filename
+        old_step.write_text(f"# user settings\nUNRELATED_SETTING,23\n{moved_parameter},0\n", encoding="utf-8")
+        hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        hardware.write_text(f"{moved_parameter},17 # measured\n", encoding="utf-8")
+
+        migration_module._migrate_v1_to_v2(vehicle_dir, "ArduCopter")  # pylint: disable=protected-access
+        assert not (vehicle_dir / new_filename).exists()
+        filesystem = LocalFilesystem.__new__(LocalFilesystem)
+        filesystem.vehicle_dir = str(vehicle_dir)
+        filesystem.configuration_steps = steps
+        filesystem.rename_parameter_files()
+        migrated = (vehicle_dir / new_filename).read_bytes()
+        migration_module._migrate_v1_to_v2(vehicle_dir, "ArduCopter")  # pylint: disable=protected-access
+        filesystem.rename_parameter_files()
+
+        assert not old_step.exists()
+        expected_parameter = f"{moved_parameter},0\n" if old_filename > hardware.name else f"{moved_parameter},17 # measured\n"
+        assert migrated == f"# user settings\nUNRELATED_SETTING,23\n{expected_parameter}".encode()
+        assert (vehicle_dir / new_filename).read_bytes() == migrated
+        assert not hardware.exists()
+
+    def test_v2_destinations_are_seeded_from_empty_template_before_parameter_splits(
+        self, vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        V2 template values survive while migrated project values override conflicts.
+
+        GIVEN: A format-1 project with a mandatory-hardware file and a v2 empty template
+        WHEN: The project migrates to format 2
+        THEN: Template parameters are present, duplicate migrations reach both steps, and FRAME_CLASS is only in servo outputs
+        """
+        template_dir = vehicle_dir / "templates" / "ArduCopter" / "empty_4.6.x"
+        template_dir.mkdir(parents=True)
+        template_values = {
+            "03_imu_temperature_calibration_results.param": "TEMPLATE_TEMP,1\n",
+            "16_accelerometer_calibration.param": "TEMPLATE_ACCEL,1\nINS_ACCSCAL_X,1\n",
+            "17_accelerometer_level.param": "TEMPLATE_LEVEL,1\n",
+            "19_compass_calibration.param": "TEMPLATE_COMPASS,1\n",
+            "22_flight_modes.param": "INITIAL_MODE,0\n",
+            "11_servo_outputs.param": "TEMPLATE_SERVO,1\nSERVO1_FUNCTION,0\nFRAME_CLASS,0\n",
+        }
+        for filename, content in template_values.items():
+            (template_dir / filename).write_text(content, encoding="utf-8")
+
+        (vehicle_dir / "configuration_steps_ArduCopter.json").write_text(
+            json.dumps(
+                {
+                    "steps": {filename: {} for filename in template_values}
+                    | {"15_board_orientation.param": {"old_filenames": ["05_board_orientation.param"]}}
+                }
+            ),
+            encoding="utf-8",
+        )
+        (vehicle_dir / "vehicle_components.json").write_text(
+            json.dumps(
+                {
+                    "Format version": 1,
+                    "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3 official"}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        mandatory_hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        mandatory_hardware.write_text(
+            "INS_ACCSCAL_X,0.998941\nINS_ACC1_CALTEMP,45\nAHRS_TRIM_X,0.01\nFLTMODE1,3\nINITIAL_MODE,1\n"
+            "SERVO1_FUNCTION,33\nFRAME_CLASS,1\n",
+            encoding="utf-8",
+        )
+        board_orientation = vehicle_dir / "05_board_orientation.param"
+        board_orientation.write_text("AHRS_ORIENTATION,0\nFRAME_CLASS,1\n", encoding="utf-8")
+        monkeypatch.setattr(
+            migration_module.VehicleProjectCreator,
+            "template_dir_for_bin_import",
+            staticmethod(lambda _vehicle_type, _major, _minor: str(template_dir)),
+        )
+        monkeypatch.setattr(migration_module, "VEHICLE_COMPONENTS_FORMAT_VERSION", 2)
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        accelerometer = (vehicle_dir / "16_accelerometer_calibration.param").read_text(encoding="utf-8")
+        imu_temperature = (vehicle_dir / "03_imu_temperature_calibration_results.param").read_text(encoding="utf-8")
+        accelerometer_level = (vehicle_dir / "17_accelerometer_level.param").read_text(encoding="utf-8")
+        flight_modes = (vehicle_dir / "22_flight_modes.param").read_text(encoding="utf-8")
+        servo_outputs = (vehicle_dir / "11_servo_outputs.param").read_text(encoding="utf-8")
+
+        assert "INS_ACC1_CALTEMP,45" in accelerometer
+        assert "INS_ACC1_CALTEMP,45" in imu_temperature
+        assert "AHRS_TRIM_X,0.01" in accelerometer
+        assert "AHRS_TRIM_X,0.01" in accelerometer_level
+        assert "INS_ACCSCAL_X,0.998941" in accelerometer
+        assert "TEMPLATE_ACCEL,1" in accelerometer
+        assert "TEMPLATE_TEMP,1" in imu_temperature
+        assert "TEMPLATE_LEVEL,1" in accelerometer_level
+        assert "TEMPLATE_COMPASS,1" in (vehicle_dir / "19_compass_calibration.param").read_text(encoding="utf-8")
+        assert "INITIAL_MODE,1" in flight_modes
+        assert flight_modes.count("INITIAL_MODE,") == 1
+        assert "FLTMODE1,3" in flight_modes
+        assert "TEMPLATE_SERVO,1" in servo_outputs
+        assert "SERVO1_FUNCTION,33" in servo_outputs
+        assert "FRAME_CLASS,1" in servo_outputs
+        assert "FRAME_CLASS" not in board_orientation.read_text(encoding="utf-8")
+        assert "FRAME_CLASS" not in accelerometer
+        assert "FRAME_CLASS" not in (vehicle_dir / "05_board_orientation.param").read_text(encoding="utf-8")
+        frame_class_files = [
+            path.name
+            for path in vehicle_dir.glob("*.param")
+            if path.name != "00_default.param" and "FRAME_CLASS" in path.read_text(encoding="utf-8")
+        ]
+        assert frame_class_files == ["11_servo_outputs.param"]
+
+    @pytest.mark.parametrize("failed_destination", ["16_accelerometer_calibration.param", "17_accelerometer_level.param"])
+    def test_interrupted_split_preserves_source_values_and_can_be_retried(
+        self, vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch, failed_destination: str
+    ) -> None:
+        """
+        A destination write failure cannot discard the project's only copy of calibration values.
+
+        GIVEN: A format-1 source with calibration and trim values and a failing destination write
+        WHEN: Migration is interrupted and then retried with working storage
+        THEN: The source and version survive the failure, and retry produces each value exactly once
+        """
+        components = vehicle_dir / "vehicle_components.json"
+        components.write_text(
+            json.dumps({"Format version": 1, "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter"}}}}),
+            encoding="utf-8",
+        )
+        source = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        original_content = "INS_ACCSCAL_X,0.998941\nAHRS_TRIM_X,0.01\nUNRELATED_SOURCE,9\n"
+        source.write_text(original_content, encoding="utf-8")
+        monkeypatch.setattr(migration_module, "VEHICLE_COMPONENTS_FORMAT_VERSION", 2)
+        original_write = migration_module._write_param_file_lines  # pylint: disable=protected-access
+
+        def fail_destination_write(filepath: Path, lines: list[str]) -> None:
+            if filepath.name == failed_destination:
+                message = "simulated destination write failure"
+                raise OSError(message)
+            original_write(filepath, lines)
+
+        with monkeypatch.context() as failure:
+            failure.setattr(migration_module, "_write_param_file_lines", fail_destination_write)
+            with pytest.raises(OSError, match="simulated destination write failure"):
+                migrate_vehicle_project_if_needed(str(vehicle_dir))
+
+        assert source.read_text(encoding="utf-8") == original_content
+        assert json.loads(components.read_text(encoding="utf-8"))["Format version"] == 1
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert (vehicle_dir / "16_accelerometer_calibration.param").read_text(encoding="utf-8") == (
+            "INS_ACCSCAL_X,0.998941\nAHRS_TRIM_X,0.01\n"
+        )
+        assert (vehicle_dir / "17_accelerometer_level.param").read_text(encoding="utf-8") == "AHRS_TRIM_X,0.01\n"
+        assert source.read_text(encoding="utf-8") == "UNRELATED_SOURCE,9\n"
+        assert json.loads(components.read_text(encoding="utf-8"))["Format version"] == 2
+
+    @pytest.mark.parametrize("failure_stage", ["write", "fsync", "replace"])
+    @pytest.mark.parametrize(
+        "failed_filename",
+        [
+            "16_accelerometer_calibration.param",
+            "17_accelerometer_level.param",
+            "23_general_configuration.param",
+            "14_mp_setup_mandatory_hardware.param",
+            "vehicle_components.json",
+        ],
+    )
+    def test_user_can_retry_split_without_losing_existing_values_after_storage_failure(
+        self, vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch, failed_filename: str, failure_stage: str
+    ) -> None:
+        """
+        Failed parameter or version writes preserve the previously published file.
+
+        GIVEN: A format-1 project with source-only values and existing destination-only values
+        WHEN: Writing, syncing or publishing a destination, source or version file fails, then migration is retried
+        THEN: The failed file and version survive byte-for-byte, and retry preserves every unrelated value
+        """
+        components = vehicle_dir / "vehicle_components.json"
+        components.write_text(
+            json.dumps({"Format version": 1, "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter"}}}}),
+            encoding="utf-8",
+        )
+        source = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        accelerometer = vehicle_dir / "16_accelerometer_calibration.param"
+        level = vehicle_dir / "17_accelerometer_level.param"
+        general = vehicle_dir / "23_general_configuration.param"
+        source.write_bytes(b"INS_ACCSCAL_X,0.998941\r\nAHRS_TRIM_X,0.01\r\nUNRELATED_SOURCE,9\r\n")
+        accelerometer.write_bytes(b"# measured calibration\r\nUNRELATED_ACCEL,17\r\nINS_ACCSCAL_X,1\r\n")
+        level.write_bytes(b"# keep level settings\r\nUNRELATED_LEVEL,23\r\nAHRS_TRIM_X,0\r\n")
+        general.write_bytes(b"UNRELATED_GENERAL,31\r\n")
+        originals = {path.name: path.read_bytes() for path in (components, source, accelerometer, level, general)}
+        monkeypatch.setattr(migration_module, "VEHICLE_COMPONENTS_FORMAT_VERSION", 2)
+        failed_file = vehicle_dir / failed_filename
+
+        with monkeypatch.context() as failure:
+            _interrupt_migration_write(failure, failed_file, failure_stage)
+            with pytest.raises(OSError, match=f"simulated migration {failure_stage} failure"):
+                migrate_vehicle_project_if_needed(str(vehicle_dir))
+
+        assert failed_file.read_bytes() == originals[failed_filename]
+        assert components.read_bytes() == originals[components.name]
+        if failed_file in (accelerometer, level, general):
+            assert source.read_bytes() == originals[source.name]
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        assert accelerometer.read_bytes() == (
+            b"# measured calibration\nUNRELATED_ACCEL,17\nINS_ACCSCAL_X,1\nAHRS_TRIM_X,0.01\n"
+        )
+        assert level.read_bytes() == b"# keep level settings\nUNRELATED_LEVEL,23\nAHRS_TRIM_X,0\n"
+        assert source.read_bytes() == b"UNRELATED_SOURCE,9\n"
+        assert general.read_bytes() == b"UNRELATED_GENERAL,31\nUNRELATED_SOURCE,9\n"
+        assert json.loads(components.read_bytes())["Format version"] == 2
+        assert components.read_bytes().endswith(b"\n")
+        assert b"\r" not in components.read_bytes()
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    def test_project_calibration_overrides_destination_defaults_without_duplicates(self, vehicle_dir: Path) -> None:
+        """
+        Project calibration values replace conflicting defaults while preserving unrelated settings.
+
+        GIVEN: A mandatory-hardware source and an existing calibration destination with conflicting values
+        WHEN: The format-2 split is applied and retried
+        THEN: The source values win once and unrelated destination values and comments survive
+        """
+        source = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        source.write_text("INS_ACCSCAL_X,0.998941 # measured\nINS_USE,1\nUNRELATED_SOURCE,9\n", encoding="utf-8")
+        destination = vehicle_dir / "16_accelerometer_calibration.param"
+        destination.write_text("# keep this comment\nINS_ACCSCAL_X,1\nINS_USE,0\nINS_ACCOFFS_X,0.25\n", encoding="utf-8")
+
+        migration_module._migrate_v1_to_v2(vehicle_dir, "ArduCopter", preexisting_filenames={source.name})  # pylint: disable=protected-access
+        first_content = destination.read_text(encoding="utf-8")
+        migration_module._migrate_v1_to_v2(vehicle_dir, "ArduCopter", preexisting_filenames={source.name})  # pylint: disable=protected-access
+
+        parameters = ParDict.load_param_file_into_dict(str(destination))
+        assert parameters["INS_ACCSCAL_X"].value == 0.998941
+        assert parameters["INS_USE"].value == 1
+        assert parameters["INS_ACCOFFS_X"].value == 0.25
+        assert "# keep this comment\n" in first_content
+        assert "# measured" in first_content
+        assert destination.read_text(encoding="utf-8") == first_content
+        assert source.read_text(encoding="utf-8") == "UNRELATED_SOURCE,9\n"
+
+    @pytest.mark.parametrize(
+        "source_name",
+        [
+            "11_mp_setup_mandatory_hardware.param",
+            "12_mp_setup_mandatory_hardware.param",
+            "14_mp_setup_mandatory_hardware.param",
+        ],
+    )
+    def test_legacy_mandatory_hardware_values_are_split_before_renames(
+        self, vehicle_dir: Path, vehicle_components_v0: Path, monkeypatch: pytest.MonkeyPatch, source_name: str
+    ) -> None:
+        """
+        A format-0 project's calibration values reach the dedicated format-2 steps.
+
+        GIVEN: A format-0 project with any supported mandatory-hardware filename
+        WHEN: Migration runs through format 2 before filesystem renames
+        THEN: All split values survive and the obsolete source is removed
+        """
+        source = vehicle_dir / source_name
+        source.write_text(
+            "INS_ACCSCAL_X,0.998941\nINS_ACC1_CALTEMP,45\nAHRS_TRIM_X,0.01\n"
+            "COMPASS_OFS_X,12\nFLTMODE1,0\nRC1_MIN,1100\nSERVO1_FUNCTION,33\nFRAME_CLASS,1\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(migration_module, "VEHICLE_COMPONENTS_FORMAT_VERSION", 2)
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        expected = {
+            "16_accelerometer_calibration.param": ("INS_ACCSCAL_X,0.998941\nINS_ACC1_CALTEMP,45\nAHRS_TRIM_X,0.01\n"),
+            "03_imu_temperature_calibration_results.param": "INS_ACC1_CALTEMP,45\n",
+            "17_accelerometer_level.param": "AHRS_TRIM_X,0.01\n",
+            "19_compass_calibration.param": "COMPASS_OFS_X,12\n",
+            "22_flight_modes.param": "FLTMODE1,0\n",
+            "06_remote_controller_controller.param": "RC1_MIN,1100\n",
+            "11_servo_outputs.param": "SERVO1_FUNCTION,33\nFRAME_CLASS,1\n",
+        }
+        for filename, line in expected.items():
+            assert line in (vehicle_dir / filename).read_text(encoding="utf-8")
+        assert not source.exists()
+        assert json.loads(vehicle_components_v0.read_text(encoding="utf-8"))["Format version"] == 2
+
+    def test_format_zero_project_is_migrated_through_all_versions_in_one_open(
+        self, vehicle_dir: Path, vehicle_components_v0: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Each migration pass applies one version transition and persists it before the next pass.
+
+        GIVEN: A format-version 0 project containing values used by both migrations
+        WHEN: The project is migrated once
+        THEN: v0→v1 is persisted before v1→v2 begins, and the final version is 2
+        """
+        source = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        source.write_text(
+            "INS_ACCSCAL_X,1.1\n"
+            "INS_ACC2SCAL_Y,2.2\n"
+            "INS_USE,1\n"
+            "INS_USE2,1\n"
+            "INS_USE3,1\n"
+            "INS_ACC1_CALTEMP,45\n"
+            "AHRS_TRIM_X,0.01\n"
+            "COMPASS_EXTERNAL,1\n"
+            "COMPASS_OFS1_X,12\n"
+            "FLTMODE1, stabilize\n"
+            "RC1_MIN,1100\n"
+            "FRAME_CLASS,1\n"
+            "INS_ACCSCAL_X,0.998941\n"
+            "MOT_THST_HOVER,0.301157\n"
+            "SERVO1_FUNCTION,33\n"
+            "UNRELATED_TEST,1\n",
+            encoding="utf-8",
+        )
+
+        transition_versions: list[tuple[int, int]] = []
+        v1_to_v2_input: list[str] = []
+        original_v1_to_v2 = migration_module._migrate_v1_to_v2  # pylint: disable=protected-access
+
+        def run_v0_to_v1(_path: Path, _vehicle_type: str) -> None:
+            persisted_version = json.loads((vehicle_dir / "vehicle_components.json").read_text(encoding="utf-8"))[
+                "Format version"
+            ]
+            transition_versions.append((0, persisted_version))
+
+        def run_v1_to_v2(path: Path, vehicle_type: str, *, preexisting_filenames: set[str] | None = None) -> None:
+            persisted_version = json.loads((vehicle_dir / "vehicle_components.json").read_text(encoding="utf-8"))[
+                "Format version"
+            ]
+            transition_versions.append((1, persisted_version))
+            v1_to_v2_input.append(source.read_text(encoding="utf-8"))
+            original_v1_to_v2(path, vehicle_type, preexisting_filenames=preexisting_filenames)
+
+        monkeypatch.setattr(migration_module, "_migrate_v0_to_v1", run_v0_to_v1)
+        monkeypatch.setattr(migration_module, "_migrate_v1_to_v2", run_v1_to_v2)
+        monkeypatch.setattr(migration_module, "_restore_missing_configuration_step_files", lambda *_args: None)
+        monkeypatch.setattr(migration_module, "VEHICLE_COMPONENTS_FORMAT_VERSION", 2)
+
+        result = migrate_vehicle_project_if_needed(str(vehicle_dir))
+        final_data = json.loads((vehicle_dir / "vehicle_components.json").read_text(encoding="utf-8"))
+        transitions_during_open = transition_versions.copy()
+        second_result = migrate_vehicle_project_if_needed(str(vehicle_dir))
+
+        assert result is True
+        assert transitions_during_open == [(0, 0), (1, 1)]
+        assert final_data["Format version"] == 2
+        assert second_result is False
+        assert "FRAME_CLASS,1" in v1_to_v2_input[0]
+        assert "INS_ACCSCAL_X,0.998941" in v1_to_v2_input[0]
+        assert "MOT_THST_HOVER,0.301157" in v1_to_v2_input[0]
+        assert "UNRELATED_TEST,1" in v1_to_v2_input[0]
+
+        second_pass_content = source.read_text(encoding="utf-8")
+        assert "UNRELATED_TEST,1" in second_pass_content
+        assert "INS_ACCSCAL_X,0.998941" not in second_pass_content
+        assert "INS_ACCSCAL_X,0.998941" in (vehicle_dir / "16_accelerometer_calibration.param").read_text(encoding="utf-8")
+        assert "INS_ACC1_CALTEMP,45" in (vehicle_dir / "03_imu_temperature_calibration_results.param").read_text(
+            encoding="utf-8"
+        )
+
+    def test_restore_does_not_block_rename_from_an_old_filename(
+        self, vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A template step is not restored when the project has its declared old filename."""
+        template_dir = vehicle_dir / "templates" / "ArduCopter" / "empty_4.6.x"
+        template_dir.mkdir(parents=True)
+        (template_dir / "05_board_orientation.param").write_text("TEMPLATE,1\n", encoding="utf-8")
+        (vehicle_dir / "configuration_steps_ArduCopter.json").write_text(
+            json.dumps({"steps": {"05_board_orientation.param": {"old_filenames": ["04_board_orientation.param"]}}}),
+            encoding="utf-8",
+        )
+        (vehicle_dir / "vehicle_components.json").write_text(
+            json.dumps(
+                {
+                    "Format version": 0,
+                    "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        old_step = vehicle_dir / "04_board_orientation.param"
+        old_step.write_text("AHRS_ORIENTATION,2\n", encoding="utf-8")
+        monkeypatch.setattr(
+            migration_module.VehicleProjectCreator,
+            "template_dir_for_bin_import",
+            staticmethod(lambda _vehicle_type, _major, _minor: str(template_dir)),
+        )
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert old_step.read_text(encoding="utf-8") == "AHRS_ORIENTATION,2\n"
+        assert not (vehicle_dir / "05_board_orientation.param").exists()
+
+        filesystem = LocalFilesystem.__new__(LocalFilesystem)
+        filesystem.vehicle_dir = str(vehicle_dir)
+        filesystem.configuration_steps = {"05_board_orientation.param": {"old_filenames": ["04_board_orientation.param"]}}
+        filesystem.rename_parameter_files()
+
+        assert not old_step.exists()
+        assert (vehicle_dir / "05_board_orientation.param").read_text(encoding="utf-8") == "AHRS_ORIENTATION,2\n"
+
+
+@pytest.mark.usefixtures("historical_configuration_package")
+class TestVehicleSpecificV1ToV2Migration:
+    """Old projects migrate using their frozen migration-era layouts."""
+
+    @pytest.mark.parametrize(
+        ("vehicle_type", "source_name"),
+        [
+            (vehicle, source)
+            for vehicle in ("ArduPlane", "Heli", "Rover")
+            for source in (
+                "11_mp_setup_mandatory_hardware.param",
+                "12_mp_setup_mandatory_hardware.param",
+                "14_mp_setup_mandatory_hardware.param",
+            )
+        ]
+        + [("Heli", "15_mp_setup_mandatory_hardware.param")],
+    )
+    def test_user_keeps_calibration_and_safety_values_in_vehicle_specific_steps(  # pylint: disable=too-many-locals
+        self,
+        vehicle_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        vehicle_type: str,
+        source_name: str,
+        historical_configuration_package: Path,
+    ) -> None:
+        """
+        Non-Copter conversions retain calibration and preserve settings in existing steps.
+
+        GIVEN: A format-1 vehicle with measured calibration, RC, mode and fence values
+        WHEN: It migrates to format 2 and migration is retried
+        THEN: Valid settings move to that vehicle's steps without creating Copter-only files or losing values
+        """
+        mode_name = "MODE1" if vehicle_type == "Rover" else "FLTMODE1"
+        retained_lines = [
+            "AHRS_TRIM_X,0.012 # measured level\n",
+            "INS_ACCSCAL_X,0.998 # measured accelerometer\n",
+            "COMPASS_OFS_X,12 # measured compass\n",
+            "SERVO1_FUNCTION,73 # configured output\n",
+            "INS_GYRO_FILTER,20\n",
+            f"{'FLTMODE1' if vehicle_type == 'Rover' else 'MODE1'},99 # unrelated legacy value\n",
+        ]
+        if vehicle_type == "Rover":
+            retained_lines.append("FENCE_ALT_MAX,80 # legacy altitude setting\n")
+        elif vehicle_type == "ArduPlane":
+            retained_lines.append("Q_M_THST_HOVER,0.32 # quadplane setting\n")
+        else:
+            retained_lines.append("H_RSC_MODE,3 # helicopter rotor control\n")
+        moved = {
+            "03_imu_temperature_calibration_results.param": "INS_ACC1_CALTEMP,45 # measured temperature\n",
+            "07_remote_controller_controller.param": "RC1_MIN,1100 # measured RC\nRC2_REVERSED,1\n",
+            "15_general_configuration.param": f"{mode_name},3 # selected mode\nINITIAL_MODE,1\n",
+            "16_safety_setup.param": "FENCE_ACTION,1\nFENCE_ENABLE,1\nFENCE_RADIUS,150 # project fence\n",
+        }
+        if vehicle_type != "Rover":
+            moved["16_safety_setup.param"] += "FENCE_ALT_MAX,80 # altitude fence\n"
+        source = vehicle_dir / source_name
+        source.write_text("".join(retained_lines) + "".join(moved.values()), encoding="utf-8")
+        (vehicle_dir / "16_safety_setup.param").write_text(
+            "# retained safety comment\nFENCE_RADIUS,300\nARMING_CHECK,1\n", encoding="utf-8"
+        )
+        components = vehicle_dir / "vehicle_components.json"
+        components.write_text(
+            json.dumps({"Format version": 1, "Components": {"Flight Controller": {"Firmware": {"Type": vehicle_type}}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(migration_module, "VEHICLE_COMPONENTS_FORMAT_VERSION", 2)
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        assert not source.exists()
+        if vehicle_type == "ArduPlane":
+            split = {
+                "17_accelerometer_level.param": retained_lines[0],
+                "16_accelerometer_calibration.param": retained_lines[1],
+                "19_compass_calibration.param": retained_lines[2],
+                "11_servo_outputs.param": retained_lines[3],
+                "29_motor_notch_filter_results.param": retained_lines[4],
+                "23_general_configuration.param": "".join(retained_lines[5:]),
+            }
+            for filename, content in split.items():
+                assert (vehicle_dir / filename).read_text(encoding="utf-8") == content
+            moved["06_remote_controller_controller.param"] = moved.pop("07_remote_controller_controller.param")
+            moved["22_flight_modes.param"] = moved.pop("15_general_configuration.param")
+            moved["16_safety_setup.param"] = moved["16_safety_setup.param"].replace("FENCE_RADIUS,150 # project fence\n", "")
+        else:
+            general_filename = "26_general_configuration.param" if vehicle_type == "Heli" else "19_general_configuration.param"
+            assert (vehicle_dir / general_filename).read_text(encoding="utf-8") == "".join(retained_lines[4:])
+            split = {
+                "07_accelerometer_level.param": retained_lines[0],
+                "06_accelerometer_calibration.param": retained_lines[1],
+                "22_compass_calibration.param" if vehicle_type == "Heli" else "16_compass_calibration.param": retained_lines[
+                    2
+                ],
+                "11_servo_outputs.param" if vehicle_type == "Heli" else "14_servo_outputs.param": retained_lines[3],
+            }
+            for filename, content in split.items():
+                assert (vehicle_dir / filename).read_text(encoding="utf-8") == content
+            moved[
+                "10_remote_controller_controller.param" if vehicle_type == "Heli" else "09_remote_controller_controller.param"
+            ] = moved.pop("07_remote_controller_controller.param")
+            moved["25_flight_modes.param" if vehicle_type == "Heli" else "18_flight_modes.param"] = moved.pop(
+                "15_general_configuration.param"
+            )
+            moved["16_safety_setup.param"] = moved["16_safety_setup.param"].replace("FENCE_RADIUS,150 # project fence\n", "")
+        for filename, content in moved.items():
+            expected = ""
+            if filename == "16_safety_setup.param":
+                expected = "# retained safety comment\n"
+                expected += "FENCE_RADIUS,300\n"
+                expected += "ARMING_CHECK,1\n"
+            assert (vehicle_dir / filename).read_text(encoding="utf-8") == expected + content
+        layout_path = historical_configuration_package / f"configuration_steps_{vehicle_type}.json"
+        filesystem = LocalFilesystem.__new__(LocalFilesystem)
+        filesystem.vehicle_dir = str(vehicle_dir)
+        filesystem.configuration_steps = json.loads(layout_path.read_text(encoding="utf-8"))["steps"]
+        filesystem.rename_parameter_files()
+        assert {path.name for path in vehicle_dir.glob("*.param")} - {source_name} <= set(filesystem.configuration_steps)
+        assert json.loads(components.read_bytes())["Format version"] == 2
+        before_retry = {path.name: path.read_bytes() for path in vehicle_dir.iterdir()}
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+        assert {path.name: path.read_bytes() for path in vehicle_dir.iterdir()} == before_retry
+
+    def test_user_can_open_retained_calibration_from_historical_heli_step(
+        self, vehicle_dir: Path, historical_configuration_package: Path
+    ) -> None:
+        """
+        Heli's historical calibration reaches the current split steps.
+
+        GIVEN: The OMP_M4 hardware filename with measured calibration and fence settings
+        WHEN: Heli conversion runs before the usual project filename renames
+        THEN: Calibration reaches the accelerometer step and the fence reaches the safety step
+        """
+        source = vehicle_dir / "15_mp_setup_mandatory_hardware.param"
+        source.write_text("INS_ACCSCAL_X,0.998\nFENCE_RADIUS,150\n", encoding="utf-8")
+
+        migration_module._migrate_v1_to_v2(vehicle_dir, "Heli")  # pylint: disable=protected-access
+        filesystem = LocalFilesystem.__new__(LocalFilesystem)
+        filesystem.vehicle_dir = str(vehicle_dir)
+        configuration = historical_configuration_package / "configuration_steps_Heli.json"
+        filesystem.configuration_steps = json.loads(configuration.read_text(encoding="utf-8"))["steps"]
+        filesystem.rename_parameter_files()
+
+        assert not source.exists()
+        assert (vehicle_dir / "06_accelerometer_calibration.param").read_text(encoding="utf-8") == "INS_ACCSCAL_X,0.998\n"
+        assert (vehicle_dir / "27_safety_setup.param").read_text(encoding="utf-8") == "FENCE_RADIUS,150\n"
+
+    @pytest.mark.parametrize(
+        ("vehicle_type", "template_name"),
+        [
+            ("ArduPlane", "normal_plane"),
+            ("Rover", "AION_R1"),
+            ("Rover", "Carisma_SCA-1E"),
+            ("Heli", "OMP_M4"),
+        ],
+    )
+    def test_existing_vehicle_templates_keep_all_parameter_values_in_their_layout(  # pylint: disable=too-many-locals
+        self,
+        vehicle_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        vehicle_type: str,
+        template_name: str,
+        historical_configuration_package: Path,
+    ) -> None:
+        """
+        Real Plane, Rover and Heli projects do not acquire Copter-only calibration files.
+
+        GIVEN: Numbered parameter files from an existing vehicle template at format 1
+        WHEN: Migration to format 2 runs against the vehicle's own configuration steps
+        THEN: Every original parameter line survives and every newly created file is an active step
+        """
+        # V1 snapshots from 92c5d6ad remain independent of the packaged templates.
+        fixtures = json.loads((Path(__file__).parent / "fixtures" / "vehicle_templates_v1.json").read_text(encoding="utf-8"))
+        legacy = fixtures[f"{vehicle_type}/{template_name}"]
+        for filename, content in legacy["files"].items():
+            (vehicle_dir / filename).write_text(content, encoding="utf-8")
+        (vehicle_dir / "vehicle_components.json").write_text(json.dumps(legacy["components"]), encoding="utf-8")
+        originals = {path.name for path in vehicle_dir.glob("*.param")}
+        original_lines = {
+            line
+            for path in vehicle_dir.glob("*.param")
+            if path.name != "00_default.param"
+            for line in path.read_text(encoding="utf-8-sig").splitlines()
+            if _param_name_from_line(line)
+        }
+        monkeypatch.setattr(migration_module, "VEHICLE_COMPONENTS_FORMAT_VERSION", 2)
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        resulting_files = {path.name for path in vehicle_dir.glob("*.param")}
+        steps = json.loads(
+            (historical_configuration_package / f"configuration_steps_{vehicle_type}.json").read_text(encoding="utf-8")
+        )["steps"]
+        assert resulting_files - originals <= set(steps)
+        resulting_lines = {
+            line
+            for path in vehicle_dir.glob("*.param")
+            if path.name != "00_default.param"
+            for line in path.read_text(encoding="utf-8-sig").splitlines()
+            if _param_name_from_line(line)
+        }
+        assert original_lines <= resulting_lines
+        safety_name = (
+            "16_safety_setup.param"
+            if (vehicle_dir / "16_safety_setup.param").exists()
+            else {"Heli": "27_safety_setup.param", "Rover": "20_safety_setup.param"}[vehicle_type]
+        )
+        safety = (vehicle_dir / safety_name).read_text(encoding="utf-8")
+        assert "FENCE_ACTION,1" in safety
+        assert "FENCE_RADIUS,300" in safety
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+
+    @pytest.mark.parametrize(
+        ("vehicle_type", "template_name", "layout_template"),
+        [
+            ("ArduCopter", "Holybro_X500", ""),
+            ("ArduPlane", "normal_plane", ""),
+            ("Heli", "OMP_M4", ""),
+            ("Rover", "AION_R1", ""),
+        ],
+    )
+    def test_conversion_rules_target_existing_steps_and_vehicle_parameter_names(  # pylint: disable=too-many-locals
+        self, vehicle_type: str, template_name: str, layout_template: str, historical_configuration_package: Path
+    ) -> None:
+        """
+        Migration rules refer to supported parameter names and the matching vehicle layout.
+
+        GIVEN: Each vehicle's default parameter set and destination configuration steps
+        WHEN: Its move, copy and deletion rules are inspected
+        THEN: Every destination is an active step or its declared former filename,
+              and every pattern matches a parameter for that vehicle
+        """
+        package = Path(__file__).parents[1] / "ardupilot_methodic_configurator"
+        templates = package / "vehicle_templates" / vehicle_type
+        defaults = {
+            _param_name_from_line(line)
+            for line in (templates / template_name / "00_default.param").read_text(encoding="utf-8-sig").splitlines()
+            if _param_name_from_line(line)
+        }
+        if vehicle_type == "ArduCopter":
+            # Firmware 4.7 renames and optional IMU subgroups are not present in
+            # the X500's three-IMU 4.6 default export.
+            defaults.update(
+                _param_name_from_line(line)
+                for line in (templates / "empty_4.7.x" / "00_default.param").read_text(encoding="utf-8-sig").splitlines()
+                if _param_name_from_line(line)
+            )
+            defaults.update(
+                f"INS{imu}_{suffix}" for imu in (4, 5) for suffix in ("USE", "ACC_CALTEMP", "ACCOFFS_X", "ACCSCAL_X")
+            )
+        configuration = (
+            templates / layout_template if layout_template else historical_configuration_package
+        ) / f"configuration_steps_{vehicle_type}.json"
+        steps = json.loads(configuration.read_text(encoding="utf-8"))["steps"]
+        destination_names = set(steps)
+        destination_names.update(alias for step in steps.values() for alias in step.get("old_filenames", []))
+        moves = migration_module._PARAM_MOVES_V1_TO_V2  # pylint: disable=protected-access
+        copies = migration_module._PARAM_COPIES_V1_TO_V2  # pylint: disable=protected-access
+        deletes = migration_module._PARAM_DELETES_V1_TO_V2  # pylint: disable=protected-access
+        assert not moves["all"]
+        assert not copies["all"]
+        assert not deletes["all"]
+        assert moves[vehicle_type]
+        for _source, destination, patterns, _force in moves[vehicle_type]:
+            assert destination in destination_names
+            for pattern in patterns:
+                assert any(_line_matches_any(name, [pattern]) for name in defaults), pattern
+        for _source, moved_destination, destination, patterns in copies[vehicle_type]:
+            assert moved_destination in destination_names
+            assert destination in destination_names
+            for pattern in patterns:
+                assert any(_line_matches_any(name, [pattern]) for name in defaults), pattern
+        for _source, patterns in deletes[vehicle_type]:
+            for pattern in patterns:
+                assert any(_line_matches_any(name, [pattern]) for name in defaults), pattern
+
+    @pytest.mark.parametrize("vehicle_type", ["", "UnknownVehicle"])
+    def test_unknown_vehicle_does_not_apply_another_vehicles_conversion(self, vehicle_dir: Path, vehicle_type: str) -> None:
+        """
+        Unknown vehicle types cannot silently receive Copter-specific conversions.
+
+        GIVEN: An unrecognized vehicle with calibration, mode and fence parameters
+        WHEN: The v1-to-v2 conversion is requested
+        THEN: Its parameter file is byte-for-byte unchanged and no new files appear
+        """
+        source = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        original = b"INS_ACCSCAL_X,0.998\r\nFLTMODE1,3\r\nFENCE_ACTION,1\r\n"
+        source.write_bytes(original)
+
+        deleted = migration_module._migrate_v1_to_v2(vehicle_dir, vehicle_type)  # pylint: disable=protected-access
+
+        assert deleted == set()
+        assert source.read_bytes() == original
+        assert list(vehicle_dir.iterdir()) == [source]
+
+
+class TestDeletedConfigurationStepFiles:  # pylint: disable=too-few-public-methods
+    """Tests that restoration does not undo an intentional migration deletion."""
+
+    def test_deleted_mandatory_hardware_file_is_not_restored_from_empty_template(
+        self, vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A step deleted by v1→v2 stays deleted even when the empty template has that file."""
+        template_dir = vehicle_dir / "templates" / "ArduCopter" / "empty_4.6.x"
+        template_dir.mkdir(parents=True)
+        (template_dir / "14_mp_setup_mandatory_hardware.param").write_text(
+            "FRAME_CLASS,0\nINS_ACCSCAL_X,1\nMOT_THST_HOVER,0.35\n", encoding="utf-8"
+        )
+        (vehicle_dir / "configuration_steps_ArduCopter.json").write_text(
+            json.dumps({"steps": {"14_mp_setup_mandatory_hardware.param": {}}}), encoding="utf-8"
+        )
+        (vehicle_dir / "vehicle_components.json").write_text(
+            json.dumps(
+                {
+                    "Format version": 1,
+                    "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        mandatory_hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+        mandatory_hardware.write_text("FRAME_CLASS,1\nINS_ACCSCAL_X,0.998941\nMOT_THST_HOVER,0.301157\n", encoding="utf-8")
+        monkeypatch.setattr(
+            migration_module.VehicleProjectCreator,
+            "template_dir_for_bin_import",
+            staticmethod(lambda _vehicle_type, _major, _minor: str(template_dir)),
+        )
+        # Exercise the v1→v2 stage while the checked-in target remains format 1.
+        monkeypatch.setattr(migration_module, "VEHICLE_COMPONENTS_FORMAT_VERSION", 2)
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        assert not mandatory_hardware.exists()
+        assert "INS_ACCSCAL_X,0.998941" in (vehicle_dir / "16_accelerometer_calibration.param").read_text(encoding="utf-8")
+
+
+class TestMissingConfigurationStepFileRestore:
+    """Tests restoration of configuration-step files absent from old projects."""
+
+    @pytest.fixture(
+        params=[(number, None) for number in sorted({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV})]
+        + [(errno.EINVAL, 1), (errno.EINVAL, 50)]
+    )
+    def filesystem_without_hard_links(self, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+        """Simulate a writable filesystem that cannot publish hard links."""
+        error_number, windows_error = request.param
+
+        def unavailable_link(_source: Path, _destination: Path) -> None:
+            error = OSError(error_number, "Hard links unavailable on this filesystem")
+            if windows_error is not None:
+                error.winerror = windows_error
+            raise error
+
+        monkeypatch.setattr(migration_module, "os_link", unavailable_link)
+
+    @pytest.fixture
+    def project_with_missing_step(self, vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Provide an old project with one missing step and an isolated matching template."""
+        template_dir = vehicle_dir / "template"
+        template_dir.mkdir()
+        (template_dir / "99_restored.param").write_bytes(
+            b"\xef\xbb\xbfRESTORED_PARAM,42 # retained comment\r\nANOTHER_PARAM,7\r\n"
+        )
+        (vehicle_dir / "configuration_steps_ArduCopter.json").write_text(
+            json.dumps({"steps": {"99_restored.param": {}}}), encoding="utf-8"
+        )
+        (vehicle_dir / "vehicle_components.json").write_text(
+            json.dumps(
+                {
+                    "Format version": 1,
+                    "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            migration_module.VehicleProjectCreator,
+            "template_dir_for_bin_import",
+            staticmethod(lambda *_args: str(template_dir)),
+        )
+        return template_dir / "99_restored.param"
+
+    @pytest.mark.usefixtures("filesystem_without_hard_links")
+    def test_user_can_open_and_reopen_project_without_hard_link_support(
+        self, vehicle_dir: Path, project_with_missing_step: Path
+    ) -> None:
+        """
+        Migration succeeds on filesystems without hard-link support.
+
+        GIVEN: A writable project filesystem rejects hard links and one configuration step is missing
+        WHEN: The user opens the project and then opens it again
+        THEN: The complete step is restored once, migration is finalized, and no temporary files remain
+        """
+        destination = vehicle_dir / project_with_missing_step.name
+        original_template = project_with_missing_step.read_bytes()
+        components = vehicle_dir / "vehicle_components.json"
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert destination.read_bytes() == original_template
+        assert project_with_missing_step.read_bytes() == original_template
+        migrated_components = components.read_bytes()
+        assert json.loads(migrated_components)["Format version"] == VEHICLE_COMPONENTS_FORMAT_VERSION
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+        assert components.read_bytes() == migrated_components
+        assert destination.read_bytes() == original_template
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    @pytest.mark.parametrize("content", [b"", b"USER_VALUE,17\n"])
+    @pytest.mark.usefixtures("filesystem_without_hard_links")
+    def test_restore_without_hard_links_preserves_competing_project_file(
+        self,
+        vehicle_dir: Path,
+        project_with_missing_step: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        content: bytes,
+    ) -> None:
+        """
+        A fallback restoration cannot overwrite a file another writer creates.
+
+        GIVEN: Hard links are unavailable and a step is initially missing
+        WHEN: Another writer creates that step before the fallback copy starts
+        THEN: Its contents, including an empty file, are preserved and migration completes
+        """
+        destination = vehicle_dir / project_with_missing_step.name
+        unavailable_link = migration_module.os_link
+
+        def competing_link(source: Path, target: Path) -> None:
+            target.write_bytes(content)
+            unavailable_link(source, target)
+
+        monkeypatch.setattr(migration_module, "os_link", competing_link)
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert destination.read_bytes() == content
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    @pytest.mark.parametrize("failure_stage", ["copy", "fsync"])
+    @pytest.mark.usefixtures("filesystem_without_hard_links")
+    def test_user_can_retry_interrupted_restore_without_hard_links(
+        self,
+        vehicle_dir: Path,
+        project_with_missing_step: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_stage: str,
+    ) -> None:
+        """
+        A failed fallback copy leaves the project ready for a complete retry.
+
+        GIVEN: Hard links are unavailable and the fallback copy or flush fails
+        WHEN: The user opens the project again after the storage failure is resolved
+        THEN: No partial step survives the failure and every template byte is restored on retry
+        """
+        destination = vehicle_dir / project_with_missing_step.name
+        components = vehicle_dir / "vehicle_components.json"
+        original_components = components.read_bytes()
+        original_template = project_with_missing_step.read_bytes()
+        original_fsync = migration_module.fsync
+        message = f"Simulated fallback {failure_stage} failure"
+
+        def interrupted_copy(source: BinaryIO, target: BinaryIO) -> None:
+            target.write(source.read(10))
+            raise OSError(message)
+
+        def interrupted_fsync(descriptor: int) -> None:
+            if destination.exists():
+                raise OSError(message)
+            original_fsync(descriptor)
+
+        with monkeypatch.context() as failure_patch:
+            if failure_stage == "copy":
+                failure_patch.setattr(migration_module, "copyfileobj", interrupted_copy)
+            else:
+                failure_patch.setattr(migration_module, "fsync", interrupted_fsync)
+            with pytest.raises(OSError, match=message):
+                migrate_vehicle_project_if_needed(str(vehicle_dir))
+
+        assert components.read_bytes() == original_components
+        assert not destination.exists()
+        assert not list(vehicle_dir.glob("*.tmp"))
+        assert project_with_missing_step.read_bytes() == original_template
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert destination.read_bytes() == original_template
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    def test_restored_step_requests_normal_project_file_permissions(
+        self, vehicle_dir: Path, project_with_missing_step: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Restored steps must not inherit a private temporary file's owner-only mode.
+
+        GIVEN: An old project with a missing step from its firmware template
+        WHEN: Migration creates a temporary copy for that step
+        THEN: It requests normal file permissions and lets the OS apply umask and inherited ACLs
+        """
+        original_open = os.open
+        requested_modes: list[int] = []
+
+        def record_creation_mode(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if Path(path).parent == vehicle_dir and flags & os.O_CREAT:
+                requested_modes.append(mode)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(migration_module, "os_open", record_creation_mode)
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        assert requested_modes == [0o666]
+        assert (vehicle_dir / project_with_missing_step.name).read_bytes() == project_with_missing_step.read_bytes()
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits are not meaningful on Windows")
+    @pytest.mark.parametrize("creation_umask", [0o022, 0o002, 0o027, 0o077], ids=["standard", "shared", "group", "private"])
+    def test_restored_step_matches_normal_file_permissions_under_umask(
+        self, vehicle_dir: Path, project_with_missing_step: Path, creation_umask: int
+    ) -> None:
+        """
+        Restoration respects shared and private project permission policies.
+
+        GIVEN: A read-only template and a process with a specific file-creation umask
+        WHEN: A missing step and a normal comparison file are created in that process
+        THEN: Both files have the same umask-derived permissions, without inheriting the template's mode
+        """
+        destination = vehicle_dir / project_with_missing_step.name
+        comparison = vehicle_dir / "normal_creation.param"
+        project_with_missing_step.chmod(0o400)
+        # Isolate the umask change from the pytest process and any background threads.
+        script = """
+import os
+import sys
+from pathlib import Path
+from ardupilot_methodic_configurator.backend_filesystem_migration import _copy_configuration_step_file
+
+os.umask(int(sys.argv[4]))
+Path(sys.argv[3]).write_bytes(b"normal file")
+_copy_configuration_step_file(Path(sys.argv[1]), Path(sys.argv[2]))
+"""
+        subprocess.run(  # noqa: S603
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(project_with_missing_step),
+                str(destination),
+                str(comparison),
+                str(creation_umask),
+            ],
+            check=True,
+            cwd=Path(__file__).parents[1],
+        )
+
+        assert S_IMODE(destination.stat().st_mode) == S_IMODE(comparison.stat().st_mode) == 0o666 & ~creation_umask
+        assert S_IMODE(project_with_missing_step.stat().st_mode) == 0o400
+        assert destination.read_bytes() == project_with_missing_step.read_bytes()
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    def test_temporary_name_collision_preserves_the_existing_file(
+        self, vehicle_dir: Path, project_with_missing_step: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An occupied temporary filename must not be overwritten or removed.
+
+        GIVEN: A file already exists at the proposed temporary-copy path
+        WHEN: Migration attempts to create that temporary file, then retries with a new name
+        THEN: The occupied file is preserved and the retry restores the missing step
+        """
+        occupied = vehicle_dir / ".migration-occupied.tmp"
+        occupied.write_bytes(b"unrelated file")
+        destination = vehicle_dir / project_with_missing_step.name
+        components = vehicle_dir / "vehicle_components.json"
+        original_components = components.read_bytes()
+
+        with monkeypatch.context() as collision_patch:
+            collision_patch.setattr(migration_module, "token_hex", lambda *_args: "occupied")
+            with pytest.raises(FileExistsError):
+                migrate_vehicle_project_if_needed(str(vehicle_dir))
+
+        assert occupied.read_bytes() == b"unrelated file"
+        assert components.read_bytes() == original_components
+        assert not destination.exists()
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert destination.read_bytes() == project_with_missing_step.read_bytes()
+        assert occupied.read_bytes() == b"unrelated file"
+        assert list(vehicle_dir.glob("*.tmp")) == [occupied]
+
+    def test_user_can_retry_migration_after_an_interrupted_template_copy(
+        self, vehicle_dir: Path, project_with_missing_step: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A failed restoration must not publish a partial configuration step.
+
+        GIVEN: An old project is missing a step from its matching firmware template
+        WHEN: Copying that step fails after writing some bytes, then migration is retried
+        THEN: The failed copy leaves no destination or temporary file and retry restores every byte
+        """
+        destination = vehicle_dir / project_with_missing_step.name
+        components = vehicle_dir / "vehicle_components.json"
+        original_components = components.read_bytes()
+        original_template = project_with_missing_step.read_bytes()
+
+        def interrupted_copy(source: Path, target: Path) -> None:
+            Path(target).write_bytes(Path(source).read_bytes()[:10])
+            message = "Simulated interrupted template copy"
+            raise OSError(message)
+
+        with monkeypatch.context() as failure_patch:
+            failure_patch.setattr(migration_module, "copyfile", interrupted_copy)
+            with pytest.raises(OSError, match="Simulated interrupted template copy"):
+                migrate_vehicle_project_if_needed(str(vehicle_dir))
+
+        assert components.read_bytes() == original_components
+        assert not destination.exists()
+        assert not list(vehicle_dir.glob("*.tmp"))
+        assert project_with_missing_step.read_bytes() == original_template
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert destination.read_bytes() == original_template
+        assert json.loads(components.read_text(encoding="utf-8"))["Format version"] == VEHICLE_COMPONENTS_FORMAT_VERSION
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    def test_user_can_retry_migration_when_restored_step_cannot_be_published(
+        self, vehicle_dir: Path, project_with_missing_step: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Publishing a restored step happens only after its complete contents have been copied.
+
+        GIVEN: An old project with a missing step and a complete firmware template
+        WHEN: The completed temporary copy cannot replace the destination
+        THEN: Migration remains pending, the temporary file is cleaned up, and retry succeeds
+        """
+        destination = vehicle_dir / project_with_missing_step.name
+        components = vehicle_dir / "vehicle_components.json"
+        original_components = components.read_bytes()
+        original_template = project_with_missing_step.read_bytes()
+
+        def failed_publish(temporary: Path, target: Path) -> None:
+            assert temporary.parent == destination.parent
+            assert temporary.read_bytes() == original_template
+            assert target == destination
+            assert not destination.exists()
+            message = "Simulated publication failure"
+            raise OSError(message)
+
+        with monkeypatch.context() as failure_patch:
+            failure_patch.setattr(migration_module, "os_link", failed_publish)
+            with pytest.raises(OSError, match="Simulated publication failure"):
+                migrate_vehicle_project_if_needed(str(vehicle_dir))
+
+        assert components.read_bytes() == original_components
+        assert not destination.exists()
+        assert not list(vehicle_dir.glob("*.tmp"))
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert destination.read_bytes() == original_template
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    def test_restored_step_is_not_visible_until_template_copy_completes(
+        self, vehicle_dir: Path, project_with_missing_step: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Readers must not observe an incomplete restored step.
+
+        GIVEN: An old project with a missing configuration step
+        WHEN: Its firmware template is copied successfully
+        THEN: The destination remains absent throughout copying and appears with unchanged bytes afterwards
+        """
+        destination = vehicle_dir / project_with_missing_step.name
+
+        def observed_copy(source: Path, target: Path) -> None:
+            assert not destination.exists()
+            copyfile(source, target)
+            assert not destination.exists()
+
+        monkeypatch.setattr(migration_module, "copyfile", observed_copy)
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        assert destination.read_bytes() == project_with_missing_step.read_bytes()
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    @pytest.mark.parametrize("content", [b"", b"USER_VALUE,17\n"])
+    def test_restore_preserves_file_created_while_template_is_being_copied(
+        self, vehicle_dir: Path, project_with_missing_step: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+    ) -> None:
+        """
+        Preserve competing writes during restoration.
+
+        GIVEN: Another writer creates a previously missing step during restoration
+        WHEN: The complete template copy is published
+        THEN: Even an empty competing file is preserved and temporary files are removed
+        """
+        destination = vehicle_dir / project_with_missing_step.name
+
+        def competing_copy(source: Path, target: Path) -> None:
+            copyfile(source, target)
+            destination.write_bytes(content)
+
+        monkeypatch.setattr(migration_module, "copyfile", competing_copy)
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert destination.read_bytes() == content
+        assert not list(vehicle_dir.glob("*.tmp"))
+
+    @pytest.mark.parametrize("existing_content", ["", "PROJECT_VALUE,17\n"])
+    def test_restore_preserves_existing_steps_and_ignores_unlisted_template_files(
+        self, vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch, existing_content: str
+    ) -> None:
+        """
+        Restoring missing steps preserves deliberate project contents and deletions.
+
+        GIVEN: Existing, missing, deleted and unlisted files in a matching empty template
+        WHEN: Missing configuration steps are restored using the project's step definitions
+        THEN: Only the missing declared step is copied, including when existing files are empty
+        """
+        template_dir = vehicle_dir / "template"
+        template_dir.mkdir()
+        for filename in ["90_existing.param", "91_missing.param", "92_deleted.param", "93_unlisted.param"]:
+            (template_dir / filename).write_text("TEMPLATE_VALUE,42\n", encoding="utf-8")
+        existing = vehicle_dir / "90_existing.param"
+        existing.write_text(existing_content, encoding="utf-8")
+        (vehicle_dir / "configuration_steps_ArduCopter.json").write_text(
+            json.dumps({"steps": {name: {} for name in ["90_existing.param", "91_missing.param", "92_deleted.param"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            migration_module.VehicleProjectCreator,
+            "template_dir_for_bin_import",
+            staticmethod(lambda *_args: str(template_dir)),
+        )
+
+        migration_module._restore_missing_configuration_step_files(  # pylint: disable=protected-access
+            vehicle_dir, "ArduCopter", "4.6.3", {"92_deleted.param"}
+        )
+
+        assert existing.read_text(encoding="utf-8") == existing_content
+        assert (vehicle_dir / "91_missing.param").read_text(encoding="utf-8") == "TEMPLATE_VALUE,42\n"
+        assert not (vehicle_dir / "92_deleted.param").exists()
+        assert not (vehicle_dir / "93_unlisted.param").exists()
+
+    def test_missing_step_file_is_copied_from_matching_empty_firmware_template(
+        self, vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing step is restored from the empty_{major}.{minor}.x template after migration."""
+        templates_dir = vehicle_dir / "templates"
+        template_dir = templates_dir / "ArduCopter" / "empty_4.6.x"
+        template_dir.mkdir(parents=True)
+        (template_dir / "99_restored.param").write_text("RESTORED_PARAM,42\n", encoding="utf-8")
+        (vehicle_dir / "configuration_steps_ArduCopter.json").write_text(
+            json.dumps({"steps": {"99_restored.param": {}}}), encoding="utf-8"
+        )
+        (vehicle_dir / "vehicle_components.json").write_text(
+            json.dumps(
+                {
+                    "Format version": 0,
+                    "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            migration_module.VehicleProjectCreator,
+            "template_dir_for_bin_import",
+            staticmethod(lambda _vehicle_type, _major, _minor: str(template_dir)),
+        )
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+        assert (vehicle_dir / "99_restored.param").read_text(encoding="utf-8") == "RESTORED_PARAM,42\n"
+
+
+# ---------------------------------------------------------------------------
 # Pattern-matching edge cases
 # ---------------------------------------------------------------------------
+
+
+def test_user_keeps_fourth_and_fifth_imu_calibration_values(tmp_path: Path) -> None:
+    """
+    Preserve calibration of optional IMU subgroups.
+
+    GIVEN: Calibration values use the Copter-4.6.3 IMU 4_/5_ subgroup names
+    WHEN: The hardware step is split
+    THEN: Offsets, scales and use flags reach calibration, with temperatures also retained in the temperature step
+    """
+    values = {
+        f"INS{imu}_{suffix}": index + 1
+        for imu in (4, 5)
+        for index, suffix in enumerate(
+            ("USE", "ACCOFFS_X", "ACCOFFS_Y", "ACCOFFS_Z", "ACCSCAL_X", "ACCSCAL_Y", "ACCSCAL_Z", "ACC_CALTEMP")
+        )
+    }
+    (tmp_path / "14_mp_setup_mandatory_hardware.param").write_text(
+        "".join(f"{name},{value}\n" for name, value in values.items()), encoding="utf-8"
+    )
+    migration_module._migrate_v1_to_v2(tmp_path, "ArduCopter")  # pylint: disable=protected-access
+    calibration = ParDict.load_param_file_into_dict(str(tmp_path / "16_accelerometer_calibration.param"))
+    temperatures = ParDict.load_param_file_into_dict(str(tmp_path / "03_imu_temperature_calibration_results.param"))
+    assert {name: param.value for name, param in calibration.items()} == values
+    assert {name: param.value for name, param in temperatures.items()} == {
+        name: value for name, value in values.items() if name.endswith("CALTEMP")
+    }
+    assert not (tmp_path / "14_mp_setup_mandatory_hardware.param").exists()
 
 
 class TestPatternMatchingEdgeCases:
@@ -958,3 +2547,466 @@ class TestVehicleTypeGating:
         assert result is True
         assert not any(record.levelno == logging.ERROR for record in caplog.records)
         assert (vehicle_dir / "18_osd.param").exists()
+
+
+@pytest.mark.parametrize("use_local_steps", [False, True], ids=["package", "local"])
+def test_plane_v1_values_survive_template_restoration_and_filename_renames(
+    vehicle_dir: Path, use_local_steps: bool, historical_configuration_package: Path
+) -> None:
+    """
+    Opening a legacy Plane project preserves its orientation and GNSS choices.
+
+    GIVEN: A V1 Plane project and frozen migration-era aliases whose values differ from the empty 4.7 template
+    WHEN: Missing steps are restored and legacy parameter filenames are renamed using those aliases
+    THEN: The user's values survive and no obsolete parameter filenames remain
+    """
+    components = {
+        "Format version": 1,
+        "Components": {"Flight Controller": {"Firmware": {"Type": "ArduPlane", "Version": "4.7.0"}}},
+    }
+    (vehicle_dir / "vehicle_components.json").write_text(json.dumps(components), encoding="utf-8")
+    (vehicle_dir / "05_board_orientation.param").write_text("AHRS_ORIENTATION,4 # installed sideways\n", encoding="utf-8")
+    (vehicle_dir / "12_gnss.param").write_text("GPS1_TYPE,2 # project receiver\n", encoding="utf-8")
+    configuration = historical_configuration_package / "configuration_steps_ArduPlane.json"
+    if use_local_steps:
+        copyfile(configuration, vehicle_dir / configuration.name)
+        configuration = vehicle_dir / configuration.name
+
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+    filesystem = LocalFilesystem(
+        str(vehicle_dir),
+        "ArduPlane",
+        "",
+        allow_editing_template_files=False,
+        save_component_to_system_templates=False,
+        load_project=False,
+    )
+    filesystem.configuration_steps = json.loads(configuration.read_text(encoding="utf-8"))["steps"]
+    filesystem.rename_parameter_files()
+    filesystem.file_parameters = filesystem.read_params_from_files()
+    effective = filesystem.compound_params()[0]
+
+    assert effective["AHRS_ORIENTATION"].value == 4
+    assert effective["GPS1_TYPE"].value == 2
+    assert "installed sideways" in (vehicle_dir / "15_board_orientation.param").read_text(encoding="utf-8")
+    assert "project receiver" in (vehicle_dir / "18_gnss.param").read_text(encoding="utf-8")
+    assert not (vehicle_dir / "05_board_orientation.param").exists()
+    assert not (vehicle_dir / "12_gnss.param").exists()
+    assert {path.name for path in vehicle_dir.glob("*.param")} <= set(filesystem.configuration_steps)
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+
+
+def test_plane_v1_quadplane_filter_tuning_moves_to_notch_results(vehicle_dir: Path) -> None:
+    """
+    Plane's filter migration retains the tuned QuadPlane rate filters.
+
+    GIVEN: A V1 Plane hardware step with QuadPlane filter tuning
+    WHEN: The hardware settings are split into V2 steps
+    THEN: Filter values and their comments remain in the active notch-results step
+    """
+    source = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+    content = "Q_A_RAT_RLL_FLTD,17 # measured filter\nQ_A_RAT_PIT_FLTT,19\nINS_GYRO_FILTER,42\n"
+    source.write_text(content, encoding="utf-8")
+
+    migration_module._migrate_v1_to_v2(vehicle_dir, "ArduPlane")  # pylint: disable=protected-access
+
+    assert (vehicle_dir / "29_motor_notch_filter_results.param").read_text(encoding="utf-8") == content
+    assert not source.exists()
+
+
+class TestCurrentVehicleLayouts:
+    """Opening split-layout projects preserves their existing calibration and tuning."""
+
+    @pytest.mark.parametrize(
+        ("vehicle_type", "template_name"),
+        [
+            ("ArduCopter", "empty_4.7.x"),
+            ("ArduPlane", "normal_plane"),
+            ("ArduPlane", "empty_4.7.x"),
+            ("Heli", "OMP_M4"),
+            ("Heli", "empty_4.7.x"),
+            ("Rover", "AION_R1"),
+            ("Rover", "Carisma_SCA-1E"),
+            ("Rover", "empty_4.7.x"),
+        ],
+    )
+    def test_opening_current_templates_preserves_existing_steps_and_restores_only_active_steps(
+        self, vehicle_dir: Path, vehicle_type: str, template_name: str
+    ) -> None:
+        """
+        Current split steps survive a format upgrade without resurrecting obsolete layout files.
+
+        GIVEN: A format-1 project containing the current template's active parameter files
+        WHEN: The project upgrades and missing configuration steps are restored
+        THEN: Existing parameter files remain byte-for-byte unchanged and every restored file is active
+        """
+        package = Path(__file__).parents[1] / "ardupilot_methodic_configurator"
+        steps = json.loads((package / f"configuration_steps_{vehicle_type}.json").read_text(encoding="utf-8"))["steps"]
+        template = package / "vehicle_templates" / vehicle_type / template_name
+        originals: dict[str, bytes] = {}
+        for filename in steps:
+            source = template / filename
+            if source.is_file():
+                originals[filename] = source.read_bytes()
+                (vehicle_dir / filename).write_bytes(originals[filename])
+        assert originals
+        components = vehicle_dir / "vehicle_components.json"
+        components.write_text(
+            json.dumps(
+                {
+                    "Format version": 1,
+                    "Components": {"Flight Controller": {"Firmware": {"Type": vehicle_type, "Version": "4.7.0"}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+        for filename, content in originals.items():
+            assert (vehicle_dir / filename).read_bytes() == content
+        assert {path.name for path in vehicle_dir.glob("*.param")} <= set(steps)
+        assert not any("_mp_setup_mandatory_hardware" in filename for filename in steps)
+        assert json.loads(components.read_bytes())["Format version"] == 2
+        before_retry = {path.name: path.read_bytes() for path in vehicle_dir.iterdir()}
+        assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+        assert {path.name: path.read_bytes() for path in vehicle_dir.iterdir()} == before_retry
+
+    @pytest.mark.parametrize("vehicle_type", ["", "UnknownVehicle", "ArduPlane", "Heli", "Rover"])
+    def test_other_vehicles_do_not_receive_copter_frame_moves(self, vehicle_dir: Path, vehicle_type: str) -> None:
+        """
+        Copter frame migration cannot change another vehicle's configuration.
+
+        GIVEN: A vehicle with a board-orientation file containing frame and orientation values
+        WHEN: The format-1 transition runs for a non-Copter type
+        THEN: Its parameter file stays byte-for-byte unchanged and no new files appear
+        """
+        source = vehicle_dir / "05_board_orientation.param"
+        original = b"AHRS_ORIENTATION,4\r\nFRAME_CLASS,1\r\n"
+        source.write_bytes(original)
+
+        deleted = migration_module._migrate_v1_to_v2(vehicle_dir, vehicle_type)  # pylint: disable=protected-access
+
+        assert deleted == set()
+        assert source.read_bytes() == original
+        assert list(vehicle_dir.iterdir()) == [source]
+
+
+@pytest.mark.parametrize("use_local_steps", [False, True], ids=["package", "local"])
+def test_plane_values_survive_template_restoration_with_current_filenames(vehicle_dir: Path, use_local_steps: bool) -> None:
+    """
+    Opening a Plane project preserves its orientation and GNSS choices when restoring missing steps.
+
+    GIVEN: A V1 Plane project using current filenames and values differing from the empty 4.7 template
+    WHEN: Missing steps are restored with shared or project-local configuration steps
+    THEN: The user's values survive and every parameter file is an active step
+    """
+    package = Path(__file__).parents[1] / "ardupilot_methodic_configurator"
+    components = {
+        "Format version": 1,
+        "Components": {"Flight Controller": {"Firmware": {"Type": "ArduPlane", "Version": "4.7.0"}}},
+    }
+    (vehicle_dir / "vehicle_components.json").write_text(json.dumps(components), encoding="utf-8")
+    (vehicle_dir / "15_board_orientation.param").write_text("AHRS_ORIENTATION,4 # installed sideways\n", encoding="utf-8")
+    (vehicle_dir / "18_gnss.param").write_text("GPS1_TYPE,2 # project receiver\n", encoding="utf-8")
+    configuration = package / "configuration_steps_ArduPlane.json"
+    if use_local_steps:
+        copyfile(configuration, vehicle_dir / configuration.name)
+        configuration = vehicle_dir / configuration.name
+
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+    filesystem = LocalFilesystem(
+        str(vehicle_dir),
+        "ArduPlane",
+        "",
+        allow_editing_template_files=False,
+        save_component_to_system_templates=False,
+        load_project=False,
+    )
+    filesystem.configuration_steps = json.loads(configuration.read_text(encoding="utf-8"))["steps"]
+    filesystem.rename_parameter_files()
+    filesystem.file_parameters = filesystem.read_params_from_files()
+    effective = filesystem.compound_params()[0]
+
+    assert effective["AHRS_ORIENTATION"].value == 4
+    assert effective["GPS1_TYPE"].value == 2
+    assert "installed sideways" in (vehicle_dir / "15_board_orientation.param").read_text(encoding="utf-8")
+    assert "project receiver" in (vehicle_dir / "18_gnss.param").read_text(encoding="utf-8")
+    assert not (vehicle_dir / "05_board_orientation.param").exists()
+    assert not (vehicle_dir / "12_gnss.param").exists()
+    assert {path.name for path in vehicle_dir.glob("*.param")} <= set(filesystem.configuration_steps)
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+
+
+@pytest.mark.parametrize("vehicle_type", ["ArduCopter", "ArduPlane", "Heli", "Rover"])
+@pytest.mark.parametrize("destination_kind", ["controller", "safety"])
+@pytest.mark.parametrize("use_alias", [False, True])
+def test_forced_moves_preserve_the_effective_legacy_file_order(
+    vehicle_dir: Path, vehicle_type: str, destination_kind: str, use_alias: bool
+) -> None:
+    """
+    A forced move keeps the value from the later original project step.
+
+    GIVEN: Conflicting hardware values in an earlier controller or later safety step
+    WHEN: The hardware step is split using current filenames or legacy aliases
+    THEN: The effective value and its comment follow the original file order
+    """
+    destinations = {
+        "ArduCopter": ("06_remote_controller_controller.param", "24_safety_setup.param"),
+        "ArduPlane": ("06_remote_controller_controller.param", "24_safety_setup.param"),
+        "Heli": ("10_remote_controller_controller.param", "27_safety_setup.param"),
+        "Rover": ("09_remote_controller_controller.param", "20_safety_setup.param"),
+    }
+    is_safety = destination_kind == "safety"
+    parameter = "FENCE_ENABLE" if is_safety else "RC1_MIN"
+    destination_name = destinations[vehicle_type][int(is_safety)]
+    alias = "16_safety_setup.param" if is_safety else "07_remote_controller_controller.param"
+    if use_alias:
+        (vehicle_dir / f"configuration_steps_{vehicle_type}.json").write_text(
+            json.dumps({"steps": {destination_name: {"old_filenames": [alias]}}}), encoding="utf-8"
+        )
+    destination = vehicle_dir / (alias if use_alias else destination_name)
+    destination.write_text(f"{parameter},0 # existing step\n", encoding="utf-8")
+    hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+    hardware.write_text(f"{parameter},1 # legacy hardware\n", encoding="utf-8")
+
+    migration_module._migrate_v1_to_v2(vehicle_dir, vehicle_type)  # pylint: disable=protected-access
+
+    expected = f"{parameter},0 # existing step\n" if is_safety else f"{parameter},1 # legacy hardware\n"
+    assert destination.read_text(encoding="utf-8") == expected
+    if use_alias:
+        assert not (vehicle_dir / destination_name).exists()
+
+
+@pytest.mark.parametrize(
+    "failed_filename",
+    ["16_accelerometer_calibration.param", "14_mp_setup_mandatory_hardware.param", "vehicle_components.json"],
+)
+@pytest.mark.parametrize("existing_safety", [False, True])
+def test_retry_distinguishes_restored_safety_defaults_from_original_project_values(
+    vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch, failed_filename: str, existing_safety: bool
+) -> None:
+    """
+    Restored safety defaults never become configured values merely because migration was interrupted.
+
+    GIVEN: A legacy enabled fence and either a missing safety step or a configured disabled fence
+    WHEN: Migration fails during a destination, source or version write and the project is reopened
+    THEN: Retry preserves the original fence choice, calibration and comments
+    """
+    components = vehicle_dir / "vehicle_components.json"
+    components.write_text(
+        json.dumps(
+            {
+                "Format version": 1,
+                "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.7.0"}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+    hardware.write_text("INS_ACCSCAL_X,0.998 # measured\nFENCE_ENABLE,1 # project fence\n", encoding="utf-8")
+    safety = vehicle_dir / "24_safety_setup.param"
+    if existing_safety:
+        safety.write_text("FENCE_ENABLE,0 # configured disabled\n", encoding="utf-8")
+    template = vehicle_dir / "template"
+    template.mkdir()
+    (template / safety.name).write_text("FENCE_ENABLE,0 # template default\n", encoding="utf-8")
+    (template / "16_accelerometer_calibration.param").write_text("INS_ACCSCAL_X,1 # template default\n", encoding="utf-8")
+    monkeypatch.setattr(
+        migration_module.VehicleProjectCreator,
+        "template_dir_for_bin_import",
+        staticmethod(lambda _vehicle_type, _major, _minor: str(template)),
+    )
+
+    with monkeypatch.context() as failure:
+        _interrupt_migration_write(failure, vehicle_dir / failed_filename, "replace")
+        with pytest.raises(OSError, match="simulated migration replace failure"):
+            migrate_vehicle_project_if_needed(str(vehicle_dir))
+    assert json.loads(components.read_text(encoding="utf-8"))["Format version"] == 1
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+    expected_safety = "FENCE_ENABLE,0 # configured disabled\n" if existing_safety else "FENCE_ENABLE,1 # project fence\n"
+    assert safety.read_text(encoding="utf-8") == expected_safety
+    assert (vehicle_dir / "16_accelerometer_calibration.param").read_text(encoding="utf-8") == (
+        "INS_ACCSCAL_X,0.998 # measured\n"
+    )
+    assert not (vehicle_dir / ".migration-v1-to-v2.json").exists()
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+
+
+def test_multiple_historical_hardware_sources_keep_the_latest_value(vehicle_dir: Path) -> None:
+    """
+    Conflicts between multiple legacy hardware files follow their original order.
+
+    GIVEN: Different RC calibration values in both the v0 and v1 hardware filenames
+    WHEN: Both files are split into the same controller step
+    THEN: The value from the later v1 hardware file wins
+    """
+    (vehicle_dir / "11_mp_setup_mandatory_hardware.param").write_text("RC1_MIN,1000 # older\n", encoding="utf-8")
+    (vehicle_dir / "14_mp_setup_mandatory_hardware.param").write_text("RC1_MIN,1100 # later\n", encoding="utf-8")
+
+    migration_module._migrate_v1_to_v2(vehicle_dir, "ArduCopter")  # pylint: disable=protected-access
+
+    assert (vehicle_dir / "06_remote_controller_controller.param").read_text(encoding="utf-8") == "RC1_MIN,1100 # later\n"
+
+
+@pytest.mark.parametrize("vehicle_type", ["ArduCopter", "ArduPlane"])
+@pytest.mark.parametrize("general_filename", ["12_general_configuration.param", "15_general_configuration.param"])
+def test_general_configuration_keeps_the_latest_original_hardware_values(
+    vehicle_dir: Path, vehicle_type: str, general_filename: str
+) -> None:
+    """
+    Known and unrecognized hardware values preserve precedence when surfaced in general configuration.
+
+    GIVEN: Conflicting rangefinder and custom settings in hardware and general configuration
+    WHEN: They are migrated into the current general configuration step
+    THEN: Each effective value comes from the later original file
+    """
+    destination = "23_general_configuration.param"
+    (vehicle_dir / f"configuration_steps_{vehicle_type}.json").write_text(
+        json.dumps({"steps": {destination: {"old_filenames": [general_filename]}}}), encoding="utf-8"
+    )
+    hardware = vehicle_dir / "14_mp_setup_mandatory_hardware.param"
+    hardware.write_text("RNGFND1_TYPE,1 # hardware\nCUSTOM_HARDWARE,1 # hardware\n", encoding="utf-8")
+    general = vehicle_dir / general_filename
+    general.write_text("RNGFND1_TYPE,2 # general\nCUSTOM_HARDWARE,2 # general\n", encoding="utf-8")
+
+    migration_module._migrate_v1_to_v2(vehicle_dir, vehicle_type)  # pylint: disable=protected-access
+
+    expected = 2 if general_filename.startswith("15_") else 1
+    values = ParDict.load_param_file_into_dict(str(general))
+    assert values["RNGFND1_TYPE"].value == expected
+    assert values["CUSTOM_HARDWARE"].value == expected
+
+
+@pytest.mark.parametrize("existing_destination", [False, True], ids=["restored-default", "configured-step"])
+@pytest.mark.parametrize(
+    ("vehicle_type", "parameter"),
+    [
+        (vehicle, parameter)
+        for vehicle, prefix in (("ArduCopter", "ATC"), ("ArduPlane", "Q_A"))
+        for parameter in ["FENCE_ALT_MAX", "FENCE_RADIUS", "INS_GYRO_FILTER"]
+        + [f"{prefix}_RAT_{axis}_FLT{kind}" for axis in ("PIT", "RLL", "YAW") for kind in "DT"]
+    ],
+)
+def test_nonforced_moves_preserve_project_values_over_restored_defaults(
+    vehicle_dir: Path, monkeypatch: pytest.MonkeyPatch, vehicle_type: str, existing_destination: bool, parameter: str
+) -> None:
+    """
+    Every move rule distinguishes restored defaults from configured project values.
+
+    GIVEN: Legacy fence or filter tuning and either a missing or already configured destination
+    WHEN: Migration restores missing steps from a template and moves hardware settings
+    THEN: Project values override restored defaults while existing destination values retain precedence
+    """
+    destination_name = "24_safety_setup.param" if parameter.startswith("FENCE_") else "29_motor_notch_filter_results.param"
+    (vehicle_dir / "vehicle_components.json").write_text(
+        json.dumps(
+            {
+                "Format version": 1,
+                "Components": {"Flight Controller": {"Firmware": {"Type": vehicle_type, "Version": "4.7.0"}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (vehicle_dir / f"configuration_steps_{vehicle_type}.json").write_text(
+        json.dumps({"steps": {destination_name: {}}}), encoding="utf-8"
+    )
+    (vehicle_dir / "14_mp_setup_mandatory_hardware.param").write_text(f"{parameter},77 # project tuning\n", encoding="utf-8")
+    template = vehicle_dir / "template"
+    template.mkdir()
+    (template / destination_name).write_text(f"{parameter},100 # template default\n", encoding="utf-8")
+    monkeypatch.setattr(
+        migration_module.VehicleProjectCreator,
+        "template_dir_for_bin_import",
+        staticmethod(lambda *_args: str(template)),
+    )
+    destination = vehicle_dir / destination_name
+    if existing_destination:
+        destination.write_text(f"{parameter},123 # configured destination\n", encoding="utf-8")
+
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is True
+
+    expected = "123 # configured destination" if existing_destination else "77 # project tuning"
+    assert destination.read_text(encoding="utf-8") == f"{parameter},{expected}\n"
+    assert migrate_vehicle_project_if_needed(str(vehicle_dir)) is False
+
+
+@pytest.mark.parametrize(
+    ("vehicle_type", "source_name", "general_name"),
+    [
+        (vehicle, source, general)
+        for vehicle, general in (("Heli", "26_general_configuration.param"), ("Rover", "19_general_configuration.param"))
+        for source in (
+            "11_mp_setup_mandatory_hardware.param",
+            "12_mp_setup_mandatory_hardware.param",
+            "14_mp_setup_mandatory_hardware.param",
+        )
+    ]
+    + [("Heli", "15_mp_setup_mandatory_hardware.param", "26_general_configuration.param")],
+)
+def test_user_can_review_all_leftover_hardware_values_in_active_vehicle_steps(
+    vehicle_dir: Path, vehicle_type: str, source_name: str, general_name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Heli and Rover hardware values remain visible after their historical step disappears.
+
+    GIVEN: A legacy hardware file with frame, RC mapping, motor, controller and gyro settings
+    WHEN: The project migrates to its vehicle-specific V2 layout
+    THEN: Every leftover value and comment appears in an active step with a review warning
+    """
+    parameters = ("FRAME_CLASS", "FRAME_TYPE", "RCMAP_ROLL", "MOT_THST_EXPO", "ATC_RAT_RLL_P", "INS_GYRO_FILTER")
+    original = "".join(f"{parameter},77 # project hardware\n" for parameter in parameters)
+    source = vehicle_dir / source_name
+    source.write_text(original, encoding="utf-8")
+    general = vehicle_dir / general_name
+    general.write_text("FRAME_CLASS,100 # template default\nUNRELATED,2 # retained\n", encoding="utf-8")
+
+    migration_module._migrate_v1_to_v2(  # pylint: disable=protected-access
+        vehicle_dir, vehicle_type, preexisting_filenames={source_name}
+    )
+
+    assert general.read_text(encoding="utf-8") == "UNRELATED,2 # retained\n" + original
+    assert not source.exists()
+    configuration = Path(__file__).parents[1] / "ardupilot_methodic_configurator" / f"configuration_steps_{vehicle_type}.json"
+    active_steps = json.loads(configuration.read_text(encoding="utf-8"))["steps"]
+    assert {path.name for path in vehicle_dir.glob("*.param")} <= set(active_steps)
+    assert "for review" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("vehicle_type", "destination_name"),
+    [
+        ("ArduCopter", "06_remote_controller_controller.param"),
+        ("ArduPlane", "06_remote_controller_controller.param"),
+        ("Heli", "10_remote_controller_controller.param"),
+        ("Rover", "09_remote_controller_controller.param"),
+    ],
+)
+def test_empty_placeholder_allows_legacy_alias_overlay_before_filename_rename(
+    vehicle_dir: Path, vehicle_type: str, destination_name: str
+) -> None:
+    """
+    An empty current filename must not strand a customized legacy step.
+
+    GIVEN: An empty V2 controller placeholder, an older alias and newer hardware calibration
+    WHEN: Migration overlays the calibration and normal project loading renames the alias
+    THEN: Both original alias settings and the latest calibration are available in the current step
+    """
+    alias = vehicle_dir / "07_remote_controller_controller.param"
+    alias.write_text("RC1_MIN,1200 # older calibration\nRC2_MIN,990 # retained\n", encoding="utf-8")
+    destination = vehicle_dir / destination_name
+    destination.touch()
+    steps = {destination_name: {"old_filenames": [alias.name]}}
+    (vehicle_dir / f"configuration_steps_{vehicle_type}.json").write_text(json.dumps({"steps": steps}), encoding="utf-8")
+    (vehicle_dir / "14_mp_setup_mandatory_hardware.param").write_text("RC1_MIN,1100 # latest calibration\n", encoding="utf-8")
+
+    migration_module._migrate_v1_to_v2(vehicle_dir, vehicle_type)  # pylint: disable=protected-access
+    migration_module._migrate_v1_to_v2(vehicle_dir, vehicle_type)  # pylint: disable=protected-access
+    filesystem = LocalFilesystem.__new__(LocalFilesystem)
+    filesystem.vehicle_dir = str(vehicle_dir)
+    filesystem.configuration_steps = steps
+    filesystem.rename_parameter_files()
+
+    assert not alias.exists()
+    assert destination.read_text(encoding="utf-8") == "RC2_MIN,990 # retained\nRC1_MIN,1100 # latest calibration\n"
