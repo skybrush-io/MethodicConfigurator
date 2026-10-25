@@ -750,10 +750,10 @@ class SkybrushLogAnalysisWindow(BaseWindow):
                 current_version = {}
             self._analysis_is_stale, stored_core, current_core = _stored_analysis_is_stale(analysis, current_version)
             self._stale_version_details = (stored_core, current_core)
-            return _restore_pass_answers(cast("dict[str, Any]", to_agent_view(analysis)), analysis)
-        report_progress(_("Uploading log and running analysis through the Skybrush API - this can take a while"))
-        self._analysis_reused = False
-        analysis = cast("Any", client.analyze(logfile))
+        else:
+            report_progress(_("Uploading log and running analysis through the Skybrush API - this can take a while"))
+            self._analysis_reused = False
+            analysis = cast("dict[str, Any]", client.analyze(logfile))
         return _restore_pass_answers(cast("dict[str, Any]", to_agent_view(analysis)), analysis)
 
     def _on_analysis_done(self, result: object | None, error: Exception | None) -> None:
