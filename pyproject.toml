@@ -171,6 +171,9 @@ required-version = ">=0.12.6"
 # Pymavlink disables its native DataFlash indexer on Windows and macOS source builds.
 extra-build-variables = { pymavlink = { PYMAVLINK_FAST_INDEX = "1" } }
 
+[tool.uv.sources]
+skybrush-log-analyzer = { path = "../skybrush-log-analyzer-cli", editable = true }
+
 [tool.setuptools]
 # Discover the application and its subpackages; specify data via package-data.
 include-package-data = false
