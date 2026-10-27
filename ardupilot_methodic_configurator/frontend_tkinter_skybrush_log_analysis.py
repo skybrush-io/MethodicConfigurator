@@ -12,18 +12,17 @@ import ssl
 import sys
 import tkinter as tk
 from collections.abc import Callable
-from contextlib import redirect_stdout, suppress
-from io import StringIO
+from contextlib import suppress
+from dataclasses import replace
 from logging import debug as logging_debug
 from logging import error as logging_error
-from logging import info as logging_info
 from pathlib import Path
 from threading import Lock
 from tkinter import Toplevel, messagebox, ttk
 from typing import TYPE_CHECKING, Any, cast
 
 from skybrush_log_analyzer.analysis import to_agent_view
-from skybrush_log_analyzer.config import load_config
+from skybrush_log_analyzer.config import load_config, login, logout
 from skybrush_log_analyzer.errors import (
     AccountUnreachable,
     ApplicationErrorWithMessage,
@@ -34,6 +33,7 @@ from skybrush_log_analyzer.errors import (
     ServerError,
     Unauthenticated,
 )
+from skybrush_log_analyzer.paths import ConfigPath
 from skybrush_log_analyzer.utils import calculate_file_hash
 
 from ardupilot_methodic_configurator import _, __version__
@@ -45,7 +45,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_show import show_tooltip
 
 if TYPE_CHECKING:
     from skybrush_log_analyzer.api_client import APIClient
-    from skybrush_log_analyzer.auth_client import AuthClient
+    from skybrush_log_analyzer.config import Config
     from skybrush_log_analyzer.typing import SuggestionCategory
 
 _ACCOUNT_URL = "https://account.skybrush.io"
@@ -110,15 +110,13 @@ def _align_truststore_with_system_cert_injection() -> None:
 # ---------------- Skybrush API clients ----------------
 
 
-def _create_skybrush_clients() -> tuple["APIClient", "AuthClient"]:
-    """Create Skybrush API and authentication clients from the local analyzer configuration."""
+def _create_skybrush_client(config: "Config") -> "APIClient":
+    """Create a Skybrush API client, with its authentication client, for the given analyzer configuration."""
     _align_truststore_with_system_cert_injection()
     from skybrush_log_analyzer.api_client import APIClient  # noqa: PLC0415
     from skybrush_log_analyzer.auth_client import AuthClient  # noqa: PLC0415
 
-    config = load_config()
-    auth_client = AuthClient(config)
-    return APIClient(config, auth_client), auth_client
+    return APIClient(config, AuthClient(config))
 
 
 # ---------------- Skybrush API error messages ----------------
@@ -433,7 +431,8 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._auth_runner = BackgroundTaskRunner(self.root.after)
         self._feedback_runner = BackgroundTaskRunner(self.root.after)
         self._login_runner = BackgroundTaskRunner(self.root.after)
-        self._logged_in = load_config().api_key is not None
+        self._client = _create_skybrush_client(load_config())
+        self._logged_in = self._client.config.api_key is not None
         self._analysis_reused = False
         self._version_info: dict[str, Any] = {}
         #: True while the header version/log-in state has never been fetched successfully.
@@ -727,9 +726,9 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
     def _fetch_or_upload_analysis(self, report_progress: Callable[..., None]) -> dict[str, Any]:
         """Reuse the stored account analysis when present, uploading the log otherwise. Worker thread."""
-        client, auth_client = _create_skybrush_clients()
+        client = self._client
         # Refresh the API token before any request to avoid token expiration mid-operation.
-        auth_client.refresh_token()
+        client.auth.refresh_token()
         force_refresh = self._force_refresh
         self._force_refresh = False
         self._analysis_is_stale = False
@@ -831,6 +830,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
         def on_login_done(result: object | None, error: Exception | None) -> None:
             if error is None:
+                self._client = cast("APIClient", result)
                 self._logged_in = True
                 self._version_check_pending = False
                 self._update_login_button()
@@ -840,36 +840,22 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
         return self._login_runner.start(lambda _progress: self._validate_and_store_api_key(api_key), None, on_login_done)
 
-    def _validate_and_store_api_key(self, api_key: str) -> dict[str, Any]:
-        """Run the analyzer 'login --api-key' command in-process, validating and storing the key. Worker thread."""
-        _align_truststore_with_system_cert_injection()  # before the CLI imports its own truststore copy
-        from skybrush_log_analyzer.cli import login_cmd  # noqa: PLC0415
-
+    def _validate_and_store_api_key(self, api_key: str) -> "APIClient":
+        """Validate a candidate API key against the account and the Skybrush API, storing it when accepted. Worker thread."""
+        config = self._client.config
+        is_local = config.config_dir == ConfigPath.dir(local=True)
+        candidate = _create_skybrush_client(replace(config, api_key=api_key))
+        candidate.auth.refresh_token()
+        candidate.version()
         try:
-            # login_cmd() prints to stdout; capture it and re-emit with the tag prefix on the logging channel.
-            with redirect_stdout(StringIO()) as captured:
-                login_cmd(api_key=api_key, local=False)
-            for line in captured.getvalue().splitlines():
-                if line:
-                    logging_info(_("%s API key validation message: %s"), _LOG_TAG, line)
-        except BaseException as error:  # pylint: disable=broad-exception-caught
-            # The CLI command reports failures as typer.Exit; the underlying cause is what is displayed.
-            cause = getattr(error, "__cause__", None)
-            if isinstance(cause, Exception):
-                raise cause from None
-            raise
-        return {}
+            login(api_key, local=is_local)
+        except OSError as error:
+            raise ConfigError(str(error)) from error
+        return candidate
 
     def _apply_logout(self) -> None:
-        """Run the analyzer 'logout' operation in-process, removing the stored API key and token."""
-        _align_truststore_with_system_cert_injection()  # before the analyzer imports its own truststore copy
-        from skybrush_log_analyzer.config import logout  # noqa: PLC0415
-        from skybrush_log_analyzer.errors import ConfigError  # noqa: PLC0415
-
-        # Do not use logout_cmd(): the CLI reads a config snapshot taken at its module import time,
-        # which in this application predates the API key being stored (it is first imported when
-        # logging in), so logout_cmd() wrongly believes the user is not logged in.
-        config = load_config()
+        """Remove the stored API key and token of the active analyzer configuration."""
+        config = self._client.config
         if config.api_key is None:
             self._logged_in = False
             self._update_login_button()
@@ -877,9 +863,10 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             return
         try:
             logout(config)
-        except (OSError, ConfigError) as error:
+        except OSError as error:
             messagebox.showerror(_("Skybrush Log Analysis"), _skybrush_error_message(error), parent=self.root)
             return
+        self._client = _create_skybrush_client(load_config())
         self._logged_in = False
         self._version_info = {}
         self._version_check_pending = False
@@ -902,7 +889,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
     def _fetch_web_login_url(self) -> str:
         """Acquire a single-sign-on URL for the Skybrush Log Analyzer, deep-linking to this log's analysis."""
-        client, _auth_client = _create_skybrush_clients()
+        client = self._client
         try:
             intent = client.get_analysis_view_intent(Path(self.logfile))
         except BadRequest:
@@ -940,7 +927,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
     def _start_header_status_checks(self) -> None:
         """Fill the header version/log-in labels; the network part runs as background tasks."""
-        if load_config().api_key:
+        if self._client.config.api_key:
             self._version_label.configure(text=_("Fetching Skybrush API version..."))
             if not self._auth_runner.start(
                 lambda _progress: self._fetch_version_and_auth_state(), None, self._on_version_auth_done
@@ -959,10 +946,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
     def _fetch_version_and_auth_state(self) -> dict[str, Any]:
         """Verify log-in and fetch the Skybrush API version. Executed in a worker thread."""
-        client, auth_client = _create_skybrush_clients()
-        # Refresh the token explicitly, mirroring the analyzer 'auth-status' command flow.
-        auth_client.refresh_token()
-        version = client.version()
+        version = self._client.version()
         return version if isinstance(version, dict) else {"app_version": str(version)}
 
     def _retry_pending_version_check(self) -> None:
@@ -973,7 +957,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     def _on_version_auth_done(self, result: object | None, error: Exception | None) -> None:
         if error is not None:
             logging_error(_("%s Skybrush log-in or API version check failed: %s"), _LOG_TAG, error)
-            if isinstance(error, (Unauthenticated, InvalidAPIKey, ConfigError)):
+            if isinstance(error, (Unauthenticated, InvalidAPIKey)):
                 # Definitively logged out: flip the header button to the Login state.
                 self._logged_in = False
                 self._update_login_button()
@@ -991,7 +975,9 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self._logged_in = True
             self._update_login_button()
         self._version_label.configure(text=_format_api_version(result), foreground="")
-        self._set_auth_status(_("Authenticated at {account_url}").format(account_url=load_config().account_url), "dark green")
+        self._set_auth_status(
+            _("Authenticated at {account_url}").format(account_url=self._client.config.account_url), "dark green"
+        )
 
     def _set_auth_status(self, text: str, color: str) -> None:
         """Set the header log-in status line with its severity color."""
@@ -1037,8 +1023,9 @@ class SkybrushLogAnalysisWindow(BaseWindow):
                 content_lines.append(_("Log file SHA-256: {hash}").format(hash=calculate_file_hash(logfile.read_bytes())))
         if self._version_info:
             content_lines.append(_format_api_version(self._version_info))
-        client, _auth_client = _create_skybrush_clients()
-        result = client.suggest(category=cast("SuggestionCategory", category), title=title, content="\n".join(content_lines))
+        result = self._client.suggest(
+            category=cast("SuggestionCategory", category), title=title, content="\n".join(content_lines)
+        )
         return cast("dict[str, Any]", result)
 
     # ---------------- results rendering ----------------
