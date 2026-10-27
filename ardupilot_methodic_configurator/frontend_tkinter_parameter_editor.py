@@ -934,42 +934,14 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
             if (self.parameter_editor.is_fc_connected and self.parameter_editor.is_mavftp_supported)
             else _("No flight controller connected or MAVFTP not supported"),
         )
-
-        # Create analyse flight log button
-        analyse_log_button = ttk.Button(
-            buttons_frame,
-            text=_("Analyse a .bin log"),
-            command=self.on_analyse_log_click,
-        )
-        analyse_log_button.pack(side=tk.LEFT, padx=(8, 8))
-        show_tooltip(analyse_log_button, _("Open a .bin flight log and analyse its availability"))
-
         # Create Skybrush log analysis button
         skybrush_log_button = ttk.Button(
             buttons_frame,
-            text=_("Analyze log\nwith Skybrush"),
+            text=_("Analyse log\nwith Skybrush"),
             command=self.on_analyse_log_with_skybrush_click,
         )
         skybrush_log_button.pack(side=tk.LEFT, padx=(8, 8))
         show_tooltip(skybrush_log_button, _("Select a .bin flight log to open the Skybrush Log Analysis window"))
-
-        # Create Zip file for forum button
-        zip_vehicle_for_forum_button = ttk.Button(
-            buttons_frame,
-            text=_("Zip Vehicle for Forum Help"),
-            command=self.on_zip_vehicle_for_forum_help_click,
-        )
-        zip_vehicle_for_forum_button.configure(state=("normal" if self.parameter_editor.parameter_files() else "disabled"))
-        zip_vehicle_for_forum_button.pack(
-            side=tk.LEFT, padx=(8, 8)
-        )  # Add padding on both sides of the Create Zip file for forum button
-        show_tooltip(
-            zip_vehicle_for_forum_button,
-            _("Creates a .zip file of the configuration files\nso that they can be easily shared for forum help")
-            if self.parameter_editor.parameter_files()
-            else _("No intermediate parameter files available"),
-        )
-
         # Create skip buttons
         self.skip_button = ttk.Button(buttons_frame, text=_("Skip >"), command=self.on_skip_click)
         self.skip_button.configure(
