@@ -937,7 +937,7 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
         # Create Skybrush log analysis button
         skybrush_log_button = ttk.Button(
             buttons_frame,
-            text=_("Analyze log\nwith Skybrush"),
+            text=_("Analyse log\nwith Skybrush"),
             command=self.on_analyse_log_with_skybrush_click,
         )
         skybrush_log_button.pack(side=tk.LEFT, padx=(8, 8))
