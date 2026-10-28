@@ -13,7 +13,7 @@ import sys
 import tkinter as tk
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import dataclass
 from logging import debug as logging_debug
 from logging import error as logging_error
 from pathlib import Path
@@ -21,20 +21,21 @@ from threading import Lock
 from tkinter import Toplevel, messagebox, ttk
 from typing import TYPE_CHECKING, Any, cast
 
-from skybrush_log_analyzer.analysis import to_agent_view
-from skybrush_log_analyzer.config import load_config, login, logout
+from skybrush_log_analyzer.analysis import compact
+from skybrush_log_analyzer.config import Config
 from skybrush_log_analyzer.errors import (
     AccountUnreachable,
+    APIUnreachable,
     ApplicationErrorWithMessage,
+    ApplicationErrorWithURL,
     BadRequest,
     ConfigError,
     InvalidAPIKey,
+    NotFound,
     ResponseParsingFailed,
     ServerError,
     Unauthenticated,
 )
-from skybrush_log_analyzer.paths import ConfigPath
-from skybrush_log_analyzer.utils import calculate_file_hash
 
 from ardupilot_methodic_configurator import _, __version__
 from ardupilot_methodic_configurator.backend_internet import webbrowser_open_url
@@ -45,10 +46,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_show import show_tooltip
 
 if TYPE_CHECKING:
     from skybrush_log_analyzer.api_client import APIClient
-    from skybrush_log_analyzer.config import Config
     from skybrush_log_analyzer.typing import SuggestionCategory
-
-_ACCOUNT_URL = "https://account.skybrush.io"
 
 #: Serializes truststore aliasing when two background tasks start concurrently.
 _TRUSTSTORE_ALIAS_LOCK = Lock()
@@ -62,9 +60,6 @@ _STATUS_COLOR = {
     "SKIP": "gray50",
     "NOT_APPLICABLE": "gray50",
 }
-
-#: Display order of test-case statuses, most severe first.
-_STATUS_DISPLAY_ORDER = ("FAIL", "WARN", "INFO", "PASS", "SKIP", "NOT_APPLICABLE")
 
 #: Prefix prepended to every console (logging) line emitted by the Skybrush log analysis integration.
 _LOG_TAG = "[Skybrush log analysis]"
@@ -110,13 +105,12 @@ def _align_truststore_with_system_cert_injection() -> None:
 # ---------------- Skybrush API clients ----------------
 
 
-def _create_skybrush_client(config: "Config") -> "APIClient":
-    """Create a Skybrush API client, with its authentication client, for the given analyzer configuration."""
+def _api_client_class() -> "type[APIClient]":
+    """Import the Skybrush API client class, aligning truststore with the system certificate injection first."""
     _align_truststore_with_system_cert_injection()
     from skybrush_log_analyzer.api_client import APIClient  # noqa: PLC0415
-    from skybrush_log_analyzer.auth_client import AuthClient  # noqa: PLC0415
 
-    return APIClient(config, AuthClient(config))
+    return APIClient
 
 
 # ---------------- Skybrush API error messages ----------------
@@ -129,6 +123,7 @@ _SKYBRUSH_ERROR_MESSAGES: tuple[tuple[type[Exception], str], ...] = (
     ),
     (InvalidAPIKey, _("The Skybrush API key is invalid or has been revoked. Create a new one at {account_url}.")),
     (AccountUnreachable, _("Could not reach the Skybrush Account server at {account_url}.")),
+    (APIUnreachable, _("Could not reach the Skybrush API: {message}")),
     (ConfigError, _("Invalid 'skybrush-log-analyzer' configuration: {message}")),
     (BadRequest, _("The Skybrush API rejected the request: {message}")),
     (ServerError, _("The Skybrush API is currently unavailable.")),
@@ -141,7 +136,8 @@ def _skybrush_error_message(error: Exception) -> str:
     for error_type, message_template in _SKYBRUSH_ERROR_MESSAGES:
         if isinstance(error, error_type):
             details = error.message if isinstance(error, ApplicationErrorWithMessage) else str(error)
-            return message_template.format(message=details, account_url=_ACCOUNT_URL)
+            account_url = error.url if isinstance(error, ApplicationErrorWithURL) else ""
+            return message_template.format(message=details, account_url=account_url)
     return _("Skybrush API analysis failed: {error}").format(error=error)
 
 
@@ -179,31 +175,15 @@ def _stored_analysis_is_stale(analysis: dict[str, Any], current_version: dict[st
     return is_stale, stored_core, current_core
 
 
-def _ordered_statuses(counts: dict[str, int]) -> list[str]:
-    """Order test-case statuses by severity, then any unrecognized statuses alphabetically."""
-    statuses = [status for status in _STATUS_DISPLAY_ORDER if status in counts]
-    return statuses + sorted(status for status in counts if status not in _STATUS_DISPLAY_ORDER)
+@dataclass(frozen=True)
+class _AnalysisResult:
+    """Compact analysis view of a log and how it was obtained."""
 
-
-def _restore_pass_answers(view: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
-    """Re-attach the answer/value messages of PASS test results, omitted by the analyzer's agent view."""
-    answers: dict[str, list[dict[str, Any]]] = {}
-    for result in analysis.get("test_results") or []:
-        name = result.get("test_name")
-        messages = result.get("messages") or []
-        if not isinstance(name, str) or not messages or name in answers:
-            continue
-        answers[name] = [
-            {key: value for key, value in message.items() if key != "id" and value is not None}
-            for message in messages
-            if isinstance(message, dict)
-        ]
-    for result in view.get("test_results") or []:
-        if result.get("status") == "PASS" and not result.get("messages"):
-            messages = answers.get(result.get("test_name"))
-            if messages:
-                result["messages"] = messages
-    return view
+    view: dict[str, Any]
+    #: Whether the view is the stored analysis rather than a fresh one.
+    reused: bool
+    #: The stored and the current backend core versions when the stored analysis is stale, otherwise None.
+    stale_cores: tuple[str, str] | None = None
 
 
 def _format_test_message(message: dict[str, Any]) -> tuple[str, str]:
@@ -232,15 +212,15 @@ def _format_test_message(message: dict[str, Any]) -> tuple[str, str]:
 
 
 class FeedbackDialog:
-    """Modal dialog that collects user feedback and submits it to the Skybrush team (analyzer 'suggest')."""
+    """Modal dialog that collects user feedback and submits it to the Skybrush team."""
 
     #: Categories accepted by the Skybrush suggestion endpoint, most relevant for analysis results first.
-    CATEGORIES = ("bug", "test_case", "improvement", "feature", "other")
+    CATEGORIES: "tuple[SuggestionCategory, ...]" = ("bug", "test_case", "improvement", "feature", "other")
 
     def __init__(
         self,
         parent: tk.Tk | Toplevel,
-        submit: Callable[[str, str, str, Callable[[object | None, Exception | None], None]], bool],
+        submit: Callable[["SuggestionCategory", str, str, Callable[[object | None, Exception | None], None]], bool],
     ) -> None:
         self._parent = parent
         self._submit = submit
@@ -265,11 +245,9 @@ class FeedbackDialog:
         ttk.Label(header, text=instructions, foreground="gray50").pack(anchor=tk.W, pady=(4, 10))
 
         ttk.Label(body, text=_("Category")).pack(anchor=tk.W)
-        self._category: str = self.CATEGORIES[0]
-        category_box = ttk.Combobox(body, values=self.CATEGORIES, state="readonly", width=20)
-        category_box.set(self._category)
-        category_box.pack(anchor=tk.W, fill=tk.X, pady=(0, 8))
-        category_box.bind("<<ComboboxSelected>>", self._on_category_selected)
+        self._category_box = ttk.Combobox(body, values=self.CATEGORIES, state="readonly", width=20)
+        self._category_box.current(0)
+        self._category_box.pack(anchor=tk.W, fill=tk.X, pady=(0, 8))
 
         ttk.Label(body, text=_("Title")).pack(anchor=tk.W)
         self._title_entry = ttk.Entry(body)
@@ -293,9 +271,6 @@ class FeedbackDialog:
         self._submit_button.pack(side=tk.RIGHT, padx=(0, 8))
         self._title_entry.focus_set()
 
-    def _on_category_selected(self, event: "tk.Event[ttk.Combobox]") -> None:
-        self._category = str(event.widget.get())
-
     def show(self) -> None:
         """Show the dialog modally."""
         self._root.transient(self._parent)
@@ -315,7 +290,8 @@ class FeedbackDialog:
             )
             messagebox.showerror(_("Send feedback"), message, parent=self._root)
             return
-        if not self._submit(self._category, title, description, self._on_submitted):
+        category = self.CATEGORIES[self._category_box.current()]
+        if not self._submit(category, title, description, self._on_submitted):
             return
         self._submit_button.configure(state="disabled")
         self._progress_label.configure(text=_("Sending feedback to the Skybrush team..."))
@@ -340,16 +316,17 @@ class FeedbackDialog:
 
 
 class LoginForm(ttk.Frame):
-    """Form that validates and stores the Skybrush API key (analyzer 'login --api-key' equivalent)."""
-
-    #: The account area where users can generate and revoke API keys.
-    DEVELOPER_AREA_URL = "https://account.skybrush.io/developer"
+    """Form that collects the Skybrush API key and passes it to the login callback."""
 
     def __init__(
-        self, parent: tk.Misc, login: Callable[[str, Callable[[object | None, Exception | None], None]], bool]
+        self,
+        parent: tk.Misc,
+        login: Callable[[str, Callable[[object | None, Exception | None], None]], bool],
+        account_url: str,
     ) -> None:
         super().__init__(parent, padding=(16, 12, 16, 12))
         self._login = login
+        self._account_url = account_url
 
         instructions = _(
             "A Skybrush API key is required to analyze flight logs.\n"
@@ -366,7 +343,7 @@ class LoginForm(ttk.Frame):
         ttk.Button(
             developer_row,
             text=_("Open Skybrush Account"),
-            command=lambda: webbrowser_open_url(self.DEVELOPER_AREA_URL),
+            command=lambda: webbrowser_open_url(self._account_url),
         ).pack(side=tk.LEFT)
         ttk.Label(developer_row, text=_("Create or manage your API keys there"), foreground="gray50").pack(
             side=tk.LEFT, padx=(8, 0)
@@ -420,15 +397,12 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._auth_runner = BackgroundTaskRunner(self.root.after)
         self._feedback_runner = BackgroundTaskRunner(self.root.after)
         self._login_runner = BackgroundTaskRunner(self.root.after)
-        self._client = _create_skybrush_client(load_config())
-        self._logged_in = self._client.config.api_key is not None
-        self._analysis_reused = False
+        self._config = Config.load()
+        #: Client of the log-in session; None while logged out.
+        self._client: APIClient | None = _api_client_class()(self._config) if self._config.api_key else None
         self._version_info: dict[str, Any] = {}
         #: True while the header version/log-in state has never been fetched successfully.
         self._version_check_pending = True
-        self._force_refresh = False
-        self._analysis_is_stale = False
-        self._stale_version_details: tuple[str, str] = ("", "")
         self._find_bar: ttk.Frame | None = None
         self._find_entry: ttk.Entry | None = None
         self._find_count_label: ttk.Label | None = None
@@ -445,7 +419,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         self._build_header()
         self._build_footer()
         self._build_results_area()
-        self._login_form = LoginForm(self.main_frame, self._start_login)
+        self._login_form = LoginForm(self.main_frame, self._start_login, self._config.account_url)
         self._update_login_state()
         self._start_header_status_checks()
 
@@ -566,7 +540,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     # ---------------- results text helpers ----------------
 
     def _set_status(self, text: str) -> None:
-        """Update the status line above the results text window."""
+        """Update the status line."""
         self.status_label.configure(text=text)
 
     def _replace_results_text(self) -> None:
@@ -591,7 +565,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
     def _show_find_bar(self, _event: object | None = None) -> None:
         """Show the browser-like find bar above the results text and focus its field."""
-        if not self._logged_in:
+        if self._client is None:
             return
         if self._find_bar is None:
             self._find_bar = ttk.Frame(self.main_frame)
@@ -693,8 +667,12 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     # ---------------- analysis run ----------------
 
     def _on_run_analysis_click(self) -> None:
-        """Fetch the stored analysis of the log, uploading and analyzing it freshly when none exists yet."""
-        if self._analysis_runner.active:
+        self._start_analysis(force_refresh=False)
+
+    def _start_analysis(self, force_refresh: bool) -> None:
+        """Fetch the stored analysis of the log, uploading and analyzing it freshly when none exists yet or when forced."""
+        client = self._client
+        if self._analysis_runner.active or client is None:
             return
 
         logfile = Path(self.logfile)
@@ -708,64 +686,65 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
         self._run_analysis_button.configure(state="disabled")
         self._set_status(_("Fetching the existing analysis from the Skybrush account"))
-        if not self._analysis_runner.start(self._fetch_or_upload_analysis, self._on_analysis_progress, self._on_analysis_done):
+        if not self._analysis_runner.start(
+            lambda progress: self._fetch_or_upload_analysis(client, force_refresh, progress),
+            lambda text: self._on_analysis_progress(client, text),
+            lambda result, error: self._on_analysis_done(client, result, error),
+        ):
             self._update_action_buttons()
             self._set_status("")
 
-    def _on_analysis_progress(self, text: str) -> None:
-        """Show the background phase updates above the results window."""
-        self._set_status(text)
+    def _on_analysis_progress(self, client: "APIClient", text: str) -> None:
+        """Show the progress of the current session's analysis in the status line."""
+        if client is self._client:
+            self._set_status(text)
 
-    def _fetch_or_upload_analysis(self, report_progress: Callable[..., None]) -> dict[str, Any]:
-        """Reuse the stored account analysis when present, uploading the log otherwise. Worker thread."""
-        client = self._client
-        # Refresh the API token before any request to avoid token expiration mid-operation.
-        client.auth.refresh_token()
-        force_refresh = self._force_refresh
-        self._force_refresh = False
-        self._analysis_is_stale = False
+    def _fetch_or_upload_analysis(
+        self, client: "APIClient", force_refresh: bool, report_progress: Callable[..., None]
+    ) -> _AnalysisResult:
+        """Reuse the stored account analysis when present and not forced, uploading the log otherwise. Worker thread."""
         logfile = Path(self.logfile)
         analysis = None
         if not force_refresh:
             try:
                 analysis = client.get_analysis(logfile)
-            except BadRequest:
-                # The by-hash lookup failing (404) means this log was never analyzed within the account.
+            except NotFound:
+                # The by-hash lookup failing means this log was never analyzed within the account.
                 analysis = None
-        if isinstance(analysis, dict) and analysis.get("test_results"):
-            self._analysis_reused = True
+        if analysis is not None and analysis.get("test_results"):
             try:
-                current_version = cast("dict[str, Any]", client.version())
+                current_version = client.version()
             except Exception as exception:  # pylint: disable=broad-exception-caught
                 logging_debug(_("%s Fetching the Skybrush API version failed: %s"), _LOG_TAG, exception)
                 current_version = {}
-            self._analysis_is_stale, stored_core, current_core = _stored_analysis_is_stale(analysis, current_version)
-            self._stale_version_details = (stored_core, current_core)
-        else:
-            report_progress(_("Uploading log and running analysis through the Skybrush API - this can take a while"))
-            self._analysis_reused = False
-            analysis = cast("dict[str, Any]", client.analyze(logfile))
-        return _restore_pass_answers(cast("dict[str, Any]", to_agent_view(analysis)), analysis)
+            is_stale, stored_core, current_core = _stored_analysis_is_stale(analysis, current_version)
+            return _AnalysisResult(
+                compact(analysis),
+                reused=True,
+                stale_cores=(stored_core, current_core) if is_stale else None,
+            )
+        report_progress(_("Uploading log and running analysis through the Skybrush API - this can take a while"))
+        return _AnalysisResult(compact(client.analyze(logfile)), reused=False)
 
-    def _on_analysis_done(self, result: object | None, error: Exception | None) -> None:
+    def _on_analysis_done(self, client: "APIClient", result: object | None, error: Exception | None) -> None:
         self._update_action_buttons()
+        if client is not self._client:
+            return
         if error is not None:
             logging_error(_("%s Skybrush API analysis failed: %s"), _LOG_TAG, error)
             self._show_analysis_error(_skybrush_error_message(error))
+            self._end_session_if_rejected(error)
             return
-        if not isinstance(result, dict):
-            self._show_analysis_error(_("The Skybrush API returned unexpected data."))
-            return
-        self._display_analysis_results(result)
-        self._set_status(_("Existing Skybrush log analysis reused") if self._analysis_reused else _("Analysis completed"))
-        if self._analysis_reused and self._analysis_is_stale:
-            self._offer_fresh_analysis()
+        analysis = cast("_AnalysisResult", result)
+        self._display_analysis_results(analysis.view)
+        self._set_status(_("Existing Skybrush log analysis reused") if analysis.reused else _("Analysis completed"))
+        if analysis.stale_cores is not None:
+            self._offer_fresh_analysis(*analysis.stale_cores)
         # Successful server communication: silently retry a header version check that failed earlier.
         self._retry_pending_version_check()
 
-    def _offer_fresh_analysis(self) -> None:
+    def _offer_fresh_analysis(self, stored_core: str, current_core: str) -> None:
         """Ask the user whether to re-run an analysis that an older backend core produced."""
-        stored_core, current_core = self._stale_version_details
         if messagebox.askyesno(
             _("Skybrush Log Analysis"),
             _(
@@ -775,16 +754,15 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             ).format(stored=stored_core or "?", current=current_core or "?"),
             parent=self.root,
         ):
-            self._force_refresh = True
-            self._on_run_analysis_click()
+            self._start_analysis(force_refresh=True)
 
     # ---------------- login / logout ----------------
 
     def _update_login_state(self) -> None:
         """Sync the header buttons and the login form or results view with the authentication state."""
-        self._logout_button.configure(state="normal" if self._logged_in else "disabled")
+        self._logout_button.configure(state="normal" if self._client is not None else "disabled")
         self._update_action_buttons()
-        if self._logged_in:
+        if self._client is not None:
             self._login_form.pack_forget()
             self._results_row.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(0, 8))
         else:
@@ -795,7 +773,7 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
     def _update_action_buttons(self) -> None:
         """Enable the Skybrush service buttons only when logged in; in-flight buttons stay disabled."""
-        state = "normal" if self._logged_in else "disabled"
+        state = "normal" if self._client is not None else "disabled"
         if not self._analysis_runner.active:
             self._run_analysis_button.configure(state=state)
         if not self._web_login_runner.active:
@@ -804,85 +782,92 @@ class SkybrushLogAnalysisWindow(BaseWindow):
             self._feedback_button.configure(state=state)
 
     def _start_login(self, api_key: str, on_done: Callable[[object | None, Exception | None], None]) -> bool:
-        """Validate a candidate API key against the account, storing it only when accepted."""
+        """Start logging in with the API key in the background; False when a login is already running."""
         if self._login_runner.active:
             return False
+        config_dir = self._config.config_dir
 
         def on_login_done(result: object | None, error: Exception | None) -> None:
             if error is None:
                 self._client = cast("APIClient", result)
-                self._logged_in = True
+                self._config = self._client.config
                 self._version_check_pending = False
                 self._update_login_state()
                 self._set_status(_("Logged in to the Skybrush Account"))
                 self._start_header_status_checks()
             on_done(result, error)
 
-        return self._login_runner.start(lambda _progress: self._validate_and_store_api_key(api_key), None, on_login_done)
-
-    def _validate_and_store_api_key(self, api_key: str) -> "APIClient":
-        """Validate a candidate API key against the account and the Skybrush API, storing it when accepted. Worker thread."""
-        config = self._client.config
-        is_local = config.config_dir == ConfigPath.dir(local=True)
-        candidate = _create_skybrush_client(replace(config, api_key=api_key))
-        candidate.auth.refresh_token()
-        candidate.version()
-        try:
-            login(api_key, local=is_local)
-        except OSError as error:
-            raise ConfigError(str(error)) from error
-        return candidate
+        return self._login_runner.start(lambda _progress: _api_client_class().login(config_dir, api_key), None, on_login_done)
 
     def _apply_logout(self) -> None:
-        """Remove the stored API key and token of the active analyzer configuration."""
-        config = self._client.config
-        if config.api_key is None:
-            self._logged_in = False
-            self._update_login_state()
-            self._set_logged_out_header()
+        """End the log-in session, removing the stored API key and token."""
+        if self._client is None:
             return
         try:
-            logout(config)
-        except OSError as error:
-            messagebox.showerror(_("Skybrush Log Analysis"), _skybrush_error_message(error), parent=self.root)
+            self._client.logout()
+        except ConfigError as error:
+            messagebox.showerror(
+                _("Skybrush Log Analysis"), _skybrush_error_message(error), parent=self.root
+            )
+            # The client is invalidated even when removing the stored API key failed.
+            self._set_logged_out(Unauthenticated())
             return
-        self._client = _create_skybrush_client(load_config())
-        self._logged_in = False
+        self._set_logged_out(Unauthenticated())
+        self._set_status(_("Logged out"))
+
+    def _end_session_if_rejected(self, error: Exception) -> None:
+        """Switch to the logged-out state when the error shows that the log-in is no longer accepted."""
+        if isinstance(error, (Unauthenticated, InvalidAPIKey)):
+            self._set_logged_out(error)
+
+    def _set_logged_out(self, reason: Exception) -> None:
+        """Drop the log-in session and show the login form, with the reason in the header."""
+        self._client = None
         self._version_info = {}
         self._version_check_pending = False
         self._update_login_state()
-        self._set_logged_out_header()
-        self._set_status(_("Logged out"))
+        self._set_status("")
+        self._version_label.configure(text=_("Skybrush API version: requires logging in"), foreground="gray50")
+        self._set_auth_status(_skybrush_error_message(reason), "red3")
 
     # ---------------- browser links ----------------
 
     def _on_open_in_browser_click(self) -> None:
         """Open the analysis of the selected log in the Skybrush Log Analyzer in the default browser."""
-        if self._web_login_runner.active:
+        client = self._client
+        if self._web_login_runner.active or client is None:
             return
 
         self._open_web_button.configure(state="disabled")
         self._set_status(_("Requesting a log-in link for the Skybrush Log Analyzer web application"))
-        if not self._web_login_runner.start(lambda _progress: self._fetch_web_login_url(), None, self._on_web_login_done):
+        if not self._web_login_runner.start(
+            lambda _progress: self._fetch_web_login_url(client),
+            None,
+            lambda result, error: self._on_web_login_done(client, result, error),
+        ):
             self._update_action_buttons()
             self._set_status("")
 
-    def _fetch_web_login_url(self) -> str:
+    def _fetch_web_login_url(self, client: "APIClient") -> str:
         """Acquire a single-sign-on URL for the Skybrush Log Analyzer, deep-linking to this log's analysis."""
-        client = self._client
         try:
             intent = client.get_analysis_view_intent(Path(self.logfile))
-        except BadRequest:
+        except NotFound:
             # No stored analysis for this log within the account; open the generic analyzer view.
             intent = None
-        return cast("str", client.get_web_login_url(intent=intent))
+        return client.get_web_login_url(intent=intent)
 
-    def _on_web_login_done(self, result: object | None, error: Exception | None) -> None:
+    def _on_web_login_done(self, client: "APIClient", result: object | None, error: Exception | None) -> None:
         self._update_action_buttons()
+        if client is not self._client:
+            return
         if error is not None:
             logging_error(_("%s Could not acquire a Skybrush web log-in link: %s"), _LOG_TAG, error)
             self._set_status("")
-            messagebox.showerror(_("Skybrush Log Analysis"), _skybrush_error_message(error), parent=self.root)
+            messagebox.showerror(
+                _("Skybrush Log Analysis"), _skybrush_error_message(error), parent=self.root
+            )
+            self._end_session_if_rejected(error)
             return
         if not isinstance(result, str) or not result:
             self._set_status("")
@@ -906,43 +891,35 @@ class SkybrushLogAnalysisWindow(BaseWindow):
     # ---------------- header status checks ----------------
 
     def _start_header_status_checks(self) -> None:
-        """Fill the header version/log-in labels; the network part runs as background tasks."""
-        if self._client.config.api_key:
+        """Fill the header version and log-in labels; the version is fetched in the background."""
+        client = self._client
+        if client is not None:
             self._version_label.configure(text=_("Fetching Skybrush API version..."))
             if not self._auth_runner.start(
-                lambda _progress: self._fetch_version_and_auth_state(), None, self._on_version_auth_done
+                lambda _progress: client.version(),
+                None,
+                lambda result, error: self._on_version_auth_done(client, result, error),
             ):
                 self._set_auth_status("", "gray50")
         else:
-            # Mirrors the not-logged-in state of the analyzer 'auth-status' command.
-            self._logged_in = False
-            self._update_login_state()
-            self._set_logged_out_header()
-
-    def _set_logged_out_header(self) -> None:
-        """Show the header in the not-logged-in state (analyzer 'auth-status' equivalent)."""
-        self._version_label.configure(text=_("Skybrush API version: requires logging in"))
-        self._set_auth_status(_skybrush_error_message(Unauthenticated()), "red3")
-
-    def _fetch_version_and_auth_state(self) -> dict[str, Any]:
-        """Verify log-in and fetch the Skybrush API version. Executed in a worker thread."""
-        version = self._client.version()
-        return version if isinstance(version, dict) else {"app_version": str(version)}
+            self._set_logged_out(Unauthenticated())
 
     def _retry_pending_version_check(self) -> None:
         """Retry the header version/log-in check after any successful server communication."""
         if self._version_check_pending and not self._auth_runner.active:
             self._start_header_status_checks()
 
-    def _on_version_auth_done(self, result: object | None, error: Exception | None) -> None:
+    def _on_version_auth_done(self, client: "APIClient", result: object | None, error: Exception | None) -> None:
+        if client is not self._client:
+            # The check of the current session could not start while this one was running.
+            if self._client is not None:
+                self._start_header_status_checks()
+            return
         if error is not None:
             logging_error(_("%s Skybrush log-in or API version check failed: %s"), _LOG_TAG, error)
-            if isinstance(error, (Unauthenticated, InvalidAPIKey)):
-                # Definitively logged out: flip the header button to the Login state.
-                self._logged_in = False
-                self._update_login_state()
             self._version_label.configure(text=_("Skybrush API version unknown"), foreground="gray50")
             self._set_auth_status(_skybrush_error_message(error), "red3")
+            self._end_session_if_rejected(error)
             return
         if not isinstance(result, dict):
             self._version_label.configure(text=_("Skybrush API version unknown"), foreground="gray50")
@@ -951,62 +928,71 @@ class SkybrushLogAnalysisWindow(BaseWindow):
 
         self._version_info = result
         self._version_check_pending = False
-        if not self._logged_in:
-            self._logged_in = True
-            self._update_login_state()
         self._version_label.configure(text=_format_api_version(result), foreground="")
-        self._set_auth_status(
-            _("Authenticated at {account_url}").format(account_url=self._client.config.account_url), "dark green"
-        )
+        self._set_auth_status(_("Authenticated at {account_url}").format(account_url=self._config.account_url), "dark green")
 
     def _set_auth_status(self, text: str, color: str) -> None:
         """Set the header log-in status line with its severity color."""
         self._auth_status_label.configure(text=text, foreground=color)
 
-    # ---------------- feedback (analyzer 'suggest' equivalent) ----------------
+    # ---------------- feedback ----------------
 
     def _on_send_feedback_click(self) -> None:
-        """Open the feedback dialog (analyzer 'suggest' command equivalent)."""
+        """Open the feedback dialog."""
 
         def submit(
-            category: str, title: str, description: str, on_done: Callable[[object | None, Exception | None], None]
+            category: "SuggestionCategory",
+            title: str,
+            description: str,
+            on_done: Callable[[object | None, Exception | None], None],
         ) -> bool:
             return self._start_suggestion(category, title, description, on_done)
 
         FeedbackDialog(self.root, submit).show()
 
     def _start_suggestion(
-        self, category: str, title: str, description: str, on_done: Callable[[object | None, Exception | None], None]
+        self,
+        category: "SuggestionCategory",
+        title: str,
+        description: str,
+        on_done: Callable[[object | None, Exception | None], None],
     ) -> bool:
         """Submit the suggestion through the Skybrush API in the background."""
+        client = self._client
 
         def on_suggestion_done(result: object | None, error: Exception | None) -> None:
-            # A submitted suggestion proves the server was reached; use it to retry a pending version check.
-            if error is None:
-                self._retry_pending_version_check()
             on_done(result, error)
+            if client is not self._client:
+                return
+            if error is None:
+                # A submitted suggestion proves the server was reached; use it to retry a pending version check.
+                self._retry_pending_version_check()
+            else:
+                self._end_session_if_rejected(error)
 
-        if self._feedback_runner.active:
+        if self._feedback_runner.active or client is None:
             return False
         return self._feedback_runner.start(
-            lambda _progress: self._submit_suggestion(category, title, description), None, on_suggestion_done
+            lambda _progress: self._submit_suggestion(client, category, title, description), None, on_suggestion_done
         )
 
-    def _submit_suggestion(self, category: str, title: str, description: str) -> dict[str, Any]:
-        """Build a self-contained suggestion context and send it. Worker thread."""
+    def _submit_suggestion(
+        self, client: "APIClient", category: "SuggestionCategory", title: str, description: str
+    ) -> dict[str, Any]:
+        """Send the suggestion with the log name, log hash and version details appended. Worker thread."""
+        # The client exists, so its module is already imported after the truststore alignment.
+        from skybrush_log_analyzer.api_client import calculate_file_hash  # noqa: PLC0415
+
         content_lines = [description, "", "---"]
         content_lines.append(_("ArduPilot Methodic Configurator {version}").format(version=__version__))
         logfile = Path(self.logfile)
         if logfile.is_file():
             content_lines.append(_("Flight log: {filename}").format(filename=logfile.name))
             with suppress(OSError):
-                content_lines.append(_("Log file SHA-256: {hash}").format(hash=calculate_file_hash(logfile.read_bytes())))
+                content_lines.append(_("Log file SHA-256: {hash}").format(hash=calculate_file_hash(logfile)))
         if self._version_info:
             content_lines.append(_format_api_version(self._version_info))
-        result = self._client.suggest(
-            category=cast("SuggestionCategory", category), title=title, content="\n".join(content_lines)
-        )
-        return cast("dict[str, Any]", result)
+        return client.suggest(category=category, title=title, content="\n".join(content_lines))
 
     # ---------------- results rendering ----------------
 
@@ -1038,19 +1024,15 @@ class SkybrushLogAnalysisWindow(BaseWindow):
         for result in test_results:
             self._append_result(result)
 
-        note = view.get("note")
-        if note:
-            self._append_results_text("\n" + str(note) + "\n", "muted")
-
         self._finish_results_text()
 
     def _append_status_counts(self, counts: dict[str, int]) -> None:
         """Append the summary line, coloring each 'STATUS: n' segment with its status color."""
         self._append_results_text(_("Test cases: "), "summary")
-        for index, status in enumerate(_ordered_statuses(counts)):
+        for index, (status, count) in enumerate(counts.items()):
             if index:
                 self._append_results_text(", ", "summary")
-            self._append_results_text(f"{status}: {counts[status]}", ("summary", f"status_{status}"))
+            self._append_results_text(f"{status}: {count}", ("summary", f"status_{status}"))
         self._append_results_text("\n\n", "summary")
 
     def _append_result(self, result: dict[str, Any]) -> None:
