@@ -178,17 +178,33 @@ eval "$(register-python-argcomplete param_pid_adjustment_update)"
 eval "$(register-python-argcomplete mavftp)"
 ```
 
-For PowerShell (MS Windows) autocompletion, run this command in PowerShell:
+The Windows per-user installer can enable PowerShell tab completion by updating the current user's
+PowerShell profiles. This task is unchecked by default. Select it only if PowerShell allows local
+scripts: with the default Windows PowerShell Restricted execution policy, a profile causes a script
+execution error at startup. PowerShell must also start with profiles enabled for completion to load.
+Open a new PowerShell session after installing. Select the PATH task too if you want to run the
+commands by name. The task affects the installing user; for all-users installs or manual setup, add
+the module to each user's profile as described below.
+
+For manual PowerShell (MS Windows) autocompletion, run this command in PowerShell:
 
 ```powershell
 notepad $PROFILE
 ```
 
-And add this line to the file:
+For the default per-user installation, add this line to the file:
 
 ```powershell
-Import-Module  "C:\Program Files (x86)\ardupilot_methodic_configurator\ardupilot_methodic_configurator_command_line_completion.psm1"
+Import-Module "$env:LOCALAPPDATA\Programs\ardupilot_methodic_configurator\ardupilot_methodic_configurator_command_line_completion.psm1"
 ```
+
+For an all-users installation on 64-bit Windows, use:
+
+```powershell
+Import-Module "${env:ProgramFiles(x86)}\ardupilot_methodic_configurator\ardupilot_methodic_configurator_command_line_completion.psm1"
+```
+
+If you selected a different installation directory, use the module path in that directory instead.
 
 ## Verify Installer Security and Integrity
 

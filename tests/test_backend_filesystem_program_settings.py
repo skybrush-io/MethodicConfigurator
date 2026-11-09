@@ -12,12 +12,16 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 import json
 import platform
+from concurrent.futures import ThreadPoolExecutor
 from os import path as os_path
+from pathlib import Path
+from threading import Event
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
 from ardupilot_methodic_configurator.backend_filesystem_program_settings import ProgramSettings, normalize_path
+from ardupilot_methodic_configurator.backend_filesystem_vehicle_components import VehicleComponents
 
 # pylint: disable=too-many-lines,protected-access,redefined-outer-name,too-few-public-methods
 
@@ -52,6 +56,73 @@ def sample_program_settings() -> dict:
         "motor_test_duration": 5.0,
         "motor_test_throttle_pct": 10,
     }
+
+
+@pytest.mark.parametrize(("device", "baudrate"), [("COM1", 57600), ("COM2", 57600), ("COM1", 115200)])
+def test_connection_settings_are_written_only_when_the_pair_changes(tmp_path: Path, device: str, baudrate: int) -> None:
+    """GIVEN a remembered connection WHEN reconnecting THEN only a changed device or baud rate causes a save."""
+    with patch.object(ProgramSettings, "_user_config_dir", return_value=str(tmp_path)):
+        ProgramSettings.store_last_successful_connection("COM1", 57600)
+        ProgramSettings.set_setting("auto_open_doc_in_browser", value=False)
+
+        with patch.object(ProgramSettings, "_set_settings_from_dict", wraps=ProgramSettings._set_settings_from_dict) as save:
+            ProgramSettings.store_last_successful_connection(device, baudrate)
+
+        if (device, baudrate) == ("COM1", 57600):
+            save.assert_not_called()
+        else:
+            save.assert_called_once()
+        assert ProgramSettings.get_last_successful_connection() == (device, baudrate)
+        assert ProgramSettings.get_setting("auto_open_doc_in_browser") is False
+
+
+@pytest.mark.parametrize("connection_first", [True, False])
+def test_reconnect_and_documentation_changes_are_both_preserved(tmp_path: Path, connection_first: bool) -> None:
+    """GIVEN overlapping reconnect and GUI saves WHEN both finish THEN neither setting is lost."""
+    first_read = Event()
+    release_first = Event()
+    second_started = Event()
+    second_finished = Event()
+    read_settings = ProgramSettings._get_settings_as_dict
+
+    def pause_first_read() -> dict:
+        settings = read_settings()
+        if not first_read.is_set():
+            first_read.set()
+            assert release_first.wait(5), "The first settings update was not released"
+        return settings
+
+    def save_connection() -> None:
+        ProgramSettings.store_last_successful_connection("COM2", 57600)
+
+    def save_documentation() -> None:
+        ProgramSettings.set_setting("auto_open_doc_in_browser", value=False)
+
+    def second_update() -> None:
+        second_started.set()
+        (save_documentation if connection_first else save_connection)()
+        second_finished.set()
+
+    with patch.object(ProgramSettings, "_user_config_dir", return_value=str(tmp_path)):
+        ProgramSettings.set_setting("auto_open_doc_in_browser", value=True)
+        with (
+            patch.object(ProgramSettings, "_get_settings_as_dict", side_effect=pause_first_read),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            first = executor.submit(save_connection if connection_first else save_documentation)
+            try:
+                assert first_read.wait(5), "The first settings update did not start"
+                second = executor.submit(second_update)
+                assert second_started.wait(5), "The second settings update did not start"
+                # Allow an unprotected writer to finish while the first holds a stale snapshot.
+                second_finished.wait(0.1)
+            finally:
+                release_first.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+
+        assert ProgramSettings.get_last_successful_connection() == ("COM2", 57600)
+        assert ProgramSettings.get_setting("auto_open_doc_in_browser") is False
 
 
 class TestApplicationResourcePaths:
@@ -99,12 +170,12 @@ class TestApplicationResourcePaths:
         """
         User can retrieve icon filepath using modern importlib.resources method.
 
-        GIVEN: Python 3.10+ with importlib.resources.files available
+        GIVEN: A supported Python version with importlib.resources.files available
         WHEN: User requests the application icon filepath
         THEN: The path should be retrieved using importlib.resources
         AND: The path should exist and end with ArduPilot_icon.png
         """
-        # Act: Get application icon filepath (uses importlib.resources in Python 3.10+)
+        # Act: Get application icon filepath (uses importlib.resources)
         result = ProgramSettings.application_icon_filepath()
 
         # Assert: Path is valid and ends with expected filename
@@ -117,12 +188,12 @@ class TestApplicationResourcePaths:
         """
         User can retrieve logo filepath using modern importlib.resources method.
 
-        GIVEN: Python 3.10+ with importlib.resources.files available
+        GIVEN: A supported Python version with importlib.resources.files available
         WHEN: User requests the application logo filepath
         THEN: The path should be retrieved using importlib.resources
         AND: The path should exist and end with ArduPilot_logo.png
         """
-        # Act: Get application logo filepath (uses importlib.resources in Python 3.10+)
+        # Act: Get application logo filepath (uses importlib.resources)
         result = ProgramSettings.application_logo_filepath()
 
         # Assert: Path is valid and ends with expected filename
@@ -135,12 +206,12 @@ class TestApplicationResourcePaths:
         """
         User can retrieve workflow image filepath using modern importlib.resources method.
 
-        GIVEN: Python 3.10+ with importlib.resources.files available
+        GIVEN: A supported Python version with importlib.resources.files available
         WHEN: User requests the workflow image filepath for popup display
         THEN: The path should be retrieved using importlib.resources
         AND: The path should exist and end with AMC_general_workflow.png
         """
-        # Act: Get workflow image filepath (uses importlib.resources in Python 3.10+)
+        # Act: Get workflow image filepath (uses importlib.resources)
         result = ProgramSettings.workflow_image_filepath()
 
         # Assert: Path is valid and ends with expected filename
@@ -429,6 +500,7 @@ class TestSettingsFileOperations:
         expected_result["gui_complexity"] = "simple"  # Added by default
         expected_result["motor_test"] = {"duration": 2, "throttle_pct": 10}  # Added by default
         expected_result["connection_history"] = []  # Added by default
+        expected_result["last_successful_connection"] = {}  # Added by default
         expected_result["recent_vehicle_history"] = []  # Added by default
         expected_result["display_usage_popup"]["component_editor_validation"] = True  # Added by default
         expected_result["display_usage_popup"]["workflow_explanation"] = True  # Added by default
@@ -1321,29 +1393,199 @@ class TestInternalConfigurationMethods:
             assert result == "/mock/package/path/vehicle_templates"
             mock_importlib.assert_called_once_with("ardupilot_methodic_configurator")
 
-    def test_get_templates_base_dir_uses_site_config_on_windows(self) -> None:
+    @pytest.mark.parametrize("user_templates_state", ["absent", "empty", "user-only", "marker-directory", "installed"])
+    def test_get_templates_base_dir_selects_installed_templates_on_windows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, user_templates_state: str
+    ) -> None:
         """
-        Templates base directory uses site config directory on Windows.
+        Select an installed template set without relying on the machine's configuration.
 
-        GIVEN: A Windows platform environment
+        GIVEN: An all-users template installation and possibly a per-user template directory
         WHEN: The templates base directory is requested
-        THEN: The site configuration directory should be used as the base
+        THEN: Per-user templates take precedence only when their installer-owned file exists
         """
-        # Arrange: Mock Windows platform and site config
-        with (
-            patch("ardupilot_methodic_configurator.backend_filesystem_program_settings.platform_system") as mock_platform,
-            patch(
-                "ardupilot_methodic_configurator.backend_filesystem_program_settings.ProgramSettings._site_config_dir"
-            ) as mock_site_config,
-        ):
-            mock_platform.return_value = "Windows"
-            mock_site_config.return_value = "C:\\Program Files\\App"
+        monkeypatch.delenv("AMC_COMPONENT_TEMPLATES_DIR_TEST", raising=False)
+        user_config = tmp_path / "user"
+        site_config = tmp_path / "site"
+        user_templates = user_config / "vehicle_templates"
+        site_templates = site_config / "vehicle_templates"
+        site_templates.mkdir(parents=True)
+        (site_templates / "system_vehicle_components_template.json").write_text("{}", encoding="utf-8")
+        if user_templates_state != "absent":
+            user_templates.mkdir(parents=True)
+        if user_templates_state == "user-only":
+            (user_templates / "user_vehicle_components_template.json").write_text("{}", encoding="utf-8")
+        elif user_templates_state == "marker-directory":
+            (user_templates / "system_vehicle_components_template.json").mkdir()
+        elif user_templates_state == "installed":
+            (user_templates / "system_vehicle_components_template.json").write_text("{}", encoding="utf-8")
 
-            # Act: Get templates base directory
+        with (
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem_program_settings.platform_system", return_value="Windows"
+            ),
+            patch.object(ProgramSettings, "_user_config_dir", return_value=str(user_config)) as mock_user_config,
+            patch.object(ProgramSettings, "_site_config_dir", return_value=str(site_config)) as mock_site_config,
+        ):
             result = ProgramSettings.get_templates_base_dir()
 
-            # Assert: Windows path logic is used correctly
-            mock_site_config.assert_called_once()
-            # Use os.path.join to handle platform-specific path separators
-            expected_path = os_path.join("C:\\Program Files\\App", "vehicle_templates")
-            assert result == expected_path
+            mock_user_config.assert_called_once_with()
+            if user_templates_state == "installed":
+                assert result == str(user_templates)
+                mock_site_config.assert_not_called()
+            else:
+                assert result == str(site_templates)
+                mock_site_config.assert_called_once_with()
+
+    def test_scope_switch_finds_shared_templates_after_per_user_uninstall(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Find all-users templates when uninstall leaves personal presets behind.
+
+        GIVEN: Per-user templates, personal presets, and an all-users installation
+        WHEN: Uninstall removes the per-user installer's template file
+        THEN: Lookup switches to the shared installation and leaves personal presets intact
+        """
+        monkeypatch.delenv("AMC_COMPONENT_TEMPLATES_DIR_TEST", raising=False)
+        user_config = tmp_path / "user"
+        site_config = tmp_path / "site"
+        user_templates = user_config / "vehicle_templates"
+        site_templates = site_config / "vehicle_templates"
+        user_templates.mkdir(parents=True)
+        site_templates.mkdir(parents=True)
+        user_system_file = user_templates / "system_vehicle_components_template.json"
+        user_system_file.write_text("{}", encoding="utf-8")
+        (site_templates / user_system_file.name).write_text("{}", encoding="utf-8")
+        personal_presets = user_templates / "user_vehicle_components_template.json"
+        personal_presets.write_text('{"Flight Controller": [{"name": "Personal preset"}]}', encoding="utf-8")
+        with (
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem_program_settings.platform_system", return_value="Windows"
+            ),
+            patch.object(ProgramSettings, "_user_config_dir", return_value=str(user_config)),
+            patch.object(ProgramSettings, "_site_config_dir", return_value=str(site_config)),
+        ):
+            assert ProgramSettings.get_templates_base_dir() == str(user_templates)
+
+            user_system_file.unlink()
+
+            assert ProgramSettings.get_templates_base_dir() == str(site_templates)
+            assert json.loads(personal_presets.read_text(encoding="utf-8")) == {
+                "Flight Controller": [{"name": "Personal preset"}]
+            }
+
+
+class TestComponentPresetScope:
+    """Preserve personal component presets when Windows installation scope changes."""
+
+    @pytest.mark.parametrize("old_scope", ["user", "site"])
+    def test_saved_presets_survive_scope_switch_and_subsequent_save(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_scope: str
+    ) -> None:
+        """
+        Load existing presets after switching either way, then retain them on the next save.
+
+        GIVEN a personal preset saved in an installation scope that is later uninstalled
+        WHEN another scope is installed and the user loads and saves component templates
+        THEN the old preset remains available and the new scope owns the updated file
+        """
+        monkeypatch.delenv("AMC_COMPONENT_TEMPLATES_DIR_TEST", raising=False)
+        user_config, site_config = tmp_path / "user", tmp_path / "site"
+        user_templates, site_templates = user_config / "vehicle_templates", site_config / "vehicle_templates"
+        user_templates.mkdir(parents=True)
+        site_templates.mkdir(parents=True)
+        marker = "system_vehicle_components_template.json"
+        (site_templates / marker).write_text("{}", encoding="utf-8")
+        if old_scope == "user":
+            (user_templates / marker).write_text("{}", encoding="utf-8")
+        old_templates = user_templates if old_scope == "user" else site_templates
+        new_templates = site_templates if old_scope == "user" else user_templates
+        preset = {"Flight Controller": [{"name": "Personal preset", "data": {"Manufacturer": "Example"}}]}
+        added = {"Battery": [{"name": "New preset", "data": {"Cells": 4}}]}
+
+        with (
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem_program_settings.platform_system", return_value="Windows"
+            ),
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem_program_settings.user_config_dir",
+                return_value=str(user_config),
+            ),
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem_program_settings.site_config_dir",
+                return_value=str(site_config),
+            ),
+        ):
+            components = VehicleComponents()
+            assert not components.save_component_templates_to_file(preset)[0]
+            assert ProgramSettings.get_templates_base_dir() == str(old_templates)
+            old_file = old_templates / "user_vehicle_components_template.json"
+            assert json.loads(old_file.read_text(encoding="utf-8")) == preset
+
+            (old_templates / marker).unlink()
+            (new_templates / marker).write_text("{}", encoding="utf-8")
+            assert ProgramSettings.get_templates_base_dir() == str(new_templates)
+            assert components.load_component_templates()["Flight Controller"] == [
+                {**preset["Flight Controller"][0], "is_user_modified": True}
+            ]
+            assert not components.save_component_templates_to_file(added)[0]
+            assert json.loads((new_templates / old_file.name).read_text(encoding="utf-8")) == {**preset, **added}
+            assert json.loads(old_file.read_text(encoding="utf-8")) == preset
+
+            old_file.write_text('{"Ignored": [{"name": "Old"}]}', encoding="utf-8")
+            assert components.load_component_templates() == {
+                "Flight Controller": [{**preset["Flight Controller"][0], "is_user_modified": True}],
+                "Battery": [{**added["Battery"][0], "is_user_modified": True}],
+            }
+
+    @pytest.mark.parametrize("selected_content", ["{}", "{invalid json"])
+    def test_selected_scope_file_remains_authoritative(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_content: str
+    ) -> None:
+        """An empty or invalid selected file does not restore presets from the other scope."""
+        monkeypatch.delenv("AMC_COMPONENT_TEMPLATES_DIR_TEST", raising=False)
+        user_config, site_config = tmp_path / "user", tmp_path / "site"
+        user_templates, site_templates = user_config / "vehicle_templates", site_config / "vehicle_templates"
+        user_templates.mkdir(parents=True)
+        site_templates.mkdir(parents=True)
+        (user_templates / "system_vehicle_components_template.json").write_text("{}", encoding="utf-8")
+        (user_templates / "user_vehicle_components_template.json").write_text(selected_content, encoding="utf-8")
+        (site_templates / "user_vehicle_components_template.json").write_text(
+            '{"Flight Controller": [{"name": "Old preset"}]}', encoding="utf-8"
+        )
+        with (
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem_program_settings.platform_system", return_value="Windows"
+            ),
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem_program_settings.user_config_dir",
+                return_value=str(user_config),
+            ),
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem_program_settings.site_config_dir",
+                return_value=str(site_config),
+            ),
+        ):
+            assert VehicleComponents().load_component_templates() == {}
+
+    @pytest.mark.parametrize(("platform_name", "override"), [("Linux", False), ("Windows", True)])
+    def test_alternate_scope_is_disabled_outside_normal_windows_installs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform_name: str, override: bool
+    ) -> None:
+        """Test overrides and non-Windows installations never read another scope's presets."""
+        if override:
+            monkeypatch.setenv("AMC_COMPONENT_TEMPLATES_DIR_TEST", str(tmp_path))
+        else:
+            monkeypatch.delenv("AMC_COMPONENT_TEMPLATES_DIR_TEST", raising=False)
+        with (
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem_program_settings.platform_system",
+                return_value=platform_name,
+            ),
+            patch("ardupilot_methodic_configurator.backend_filesystem_program_settings.user_config_dir") as user_dir,
+            patch("ardupilot_methodic_configurator.backend_filesystem_program_settings.site_config_dir") as site_dir,
+        ):
+            assert ProgramSettings.get_other_windows_templates_base_dir(str(tmp_path)) is None
+            user_dir.assert_not_called()
+            site_dir.assert_not_called()

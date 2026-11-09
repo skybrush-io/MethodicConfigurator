@@ -10,12 +10,15 @@ SPDX-FileCopyrightText: 2024-2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+from copy import deepcopy
+from logging import WARNING
 from math import isnan
 from unittest.mock import MagicMock, Mock
 
 import pytest
 from test_data_model_vehicle_components_common import BasicTestMixin, ComponentDataModelFixtures, RealisticDataTestMixin
 
+from ardupilot_methodic_configurator import __version__
 from ardupilot_methodic_configurator.backend_filesystem_vehicle_components import VehicleComponents
 from ardupilot_methodic_configurator.battery_cell_voltages import BatteryCell
 from ardupilot_methodic_configurator.data_model_par_dict import Par, ParDict
@@ -1715,3 +1718,560 @@ class TestComponentReordering:
         rc_fields = list(model_instance._data["Components"]["RC Receiver"].keys())
         assert rc_fields[-1] == "Notes", f"Notes should be last after update_json_structure, got: {rc_fields}"
         assert model_instance._data["Components"]["RC Receiver"]["Notes"] == "FrSky receiver"
+
+
+class TestLegacyBatteryLoading:
+    """Opening a legacy battery configuration derives missing values without losing user data."""
+
+    # Keep this expected sequence independent of the production ordering.
+    # pylint: disable=duplicate-code
+    EXPECTED_ORDER = (
+        "Chemistry",
+        "Volt per cell max",
+        "Volt per cell arm",
+        "Volt per cell low",
+        "Volt per cell crit",
+        "Volt per cell min",
+        "Number of cells",
+        "Capacity mAh",
+        "Calibration note",
+        "Vendor limits",
+    )
+    # pylint: enable=duplicate-code
+
+    @staticmethod
+    def legacy_specifications(cell_count: str | int | dict[str, str] | None = 3) -> ComponentData:
+        """Provide legacy fields in a noncanonical order, including custom scalar and nested data."""
+        return {
+            "Calibration note": "Keep this calibration",
+            "Capacity mAh": 5000,
+            "Number of cells": cell_count,
+            "Volt per cell crit": 3.3,
+            "Chemistry": "Lipo",
+            "Volt per cell low": 3.6,
+            "Volt per cell max": 4.2,
+            "Vendor limits": {"reserve": 0.15},
+        }
+
+    @staticmethod
+    def load_project(
+        specifications: ComponentData,
+        fc_parameters: dict[str, float] | None = None,
+        file_parameters: dict[str, ParDict] | None = None,
+    ) -> ComponentDataModelBase:
+        """Initialize a saved project once, with parameter sources available before migration runs."""
+        schema = ComponentDataModelFixtures.create_schema()
+        model = ComponentDataModelBase(
+            {"Format version": 1, "Components": {"Battery": {"Specifications": specifications}}},
+            schema.get_all_value_datatypes(),
+            schema,
+        )
+        model.post_init({}, fc_parameters=fc_parameters, file_parameters=file_parameters)
+        return model
+
+    @staticmethod
+    def parameter_sources(source: str, voltages: tuple[float, float]) -> tuple[dict[str, float], dict[str, ParDict]]:
+        """Provide deliberately different controller/file values to make source precedence observable."""
+        arm_voltage, min_voltage = voltages
+        if source == "defaults":
+            return {}, {}
+        file_values = ParDict({"BATT_ARM_VOLT": Par(arm_voltage), "MOT_BAT_VOLT_MIN": Par(min_voltage)})
+        if source == "controller":
+            return (
+                {"BATT_ARM_VOLT": arm_voltage, "MOT_BAT_VOLT_MIN": min_voltage},
+                {"battery.param": ParDict({"BATT_ARM_VOLT": Par(99.0), "MOT_BAT_VOLT_MIN": Par(98.0)})},
+            )
+        if source == "mixed":
+            file_values["BATT_ARM_VOLT"] = Par(99.0)
+            return {"BATT_ARM_VOLT": arm_voltage}, {"battery.param": file_values}
+        return {}, {"unrelated.param": ParDict({"OTHER": Par(1.0)}), "battery.param": file_values}
+
+    @pytest.mark.parametrize("source", ["controller", "files", "mixed", "defaults"])
+    @pytest.mark.parametrize(
+        "battery",
+        [(1, 3.818926, 3.078186), (3, 11.45678, 9.23456), ("3.0", 11.45678, 9.23456)],
+        ids=["single-cell", "three-cells", "legacy-text-cell-count"],
+    )
+    def test_user_loads_missing_voltage_thresholds_from_the_best_available_parameter_source(
+        self, source: str, battery: tuple[int | str, float, float]
+    ) -> None:
+        """
+        Migration prefers controller values, falls back per parameter and rounds pack-to-cell voltages.
+
+        GIVEN: Legacy battery settings and controller, file, mixed or absent voltage parameters
+        WHEN: The project is initialized with one cell, three cells or a legacy numeric-text count
+        THEN: Missing thresholds use the right source, round to four decimals and retain all other data
+        """
+        specifications = self.legacy_specifications(battery[0])
+        original = deepcopy(specifications)
+        fc_parameters, file_parameters = self.parameter_sources(source, (battery[1], battery[2]))
+
+        model = self.load_project(specifications, fc_parameters, file_parameters)
+
+        expected = original | {
+            "Volt per cell arm": 3.8 if source == "defaults" else 3.8189,
+            "Volt per cell min": 3.2 if source == "defaults" else 3.0782,
+        }
+        actual = model.get_component_value(("Battery", "Specifications"))
+        assert actual == expected
+        assert isinstance(actual, dict)
+        assert tuple(actual) == self.EXPECTED_ORDER
+        assert specifications == original
+
+        # Reopening with different parameters must retain the migrated settings and their order.
+        model.post_init({}, fc_parameters={"BATT_ARM_VOLT": 99.0, "MOT_BAT_VOLT_MIN": 98.0})
+
+        reopened = model.get_component_value(("Battery", "Specifications"))
+        assert reopened == expected
+        assert isinstance(reopened, dict)
+        assert tuple(reopened) == self.EXPECTED_ORDER
+
+    @pytest.mark.parametrize("cell_count", [None, {}, "unknown", 0, -1], ids=["missing", "object", "text", "zero", "negative"])
+    def test_user_loads_a_battery_with_an_invalid_cell_count_using_chemistry_defaults(
+        self, cell_count: str | int | dict[str, str] | None
+    ) -> None:
+        """
+        An invalid cell count never becomes a divisor for available pack voltages.
+
+        GIVEN: Legacy battery data with missing, malformed, zero or negative cell-count metadata
+        WHEN: The project opens with valid pack-voltage parameters
+        THEN: Both missing thresholds use chemistry defaults and the original data is preserved
+        """
+        specifications = self.legacy_specifications(cell_count)
+        original = deepcopy(specifications)
+
+        model = self.load_project(specifications, {"BATT_ARM_VOLT": 11.45678, "MOT_BAT_VOLT_MIN": 9.23456})
+
+        actual = model.get_component_value(("Battery", "Specifications"))
+        assert actual == original | {"Volt per cell arm": 3.8, "Volt per cell min": 3.2}
+        assert isinstance(actual, dict)
+        assert tuple(actual) == self.EXPECTED_ORDER
+        assert specifications == original
+
+    @pytest.mark.parametrize("existing", [("Volt per cell arm", 3.75), ("Volt per cell min", 3.15)])
+    def test_user_keeps_an_existing_voltage_when_only_the_other_threshold_needs_migration(
+        self, existing: tuple[str, float]
+    ) -> None:
+        """
+        A partially migrated battery retains the stored threshold and adds only the missing value.
+
+        GIVEN: Legacy data with either arming or minimum cell voltage already set
+        WHEN: The project opens with both pack-voltage parameters available
+        THEN: The existing value survives and the added field appears in canonical voltage order
+        """
+        specifications = self.legacy_specifications()
+        specifications[existing[0]] = existing[1]
+        expected = specifications | {"Volt per cell arm": 3.8189, "Volt per cell min": 3.0782} | {existing[0]: existing[1]}
+
+        model = self.load_project(specifications, {"BATT_ARM_VOLT": 11.45678, "MOT_BAT_VOLT_MIN": 9.23456})
+
+        actual = model.get_component_value(("Battery", "Specifications"))
+        assert actual == expected
+        assert isinstance(actual, dict)
+        assert tuple(actual) == self.EXPECTED_ORDER
+
+    def test_user_reopens_complete_battery_settings_without_reordering_or_rederiving_them(self) -> None:
+        """
+        A complete battery configuration retains its existing values and field order.
+
+        GIVEN: Saved custom threshold values and an existing noncanonical specification order
+        WHEN: The project opens with different controller parameters
+        THEN: No migration is needed and the saved values and order are preserved
+        """
+        specifications = self.legacy_specifications()
+        specifications.update({"Volt per cell arm": 3.75, "Volt per cell min": 3.15})
+        original = deepcopy(specifications)
+
+        model = self.load_project(specifications, {"BATT_ARM_VOLT": 11.45678, "MOT_BAT_VOLT_MIN": 9.23456})
+
+        actual = model.get_component_value(("Battery", "Specifications"))
+        assert actual == original
+        assert isinstance(actual, dict)
+        assert tuple(actual) == tuple(original)
+        assert specifications == original
+
+
+class TestSchemaDrivenComponentValues:
+    """Public setters retain schema datatypes and useful diagnostics when conversion is impossible."""
+
+    @pytest.fixture
+    def editing_model(self) -> ComponentDataModelBase:
+        """Provide editable boolean, structured and numeric fields defined through a real schema object."""
+        schema = VehicleComponentsJsonSchema(
+            {
+                "properties": {
+                    "Components": {
+                        "properties": {
+                            "Accessory": {
+                                "properties": {
+                                    "Specifications": {
+                                        "properties": {
+                                            "Enabled": {"type": "boolean"},
+                                            "Channels": {"type": "array"},
+                                            "Calibration": {"type": "object"},
+                                            "Count": {"type": "integer"},
+                                            "Gain": {"type": "number"},
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        return ComponentDataModelBase({}, schema.get_all_value_datatypes(), schema)
+
+    @pytest.mark.parametrize(
+        ("entered", "expected"),
+        [
+            ("true", True),
+            ("TRUE", True),
+            ("1", True),
+            ("yes", True),
+            ("YES", True),
+            ("on", True),
+            ("ON", True),
+            ("false", False),
+            ("FALSE", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+            ("unknown", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_user_enters_boolean_text_and_receives_an_actual_boolean(
+        self, editing_model: ComponentDataModelBase, entered: str | None, expected: bool
+    ) -> None:
+        """
+        Supported truthy spellings are case insensitive and other or cleared text is false.
+
+        GIVEN: An editable field declared as a Boolean in the schema
+        WHEN: The user enters a supported value, other text or clears the field
+        THEN: The stored value is the expected Boolean rather than numeric or unconverted text
+        """
+        path = ("Accessory", "Specifications", "Enabled")
+
+        editing_model.set_component_value(path, entered)
+
+        assert editing_model.get_component_value(path) is expected
+
+    def test_user_stores_a_structured_object_without_flattening_it_to_text(
+        self, editing_model: ComponentDataModelBase
+    ) -> None:
+        """
+        A value already matching an object schema retains its contents and datatype.
+
+        GIVEN: An object field with a matching dictionary value
+        WHEN: The value is set through the public component API
+        THEN: The saved component data contains the same dictionary
+        """
+        value = {"offset": 0.125}
+        editing_model.set_component_value(("Accessory", "Specifications", "Calibration"), value)
+
+        actual = editing_model.get_component_data()["Components"]["Accessory"]["Specifications"]["Calibration"]
+        assert actual == value
+        assert isinstance(actual, dict)
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            ("Channels", "list", "  CH1, CH2  ", "CH1, CH2"),
+            ("Calibration", "dict", "  offset=0.125  ", "offset=0.125"),
+        ],
+    )
+    def test_user_keeps_unstructured_text_and_sees_why_a_structured_field_cannot_cast_it(
+        self, editing_model: ComponentDataModelBase, case: tuple[str, str, str, str], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        Text cannot silently become a list or dictionary merely because the schema expects one.
+
+        GIVEN: An array or object field receiving unstructured text
+        WHEN: The user sets that value
+        THEN: Trimmed text is preserved and one warning names the value, field, type and structured-data requirement
+        """
+        field, type_name, entered, expected = case
+        path = ("Accessory", "Specifications", field)
+
+        with caplog.at_level(WARNING):
+            editing_model.set_component_value(path, entered)
+
+        assert editing_model.get_component_value(path) == expected
+        reason = "list and dict types require structured data"
+        assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+            (WARNING, f"Failed to cast value '{entered}' to {type_name} for path {path}: {reason}")
+        ]
+
+    @pytest.mark.parametrize(
+        "case",
+        [("Count", "int", "  not-an-integer  ", "not-an-integer"), ("Gain", "float", "  not-a-gain  ", "not-a-gain")],
+    )
+    def test_user_keeps_invalid_numeric_text_with_the_target_field_and_type_in_the_warning(
+        self, editing_model: ComponentDataModelBase, case: tuple[str, str, str, str], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        Failed numeric conversion retains the input for correction and identifies the intended datatype.
+
+        GIVEN: An integer or floating-point field receiving nonnumeric text
+        WHEN: The user sets that value
+        THEN: Trimmed text is retained and one warning identifies the original value, target type and field
+        """
+        field, type_name, entered, expected = case
+        path = ("Accessory", "Specifications", field)
+
+        with caplog.at_level(WARNING):
+            editing_model.set_component_value(path, entered)
+
+        assert editing_model.get_component_value(path) == expected
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelno == WARNING
+        assert caplog.records[0].getMessage().startswith(f"Failed to cast value '{entered}' to {type_name} for path {path}: ")
+
+
+class TestSavedComponentStructure:
+    """Loading saved projects supplies defaults and preserves data in a predictable presentation order."""
+
+    @staticmethod
+    def load_project(data: ComponentData) -> ComponentDataModelBase:
+        """Load caller-owned project data through the real public initialization workflow."""
+        schema = ComponentDataModelFixtures.create_schema()
+        model = ComponentDataModelBase(data, schema.get_all_value_datatypes(), schema)
+        model.post_init({})
+        return model
+
+    def test_user_opens_a_sparse_project_with_the_complete_default_structure(self) -> None:
+        """
+        Missing project sections receive the documented neutral defaults.
+
+        GIVEN: A saved project containing only an empty Components mapping
+        WHEN: The user opens the project
+        THEN: Format, program, controller, frame and battery defaults have their exact names and values
+        """
+        data: ComponentData = {"Components": {}}
+
+        model = self.load_project(data)
+        loaded = model.get_component_data()
+
+        assert set(loaded) == {"Format version", "Program version", "Components"}
+        assert loaded["Format version"] == 1
+        assert loaded["Program version"] == __version__
+        components = loaded["Components"]
+        assert tuple(components) == ("Flight Controller", "Frame", "Battery")
+        assert components["Flight Controller"] == {
+            "Product": {},
+            "Firmware": {},
+            "Specifications": {"MCU Series": "Unknown"},
+            "Notes": "",
+        }
+        assert components["Frame"] == {"Specifications": {"TOW min Kg": 1, "TOW max Kg": 1, "Frame class": "Undefined"}}
+        assert components["Battery"]["Specifications"]["Capacity mAh"] == 0
+        assert components["Battery"]["Specifications"]["Chemistry"] == "Lipo"
+        assert data == {"Components": {}}
+
+    def test_user_keeps_saved_values_and_extensions_when_defaults_are_merged(self) -> None:
+        """
+        Loading fills gaps without replacing explicit values or editing caller-owned data.
+
+        GIVEN: A project with saved values, nested extensions and an older program version
+        WHEN: The user opens the project
+        THEN: Only missing defaults and the current program version are supplied
+        """
+        data: ComponentData = {
+            "Format version": 7,
+            "Program version": "older-program-version",
+            "Project notes": {"Owner": "Flight team"},
+            "Components": {
+                "Frame": {
+                    "Specifications": {"TOW min Kg": 0, "TOW max Kg": 12.5, "Frame class": "Hexa", "Arms": 6},
+                    "Notes": "Custom airframe",
+                },
+                "Flight Controller": {
+                    "Product": {"Model": "Cube Orange"},
+                    "Firmware": {"Version": "4.6.2"},
+                    "Specifications": {"MCU Series": "STM32H7", "Storage": {"Size MB": 32}},
+                    "Notes": "Keep this note",
+                },
+                "Battery": {"Specifications": {"Chemistry": "Lipo", "Capacity mAh": 6200, "Voltage max": 4.15}},
+            },
+        }
+        original = deepcopy(data)
+
+        model = self.load_project(data)
+        loaded = model.get_component_data()
+
+        assert loaded == {**original, "Program version": __version__}
+        assert data == original
+        before_reopening = deepcopy(loaded)
+        model.post_init({})
+        assert model.get_component_data() == before_reopening
+        assert data == original
+
+    def test_user_sees_every_standard_component_in_order_before_custom_components(self) -> None:
+        """
+        The complete component sequence is stable regardless of its saved ordering.
+
+        GIVEN: All standard components in reverse order interspersed with custom components
+        WHEN: The user opens the project and opens it again
+        THEN: Standard components follow the presentation sequence and custom data keeps its relative order
+        """
+        # Keep this expected sequence independent of the production ordering.
+        # pylint: disable=duplicate-code
+        expected = (
+            "Flight Controller",
+            "Frame",
+            "Battery Monitor",
+            "Battery",
+            "ESC",
+            "Motors",
+            "Propellers",
+            "GNSS Receiver",
+            "RC Controller",
+            "RC Transmitter",
+            "RC Receiver",
+            "Telemetry",
+        )
+        # pylint: enable=duplicate-code
+        components: ComponentData = {"Custom Camera": {"Notes": "Nadir", "Calibration": {"Offset": 0.125}}}
+        for name in reversed(expected):
+            components[name] = {"Notes": f"Saved {name}", "Installation": {"Label": name}}
+        components["Custom Sensor"] = {"Notes": "Payload", "Calibration": {"Offset": -0.25}}
+        data: ComponentData = {"Components": components}
+        original = deepcopy(data)
+
+        model = self.load_project(data)
+
+        for _ in range(2):
+            actual = model.get_component_data()["Components"]
+            assert tuple(actual) == (*expected, "Custom Camera", "Custom Sensor")
+            for name in expected:
+                assert actual[name]["Installation"] == {"Label": name}
+                assert actual[name]["Notes"] == f"Saved {name}"
+                assert tuple(actual[name])[-1] == "Notes"
+            for name in ("Custom Camera", "Custom Sensor"):
+                assert actual[name] == original["Components"][name]
+                assert tuple(actual[name]) == ("Calibration", "Notes")
+            model.post_init({})
+        assert data == original
+
+    @pytest.mark.parametrize("identity_fields", [(), ("Manufacturer",), ("Model",), ("Manufacturer", "Model")])
+    def test_user_sees_product_identity_before_version_url_and_custom_fields(self, identity_fields: tuple[str, ...]) -> None:
+        """
+        Complete version and URL metadata receives a canonical order without losing extensions.
+
+        GIVEN: A product with shuffled fields, optional identity fields and custom metadata
+        WHEN: The user opens the saved project
+        THEN: Identity, version and URL precede custom fields while all values and notes survive
+        """
+        product: ComponentData = {"Serial": "SN-42", "URL": "https://example.org/motor", "Version": "2.1"}
+        for field in reversed(identity_fields):
+            product[field] = f"Saved {field}"
+        product["Calibration"] = {"Offset": 0.125}
+        data: ComponentData = {"Components": {"Motors": {"Notes": "Clockwise", "Product": product, "Quantity": 4}}}
+        original = deepcopy(data)
+
+        model = self.load_project(data)
+        motor = model.get_component_data()["Components"]["Motors"]
+
+        assert tuple(motor["Product"]) == (*identity_fields, "Version", "URL", "Serial", "Calibration")
+        assert motor["Product"] == product
+        assert tuple(motor) == ("Product", "Quantity", "Notes")
+        assert motor["Notes"] == "Clockwise"
+        assert motor["Quantity"] == 4
+        assert data == original
+
+    @pytest.mark.parametrize("metadata", [{"Version": "2.1"}, {"URL": "https://example.org/motor"}, {}])
+    def test_user_keeps_partial_product_metadata_in_its_saved_order(self, metadata: ComponentData) -> None:
+        """
+        A product without both version and URL keeps its existing field order.
+
+        GIVEN: A custom-first product missing version, URL or both
+        WHEN: The user opens the saved project
+        THEN: Its contents and order are preserved without introducing absent fields
+        """
+        product = {"Serial": "SN-42", **metadata, "Manufacturer": "Motor supplier", "Model": "M4"}
+        data: ComponentData = {"Components": {"Motors": {"Product": product}}}
+
+        model = self.load_project(data)
+        actual = model.get_component_data()["Components"]["Motors"]["Product"]
+
+        assert actual == product
+        assert tuple(actual) == tuple(product)
+        assert data == {"Components": {"Motors": {"Product": product}}}
+
+    @pytest.mark.parametrize("has_telemetry", [False, True])
+    def test_user_migrates_legacy_esc_connections_without_duplicate_components(self, has_telemetry: bool) -> None:
+        """
+        Legacy control connections merge into the new section and preserve telemetry or supply neutral defaults.
+
+        GIVEN: An ESC containing both connection paths, custom settings and optional telemetry
+        WHEN: The user opens the project twice
+        THEN: Legacy fields override matching connection fields, extras survive and only one ESC remains
+        """
+        telemetry = {"Type": "SERIAL2", "Protocol": "ESC Telemetry", "Rate Hz": 10}
+        esc: ComponentData = {
+            "Notes": "Four motors",
+            "FC Connection": {"Type": "Main", "Protocol": "DShot600", "Outputs": [1, 2, 3, 4]},
+            "FC->ESC Connection": {"Protocol": "PWM", "Custom timing": {"Delay us": 5}},
+            "Product": {"Model": "4-in-1"},
+        }
+        if has_telemetry:
+            esc["ESC->FC Telemetry"] = telemetry
+        data: ComponentData = {"Components": {"ESC": esc}}
+        original = deepcopy(data)
+
+        model = self.load_project(data)
+
+        for _ in range(2):
+            components = model.get_component_data()["Components"]
+            assert set(components) == {"Flight Controller", "Frame", "Battery", "ESC"}
+            actual = components["ESC"]
+            assert set(actual) == {"Product", "FC->ESC Connection", "ESC->FC Telemetry", "Notes"}
+            assert actual["FC->ESC Connection"] == {
+                "Type": "Main",
+                "Protocol": "DShot600",
+                "Outputs": [1, 2, 3, 4],
+                "Custom timing": {"Delay us": 5},
+            }
+            assert actual["ESC->FC Telemetry"] == (telemetry if has_telemetry else {"Type": "None", "Protocol": "None"})
+            assert actual["Product"] == {"Model": "4-in-1"}
+            assert actual["Notes"] == "Four motors"
+            assert tuple(actual)[-1] == "Notes"
+            model.post_init({})
+        assert data == original
+
+    @pytest.mark.parametrize(
+        ("legacy_protocol", "expected_protocol"),
+        [("SBF", "Septentrio(SBF)"), ("GSOF", "Trimble(GSOF)"), ("SBF-DualAntenna", "Septentrio-DualAntenna(SBF)")],
+    )
+    def test_user_migrates_legacy_gnss_names_without_losing_receiver_settings(
+        self, legacy_protocol: str, expected_protocol: str
+    ) -> None:
+        """
+        Renaming a legacy GNSS component and protocol preserves its remaining data.
+
+        GIVEN: A legacy receiver name and protocol with connection, product and custom settings
+        WHEN: The user opens the project twice
+        THEN: Only the canonical receiver and protocol names remain and all other settings survive
+        """
+        receiver: ComponentData = {
+            "Notes": "Roof antenna",
+            "FC Connection": {"Type": "SERIAL3", "Protocol": legacy_protocol, "Baudrate": 115200},
+            "Product": {"Model": "Survey receiver"},
+            "Calibration": {"Offset m": 0.125},
+        }
+        data: ComponentData = {"Components": {"GNSS receiver": receiver}}
+        original = deepcopy(data)
+        expected = deepcopy(receiver)
+        expected["FC Connection"]["Protocol"] = expected_protocol
+
+        model = self.load_project(data)
+
+        for _ in range(2):
+            components = model.get_component_data()["Components"]
+            assert tuple(components) == ("Flight Controller", "Frame", "Battery", "GNSS Receiver")
+            assert components["GNSS Receiver"] == expected
+            assert tuple(components["GNSS Receiver"])[-1] == "Notes"
+            model.post_init({})
+        assert data == original

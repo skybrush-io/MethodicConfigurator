@@ -28,6 +28,8 @@ from ardupilot_methodic_configurator.data_model_vehicle_components_validation im
 
 # pylint: disable=too-many-lines,protected-access,too-many-public-methods
 
+ESC_TELEMETRY_SERIAL_PORTS = tuple(f"SERIAL{number}" for number in range(1, 9))
+
 
 class TestComponentDataModelValidation(BasicTestMixin, RealisticDataTestMixin):
     """Tests for the ComponentDataModelValidation class."""
@@ -46,6 +48,20 @@ class TestComponentDataModelValidation(BasicTestMixin, RealisticDataTestMixin):
     def realistic_model(self) -> ComponentDataModelValidation:
         """Create a realistic vehicle data model based on the JSON file."""
         return ComponentDataModelFixtures.create_realistic_model(ComponentDataModelValidation)
+
+    @pytest.fixture
+    def battery_voltage_model(self, realistic_model: ComponentDataModelValidation) -> ComponentDataModelValidation:
+        """Provide independent LiPo voltage settings within the chemistry limits."""
+        realistic_model.set_component_value(("Battery", "Specifications", "Chemistry"), "Lipo")
+        for setting, voltage in (
+            ("Volt per cell max", 4.0),
+            ("Volt per cell arm", 3.8),
+            ("Volt per cell low", 3.6),
+            ("Volt per cell crit", 3.3),
+            ("Volt per cell min", 3.2),
+        ):
+            realistic_model.set_component_value(("Battery", "Specifications", setting), voltage)
+        return realistic_model
 
     # Update the sample_doc_dict fixture to use the common one
     @pytest.fixture
@@ -470,6 +486,72 @@ class TestComponentDataModelValidation(BasicTestMixin, RealisticDataTestMixin):
         error_msg, corrected_value = model.validate_cell_voltage("3.7", ("Battery", "Specifications", "Volt per cell crit"))
         assert error_msg != ""
         assert corrected_value is not None
+
+    @pytest.mark.parametrize(
+        ("field", "value", "limit_field", "expected_correction"),
+        [
+            ("Volt per cell max", "3.7", "Volt per cell arm", 3.81),
+            ("Volt per cell arm", "4.1", "Volt per cell max", 3.99),
+            ("Volt per cell arm", "3.5", "Volt per cell low", 3.61),
+            ("Volt per cell low", "3.9", "Volt per cell arm", 3.79),
+            ("Volt per cell low", "3.2", "Volt per cell crit", 3.31),
+            ("Volt per cell crit", "3.7", "Volt per cell low", 3.59),
+            ("Volt per cell min", "3.7", "Volt per cell low", 3.59),
+        ],
+    )
+    def test_user_receives_and_stores_cell_voltage_correction_near_the_conflicting_limit(
+        self,
+        battery_voltage_model: ComponentDataModelValidation,
+        field: str,
+        value: str,
+        limit_field: str,
+        expected_correction: float,
+    ) -> None:
+        """
+        Invalid voltage relationships produce a correction 0.01 V beyond the conflicting limit.
+
+        GIVEN: LiPo voltage limits within the chemistry's supported range
+        WHEN: The user submits a voltage on the wrong side of another voltage setting
+        THEN: Validation identifies that setting and stores the nearby corrected voltage
+        """
+        model = battery_voltage_model
+        path = ("Battery", "Specifications", field)
+
+        is_valid, errors = model.validate_all_data({path: value})
+
+        assert is_valid is False
+        assert len(errors) == 1
+        assert limit_field in errors[0]
+        assert model.get_component_value(path) == pytest.approx(expected_correction)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("Volt per cell max", "3.8"),
+            ("Volt per cell arm", "4.0"),
+            ("Volt per cell arm", "3.6"),
+            ("Volt per cell low", "3.8"),
+            ("Volt per cell low", "3.3"),
+            ("Volt per cell crit", "3.6"),
+            ("Volt per cell min", "3.6"),
+        ],
+    )
+    def test_user_can_enter_cell_voltage_equal_to_a_related_limit(
+        self, battery_voltage_model: ComponentDataModelValidation, field: str, value: str
+    ) -> None:
+        """
+        Voltage relationship boundaries are inclusive.
+
+        GIVEN: LiPo maximum, arming, low and critical voltages of 4.0, 3.8, 3.6 and 3.3 V
+        WHEN: The user enters a voltage equal to its related upper or lower limit
+        THEN: Validation accepts it without proposing a correction
+        """
+        model = battery_voltage_model
+
+        error, correction = model.validate_entry_limits(value, ("Battery", "Specifications", field))
+
+        assert error == ""
+        assert correction is None
 
     def test_validate_cell_voltage_chemistry_limits(self, realistic_model) -> None:
         """
@@ -2184,3 +2266,1341 @@ class TestComponentDataModelValidationUncoveredBranches:
         # Error should be returned about arm not being set
         assert not is_valid
         assert len(errors) > 0
+
+
+class TestEscTelemetrySelection:
+    """Users see telemetry choices compatible with their selected ESC connection."""
+
+    @pytest.fixture
+    def esc_model(self) -> ComponentDataModelValidation:
+        """Provide a real component model with schema and offline protocol choices."""
+        return ComponentDataModelFixtures.create_basic_model(ComponentDataModelValidation)
+
+    @staticmethod
+    def select_connection(model: ComponentDataModelValidation, vehicle_type: str, connection_type: str, protocol: str) -> None:
+        """Select a vehicle and ESC connection using the component editor's model APIs."""
+        model.set_component_value(("Flight Controller", "Firmware", "Type"), vehicle_type)
+        model.init_possible_choices({})
+        model.set_component_value(("ESC", "FC->ESC Connection", "Type"), connection_type)
+        model.set_component_value(("ESC", "FC->ESC Connection", "Protocol"), protocol)
+
+    @pytest.mark.parametrize(
+        ("vehicle_type", "connection_type", "protocol", "expected_types", "mirrored"),
+        [
+            ("ArduCopter", "Main Out", "Normal", ("None", *ESC_TELEMETRY_SERIAL_PORTS), False),
+            ("Heli", "AIO", "DShot300", ("None", "AIO", *ESC_TELEMETRY_SERIAL_PORTS), False),
+            ("Rover", "Main Out", "BrushedBiPolar", ("None",), False),
+            ("ArduPlane", "AIO", "DShot600", ("None", "AIO", *ESC_TELEMETRY_SERIAL_PORTS), False),
+            ("ArduCopter", "CAN2", "DroneCAN", ("CAN2",), True),
+            ("ArduPlane", "CAN1", "DroneCAN", ("CAN1",), True),
+            ("ArduCopter", "SERIAL1", "FETtecOneWire", ("SERIAL1",), True),
+            ("Heli", "SERIAL4", "Torqeedo", ("SERIAL4",), True),
+            ("Rover", "SERIAL8", "CoDevESC", ("SERIAL8",), True),
+            ("ArduCopter", "CAN1", "DShot600", ("None",), False),
+            ("ArduCopter", "Main Out", "DroneCAN", ("None",), False),
+            ("ArduPlane", "SERIAL1", "FETtecOneWire", ("None",), False),
+            ("ArduCopter", "None", "None", ("None",), False),
+            ("ArduCopter", "", "", ("None",), False),
+        ],
+    )
+    # Keep each compatibility-matrix input explicit in the parametrized tests.
+    # pylint: disable-next=too-many-arguments,too-many-positional-arguments
+    def test_user_sees_telemetry_ports_and_mirror_state_for_the_selected_connection(
+        self,
+        esc_model: ComponentDataModelValidation,
+        vehicle_type: str,
+        connection_type: str,
+        protocol: str,
+        expected_types: tuple[str, ...],
+        mirrored: bool,
+    ) -> None:
+        """
+        Telemetry choices and editability follow the selected vehicle, port and protocol together.
+
+        GIVEN: A vehicle and an ESC control connection selected without parameter metadata
+        WHEN: The component editor requests valid telemetry ports and mirror state
+        THEN: Only compatible ports appear and only fully mirrored settings are locked
+        """
+        self.select_connection(esc_model, vehicle_type, connection_type, protocol)
+
+        assert esc_model.get_valid_esc_telemetry_types() == expected_types
+        assert esc_model.is_esc_telemetry_type_mirrored() is mirrored
+        assert esc_model.is_esc_telemetry_protocol_mirrored() is mirrored
+
+    @pytest.mark.parametrize(
+        ("vehicle_type", "connection_type", "protocol", "telemetry_type", "expected_protocols"),
+        [
+            ("ArduCopter", "Main Out", "Normal", "SERIAL1", ("Scripting",)),
+            ("ArduCopter", "AIO", "OneShot", "SERIAL8", ("ESC Telemetry",)),
+            ("Heli", "Main Out", "OneShot125", "SERIAL3", ("ESC Telemetry",)),
+            ("ArduCopter", "Main Out", "DShot600", "SERIAL2", ("ESC Telemetry",)),
+            ("ArduPlane", "AIO", "DShot300", "SERIAL7", ("ESC Telemetry",)),
+            ("Rover", "Main Out", "BrushedWithRelay", "SERIAL5", ("None",)),
+            ("Rover", "AIO", "BrushedBiPolar", "SERIAL5", ("None",)),
+            ("ArduCopter", "Main Out", "Brushed", "SERIAL1", ("None",)),
+            ("ArduCopter", "Main Out", "Normal", "SERIAL9", ("None",)),
+            ("ArduCopter", "SERIAL2", "FETtecOneWire", "SERIAL2", ("FETtecOneWire",)),
+            ("Rover", "SERIAL8", "CoDevESC", "SERIAL8", ("CoDevESC",)),
+            ("Heli", "SERIAL4", "Torqeedo", "SERIAL4", ("Torqeedo",)),
+            ("ArduCopter", "SERIAL3", "DShot600", "SERIAL3", ("None",)),
+            ("ArduCopter", "None", "None", "SERIAL1", ("None",)),
+            ("ArduCopter", "Main Out", "DroneCAN", "SERIAL1", ("None",)),
+        ],
+    )
+    # pylint: disable-next=too-many-arguments,too-many-positional-arguments
+    def test_user_sees_only_serial_telemetry_protocols_supported_by_the_control_protocol(
+        self,
+        esc_model: ComponentDataModelValidation,
+        vehicle_type: str,
+        connection_type: str,
+        protocol: str,
+        telemetry_type: str,
+        expected_protocols: tuple[str, ...],
+    ) -> None:
+        """
+        A serial back-channel offers the protocol compatible with the current ESC control mode.
+
+        GIVEN: An ESC control port and protocol for the selected vehicle
+        WHEN: The user selects a serial telemetry port
+        THEN: Scripting, ESC Telemetry or the mirrored protocol is offered only when applicable
+        """
+        self.select_connection(esc_model, vehicle_type, connection_type, protocol)
+
+        esc_model.set_component_value(("ESC", "ESC->FC Telemetry", "Type"), telemetry_type)
+
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == expected_protocols
+
+    @pytest.mark.parametrize(
+        ("vehicle_type", "brushed_protocol"),
+        [("ArduCopter", "Brushed"), ("Heli", "Brushed"), ("Rover", "BrushedWithRelay"), ("ArduPlane", "Brushed")],
+    )
+    @pytest.mark.parametrize("pwm_port", ["Main Out", "AIO"])
+    def test_user_switches_from_can_to_pwm_and_receives_current_telemetry_choices(
+        self,
+        esc_model: ComponentDataModelValidation,
+        vehicle_type: str,
+        brushed_protocol: str,
+        pwm_port: str,
+    ) -> None:
+        """
+        Changing the control connection refreshes telemetry choices without stale ports or duplicates.
+
+        GIVEN: A DroneCAN ESC configuration
+        WHEN: The user switches to PWM and then selects DShot, brushed and normal protocols
+        THEN: Choices first include all PWM back-channels, then narrow to the selected protocol
+        """
+        self.select_connection(esc_model, vehicle_type, "CAN2", "DroneCAN")
+        telemetry_type_path = ("ESC", "ESC->FC Telemetry", "Type")
+        telemetry_protocol_path = ("ESC", "ESC->FC Telemetry", "Protocol")
+
+        esc_model.set_component_value(("ESC", "FC->ESC Connection", "Type"), pwm_port)
+
+        assert esc_model.get_combobox_values_for_path(telemetry_type_path) == (
+            "None",
+            *ESC_TELEMETRY_SERIAL_PORTS,
+            pwm_port,
+        )
+        assert esc_model.get_combobox_values_for_path(telemetry_protocol_path) == (
+            "None",
+            "Scripting",
+            "ESC Telemetry",
+            "BDShotOnly",
+        )
+
+        for protocol, expected_types, expected_protocols in (
+            ("DShot300", ("None", pwm_port, *ESC_TELEMETRY_SERIAL_PORTS), ("None", "BDShotOnly", "ESC Telemetry")),
+            (brushed_protocol, ("None",), ("None",)),
+            ("Normal", ("None", *ESC_TELEMETRY_SERIAL_PORTS), ("None", "Scripting")),
+        ):
+            esc_model.set_component_value(("ESC", "FC->ESC Connection", "Protocol"), protocol)
+
+            assert esc_model.get_combobox_values_for_path(telemetry_type_path) == expected_types
+            assert esc_model.get_combobox_values_for_path(telemetry_protocol_path) == expected_protocols
+            assert esc_model.is_esc_telemetry_type_mirrored() is False
+            assert esc_model.is_esc_telemetry_protocol_mirrored() is False
+
+
+class TestFirmwareMetadataChoices:
+    """Firmware metadata and offline defaults supply the component editor's choices."""
+
+    @pytest.fixture
+    def choice_model(self) -> ComponentDataModelValidation:
+        """Provide a real model with no saved connection types to override initial choices."""
+        return ComponentDataModelFixtures.create_basic_model(ComponentDataModelValidation)
+
+    @pytest.mark.parametrize(
+        ("component", "section", "expected"),
+        [
+            ("RC Receiver", "FC Connection", ("RCin/SBUS", *ESC_TELEMETRY_SERIAL_PORTS, "CAN1", "CAN2")),
+            ("Telemetry", "FC Connection", ("None", *ESC_TELEMETRY_SERIAL_PORTS, "CAN1", "CAN2")),
+            ("GNSS Receiver", "FC Connection", ("None", *ESC_TELEMETRY_SERIAL_PORTS, "CAN1", "CAN2")),
+            ("ESC", "FC->ESC Connection", ("Main Out", "AIO", *ESC_TELEMETRY_SERIAL_PORTS, "CAN1", "CAN2")),
+        ],
+    )
+    def test_user_can_choose_supported_connection_ports_before_saving_components(
+        self, choice_model: ComponentDataModelValidation, component: str, section: str, expected: tuple[str, ...]
+    ) -> None:
+        """
+        New component selectors expose complete connection choices without duplicates.
+
+        GIVEN: A project without previously saved receiver, telemetry, GNSS or ESC connections
+        WHEN: The component editor initializes offline choices
+        THEN: The corresponding selector exposes exactly its supported ports in order
+        """
+        choice_model.init_possible_choices({})
+
+        assert choice_model.get_combobox_values_for_path((component, section, "Type")) == expected
+
+    @pytest.mark.parametrize(
+        ("component", "protocol"),
+        [
+            ("RC Receiver", "CRSF"),
+            ("Battery Monitor", "Analog Voltage and Current"),
+            ("GNSS Receiver", "uBlox"),
+            ("Telemetry", "MAVLink2"),
+        ],
+    )
+    def test_offline_user_can_choose_full_protocol_names_without_firmware_metadata(
+        self, choice_model: ComponentDataModelValidation, component: str, protocol: str
+    ) -> None:
+        """
+        Offline protocol selectors contain usable full names rather than missing or truncated labels.
+
+        GIVEN: A project opened without firmware metadata or saved connection selections
+        WHEN: The user chooses a supported receiver, monitor, GNSS or telemetry protocol
+        THEN: The full label is available and passes component validation
+        """
+        choice_model.init_possible_choices({})
+        path = (component, "FC Connection", "Protocol")
+
+        assert protocol in choice_model.get_combobox_values_for_path(path)
+        assert choice_model.validate_all_data({path: protocol}) == (True, [])
+
+    @pytest.mark.parametrize(
+        ("vehicle_type", "frame_values", "expected"),
+        [
+            ("ArduCopter", {"0": "Undefined", "1": "Quad", "2": "Hexa"}, ("Quad", "Hexa")),
+            ("Heli", {"0": "Undefined", "6": "Heli", "11": "Heli_Dual"}, ("Heli", "Heli_Dual")),
+            ("Rover", {"0": "Undefined", "1": "Rover", "2": "Boat"}, ("Rover", "Boat")),
+            ("ArduPlane", {"0": "Undefined", "1": "Quad"}, ("Undefined", "Single/Dual")),
+        ],
+    )
+    def test_user_sees_frame_classes_from_the_selected_vehicle_parameter(
+        self,
+        choice_model: ComponentDataModelValidation,
+        vehicle_type: str,
+        frame_values: dict[str, str],
+        expected: tuple[str, ...],
+    ) -> None:
+        """
+        Frame choices use the loaded vehicle's metadata rather than a different firmware's parameter.
+
+        GIVEN: Distinct FRAME_CLASS and Q_FRAME_CLASS metadata
+        WHEN: The component editor initializes choices for a selected vehicle
+        THEN: Plane uses Q_FRAME_CLASS and other vehicles use FRAME_CLASS without Undefined
+        """
+        choice_model.set_component_value(("Flight Controller", "Firmware", "Type"), vehicle_type)
+        metadata = {
+            "FRAME_CLASS": {"values": frame_values},
+            "Q_FRAME_CLASS": {"values": {"0": "Undefined", "10": "Single/Dual"}},
+        }
+
+        choice_model.init_possible_choices(metadata)
+
+        assert choice_model.get_combobox_values_for_path(("Frame", "Specifications", "Frame class")) == expected
+
+    @pytest.mark.parametrize("frame_metadata", [None, {}, {"values": {}}, {"values": {"0": "Undefined"}}])
+    @pytest.mark.parametrize(
+        ("vehicle_type", "expected"),
+        [
+            ("Heli", ("Heli", "SingleCopter", "CoaxCopter", "BiCopter", "Heli_Dual", "HeliQuad")),
+            ("Rover", ("Rover", "Boat", "BalanceBot")),
+        ],
+    )
+    def test_user_keeps_vehicle_frame_choices_when_metadata_has_no_usable_classes(
+        self,
+        choice_model: ComponentDataModelValidation,
+        frame_metadata: dict[str, dict[str, str]] | None,
+        vehicle_type: str,
+        expected: tuple[str, ...],
+    ) -> None:
+        """
+        Missing or unusable frame metadata preserves the selected vehicle's offline frame choices.
+
+        GIVEN: Heli or Rover with absent, empty or Undefined-only frame metadata
+        WHEN: The user opens the component editor
+        THEN: The complete vehicle-specific fallback appears without Undefined
+        """
+        choice_model.set_component_value(("Flight Controller", "Firmware", "Type"), vehicle_type)
+        metadata = {} if frame_metadata is None else {"FRAME_CLASS": frame_metadata}
+
+        choice_model.init_possible_choices(metadata)
+
+        assert choice_model.get_combobox_values_for_path(("Frame", "Specifications", "Frame class")) == expected
+
+    def test_fixed_wing_user_can_keep_undefined_as_the_only_documented_frame_class(
+        self, choice_model: ComponentDataModelValidation
+    ) -> None:
+        """
+        A fixed-wing aircraft can explicitly have no hover frame.
+
+        GIVEN: Plane metadata whose only Q_FRAME_CLASS choice is Undefined
+        WHEN: The component editor initializes the available frames
+        THEN: It preserves that choice without adding multicopter frames
+        """
+        choice_model.set_component_value(("Flight Controller", "Firmware", "Type"), "ArduPlane")
+
+        choice_model.init_possible_choices({"Q_FRAME_CLASS": {"values": {"0": "Undefined"}}})
+
+        assert choice_model.get_combobox_values_for_path(("Frame", "Specifications", "Frame class")) == ("Undefined",)
+
+    @pytest.mark.parametrize(
+        ("vehicle_type", "metadata", "expected"),
+        [
+            ("ArduCopter", {"MOT_PWM_TYPE": {"values": {"0": "Normal", "6": "DShot600"}}}, ("Normal", "DShot600")),
+            ("ArduPlane", {"Q_M_PWM_TYPE": {"values": {"0": "Normal", "5": "DShot300"}}}, ("Normal", "DShot300")),
+            (
+                "ArduPlane",
+                {
+                    "MOT_PWM_TYPE": {"values": {"0": "Normal", "6": "DShot600"}},
+                    "Q_M_PWM_TYPE": {"values": {"5": "DShot300", "8": "PWMRange"}},
+                },
+                ("DShot300", "PWMRange"),
+            ),
+        ],
+    )
+    def test_user_sees_loaded_motor_protocols_when_selecting_a_pwm_output(
+        self,
+        choice_model: ComponentDataModelValidation,
+        vehicle_type: str,
+        metadata: dict[str, dict[str, dict[str, str]]],
+        expected: tuple[str, ...],
+    ) -> None:
+        """
+        The PWM control selector reflects loaded motor metadata, preferring QuadPlane values when present.
+
+        GIVEN: Firmware motor metadata with a subset of supported PWM protocols
+        WHEN: The user selects a PWM control output after choices are initialized
+        THEN: The selector contains exactly the loaded protocols in their documented order
+        """
+        choice_model.set_component_value(("Flight Controller", "Firmware", "Type"), vehicle_type)
+        choice_model.init_possible_choices(metadata)
+
+        choice_model.set_component_value(("ESC", "FC->ESC Connection", "Type"), "Main Out")
+
+        assert choice_model.get_combobox_values_for_path(("ESC", "FC->ESC Connection", "Protocol")) == expected
+
+    @pytest.mark.parametrize("motor_metadata", [None, {}, {"values": {}}])
+    def test_user_keeps_offline_pwm_protocols_when_motor_metadata_is_missing_or_empty(
+        self, choice_model: ComponentDataModelValidation, motor_metadata: dict[str, dict[str, str]] | None
+    ) -> None:
+        """
+        Incomplete motor metadata does not empty the PWM control selector.
+
+        GIVEN: Copter with absent or empty MOT_PWM_TYPE metadata
+        WHEN: The user selects a PWM control output
+        THEN: All offline Copter PWM protocols remain available without CAN or serial protocols
+        """
+        choice_model.set_component_value(("Flight Controller", "Firmware", "Type"), "ArduCopter")
+        metadata = {} if motor_metadata is None else {"MOT_PWM_TYPE": motor_metadata}
+        choice_model.init_possible_choices(metadata)
+
+        choice_model.set_component_value(("ESC", "FC->ESC Connection", "Type"), "AIO")
+
+        assert choice_model.get_combobox_values_for_path(("ESC", "FC->ESC Connection", "Protocol")) == (
+            "Normal",
+            "OneShot",
+            "OneShot125",
+            "Brushed",
+            "DShot150",
+            "DShot300",
+            "DShot600",
+            "DShot1200",
+            "PWMRange",
+            "PWMAngle",
+        )
+
+    @pytest.mark.parametrize(
+        ("receiver_metadata", "expected"),
+        [
+            ({"values": {"512": "CRSF", "8": "SBUS"}}, ("CRSF", "SBUS")),
+            ({"Bitmask": {"512": "CRSF", "4096": "FPORT2"}}, ("CRSF", "FPORT2")),
+            ({"values": {}, "Bitmask": {"512": "CRSF"}}, ("CRSF",)),
+            ({"values": {"8": "SBUS"}, "Bitmask": {"512": "CRSF"}}, ("SBUS",)),
+        ],
+    )
+    def test_user_sees_documented_receiver_and_battery_monitor_choices(
+        self,
+        choice_model: ComponentDataModelValidation,
+        receiver_metadata: dict[str, dict[str, str]],
+        expected: tuple[str, ...],
+    ) -> None:
+        """
+        Receiver choices support value and bitmask metadata, with nonempty values taking priority.
+
+        GIVEN: Receiver metadata and battery-monitor enum metadata loaded from firmware
+        WHEN: The component editor initializes its selectors
+        THEN: Both selectors show the documented labels in order without additional fallback entries
+        """
+        metadata = {
+            "RC_PROTOCOLS": receiver_metadata,
+            "BATT_MONITOR": {"values": {"0": "Disabled", "4": "Analog Voltage and Current"}},
+        }
+
+        choice_model.init_possible_choices(metadata)
+
+        assert choice_model.get_combobox_values_for_path(("RC Receiver", "FC Connection", "Protocol")) == expected
+        assert choice_model.get_combobox_values_for_path(("Battery Monitor", "FC Connection", "Protocol")) == (
+            "Disabled",
+            "Analog Voltage and Current",
+        )
+
+    def test_user_loading_new_motor_metadata_replaces_previous_protocol_choices(
+        self, choice_model: ComponentDataModelValidation
+    ) -> None:
+        """
+        Reloading firmware metadata refreshes a saved PWM connection's protocol choices.
+
+        GIVEN: A PWM connection initialized with Copter motor protocols
+        WHEN: The user loads a new motor-protocol list
+        THEN: The selector replaces the old protocols without retaining stale entries
+        """
+        choice_model.set_component_value(("Flight Controller", "Firmware", "Type"), "ArduCopter")
+        choice_model.init_possible_choices({"MOT_PWM_TYPE": {"values": {"0": "Normal", "6": "DShot600"}}})
+        choice_model.set_component_value(("ESC", "FC->ESC Connection", "Type"), "Main Out")
+        choice_model.set_component_value(("ESC", "FC->ESC Connection", "Protocol"), "DShot600")
+
+        choice_model.init_possible_choices({"MOT_PWM_TYPE": {"values": {"5": "DShot300", "8": "PWMRange"}}})
+
+        assert choice_model.get_combobox_values_for_path(("ESC", "FC->ESC Connection", "Protocol")) == (
+            "DShot300",
+            "PWMRange",
+        )
+
+
+class TestSavedConnectionChoices:
+    """Opening a saved project rebuilds choices from its persisted connection settings."""
+
+    @staticmethod
+    def load_project(components: dict[str, dict[str, dict[str, str]]]) -> ComponentDataModelValidation:
+        """Load persisted component data through the real initialization workflow."""
+        return ComponentDataModelFixtures.create_basic_model(
+            ComponentDataModelValidation,
+            data={
+                "Format version": 1,
+                "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter"}}, **components},
+            },
+        )
+
+    def test_user_sees_complete_battery_monitor_ports_before_saving_a_connection(self) -> None:
+        """
+        A new battery monitor exposes each supported physical connection once.
+
+        GIVEN: A project without a saved battery-monitor connection
+        WHEN: The user opens the component editor
+        THEN: None, analog, I2C, CAN, virtual, PWM and SPI choices appear in order
+        """
+        model = self.load_project({})
+
+        assert model.get_combobox_values_for_path(("Battery Monitor", "FC Connection", "Type")) == (
+            "None",
+            "Analog",
+            "I2C1",
+            "I2C2",
+            "I2C3",
+            "I2C4",
+            "CAN1",
+            "CAN2",
+            "other",
+            "PWM",
+            "SPI",
+        )
+
+    @pytest.mark.parametrize(
+        ("component", "connection_type", "stored_protocol", "expected"),
+        [
+            ("RC Receiver", "None", "None", ("None",)),
+            ("RC Receiver", "CAN2", "DroneCAN", ("DroneCAN",)),
+            (
+                "RC Receiver",
+                "SERIAL4",
+                "CRSF",
+                (
+                    "All",
+                    "PPM",
+                    "IBUS",
+                    "SBUS",
+                    "SBUS_NI",
+                    "DSM",
+                    "SUMD",
+                    "SRXL",
+                    "SRXL2",
+                    "CRSF",
+                    "ST24",
+                    "FPORT",
+                    "FPORT2",
+                    "FastSBUS",
+                    "Ghost",
+                    "MAVRadio",
+                    "SITL UDP",
+                ),
+            ),
+            ("Telemetry", "None", "None", ("None",)),
+            ("GNSS Receiver", "None", "None", ("None",)),
+            (
+                "GNSS Receiver",
+                "CAN1",
+                "DroneCAN",
+                ("DroneCAN", "DroneCAN-MovingBaseline-Base", "DroneCAN-MovingBaseline-Rover"),
+            ),
+            ("Battery Monitor", "None", "Disabled", ("Disabled",)),
+            (
+                "Battery Monitor",
+                "Analog",
+                "Analog Voltage and Current",
+                (
+                    "Analog Voltage Only",
+                    "Analog Voltage and Current",
+                    "FuelLevelAnalog",
+                    "Synthetic Current and Analog Voltage",
+                    "Analog Current Only",
+                ),
+            ),
+            ("Battery Monitor", "CAN2", "DroneCAN-BatteryInfo", ("DroneCAN-BatteryInfo",)),
+            ("Battery Monitor", "PWM", "FuelLevelPWM", ("FuelLevelPWM",)),
+            ("Battery Monitor", "SPI", "INA239_SPI", ("INA239_SPI",)),
+            ("Battery Monitor", "other", "ESC", ("ESC", "Sum Of Selected Monitors", "Torqeedo", "Scripting")),
+            (
+                "Battery Monitor",
+                "I2C4",
+                "INA2XX",
+                (
+                    "Solo",
+                    "Bebop",
+                    "SMBus-Generic",
+                    "FuelFlow",
+                    "SMBUS-SUI3",
+                    "SMBUS-SUI6",
+                    "NeoDesign",
+                    "SMBus-Maxell",
+                    "Generator-Elec",
+                    "Generator-Fuel",
+                    "Rotoye",
+                    "MPPT",
+                    "INA2XX",
+                    "LTC2946",
+                    "EFI",
+                    "AD7091R5",
+                    "INA3221",
+                    "TIBQ76952-I2C (Periph only)",
+                ),
+            ),
+        ],
+    )
+    def test_user_reopens_project_with_protocols_restricted_to_the_saved_connection(
+        self, component: str, connection_type: str, stored_protocol: str, expected: tuple[str, ...]
+    ) -> None:
+        """
+        Saved connection types narrow protocol choices as soon as the project opens.
+
+        GIVEN: Persisted receiver, telemetry, GNSS or battery-monitor settings
+        WHEN: The user opens that project without editing any connection field
+        THEN: Only compatible protocols appear and the stored settings are preserved
+        """
+        model = self.load_project({component: {"FC Connection": {"Type": connection_type, "Protocol": stored_protocol}}})
+
+        assert model.get_combobox_values_for_path((component, "FC Connection", "Protocol")) == expected
+        assert model.get_component_value((component, "FC Connection", "Type")) == connection_type
+        assert model.get_component_value((component, "FC Connection", "Protocol")) == stored_protocol
+
+    def test_user_sees_all_initial_esc_choices_without_internal_mirror_markers(self) -> None:
+        """
+        Initial ESC selectors contain usable choices before any control or telemetry connection is saved.
+
+        GIVEN: A project without persisted ESC settings
+        WHEN: The component editor initializes its ESC selectors
+        THEN: PWM control and telemetry choices are complete, unique and free of internal mirror markers
+        """
+        model = self.load_project({})
+
+        assert model.get_combobox_values_for_path(("ESC", "FC->ESC Connection", "Protocol")) == (
+            "Normal",
+            "OneShot",
+            "OneShot125",
+            "Brushed",
+            "DShot150",
+            "DShot300",
+            "DShot600",
+            "DShot1200",
+            "PWMRange",
+            "PWMAngle",
+        )
+        assert model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Type")) == (
+            "None",
+            "Main Out",
+            "AIO",
+            *ESC_TELEMETRY_SERIAL_PORTS,
+            "CAN1",
+            "CAN2",
+        )
+        assert model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == (
+            "None",
+            "Scripting",
+            "ESC Telemetry",
+            "BDShotOnly",
+        )
+
+    @pytest.mark.parametrize(
+        ("control", "telemetry", "expected_types", "expected_protocols"),
+        [
+            (
+                ("Main Out", "DShot600"),
+                ("Main Out", "BDShotOnly"),
+                ("None", "Main Out", *ESC_TELEMETRY_SERIAL_PORTS),
+                ("BDShotOnly",),
+            ),
+            (("Main Out", "Normal"), ("SERIAL1", "Scripting"), ("None", *ESC_TELEMETRY_SERIAL_PORTS), ("Scripting",)),
+            (("AIO", "OneShot"), ("SERIAL8", "ESC Telemetry"), ("None", *ESC_TELEMETRY_SERIAL_PORTS), ("ESC Telemetry",)),
+            (("Main Out", "Brushed"), ("None", "None"), ("None",), ("None",)),
+            (("CAN2", "DroneCAN"), ("CAN2", "DroneCAN"), ("CAN2",), ("DroneCAN",)),
+            (("SERIAL4", "FETtecOneWire"), ("SERIAL4", "FETtecOneWire"), ("SERIAL4",), ("FETtecOneWire",)),
+            (("Main Out", "DShot600"), ("None", "None"), ("None", "Main Out", *ESC_TELEMETRY_SERIAL_PORTS), ("None",)),
+        ],
+    )
+    def test_user_reopens_project_with_saved_esc_control_and_telemetry_choices(
+        self,
+        control: tuple[str, str],
+        telemetry: tuple[str, str],
+        expected_types: tuple[str, ...],
+        expected_protocols: tuple[str, ...],
+    ) -> None:
+        """
+        Saved ESC control and back-channel settings both participate in startup choice initialization.
+
+        GIVEN: Persisted PWM, bidirectional, CAN or same-port serial ESC settings
+        WHEN: The project opens without invoking a connection setter
+        THEN: The telemetry selectors match both saved settings without resetting their values
+        """
+        model = self.load_project(
+            {
+                "ESC": {
+                    "FC->ESC Connection": {"Type": control[0], "Protocol": control[1]},
+                    "ESC->FC Telemetry": {"Type": telemetry[0], "Protocol": telemetry[1]},
+                }
+            }
+        )
+
+        assert model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Type")) == expected_types
+        assert model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == expected_protocols
+        for section, saved in (("FC->ESC Connection", control), ("ESC->FC Telemetry", telemetry)):
+            assert model.get_component_value(("ESC", section, "Type")) == saved[0]
+            assert model.get_component_value(("ESC", section, "Protocol")) == saved[1]
+
+    def test_user_reopens_legacy_esc_project_with_telemetry_disabled_and_choices_available(self) -> None:
+        """
+        Projects saved before the telemetry section existed retain usable choices after migration.
+
+        GIVEN: A legacy ESC FC Connection with DShot control and no telemetry section
+        WHEN: The project is loaded through the normal migration and initialization workflow
+        THEN: Control settings survive and telemetry starts disabled with the appropriate port choices
+        """
+        model = self.load_project({"ESC": {"FC Connection": {"Type": "Main Out", "Protocol": "DShot600"}}})
+
+        assert model.get_component_value(("ESC", "FC->ESC Connection", "Type")) == "Main Out"
+        assert model.get_component_value(("ESC", "FC->ESC Connection", "Protocol")) == "DShot600"
+        assert model.get_component_value(("ESC", "ESC->FC Telemetry", "Type")) == "None"
+        assert model.get_component_value(("ESC", "ESC->FC Telemetry", "Protocol")) == "None"
+        assert model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Type")) == (
+            "None",
+            "Main Out",
+            *ESC_TELEMETRY_SERIAL_PORTS,
+        )
+        assert model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == ("None",)
+
+
+class TestComponentBatchValidation:
+    """Users receive complete validation results for interacting component fields."""
+
+    @pytest.fixture
+    def connection_model(self) -> ComponentDataModelValidation:
+        """Provide real selectors with a bidirectional serial ESC connection."""
+        model = ComponentDataModelFixtures.create_basic_model(ComponentDataModelValidation)
+        model.set_component_value(("Flight Controller", "Firmware", "Type"), "ArduCopter")
+        model.set_component_value(("ESC", "FC->ESC Connection", "Type"), "SERIAL4")
+        model.set_component_value(("ESC", "FC->ESC Connection", "Protocol"), "FETtecOneWire")
+        model.set_component_value(("ESC", "ESC->FC Telemetry", "Type"), "SERIAL4")
+        model.set_component_value(("ESC", "ESC->FC Telemetry", "Protocol"), "FETtecOneWire")
+        return model
+
+    @pytest.mark.parametrize(
+        "other_connection",
+        [
+            ("RC Receiver", "FC Connection"),
+            ("Telemetry", "FC Connection"),
+            ("ESC", "FC->ESC Connection"),
+            ("ESC", "ESC->FC Telemetry"),
+        ],
+    )
+    @pytest.mark.parametrize("reverse_order", [False, True])
+    def test_user_sees_each_serial_conflict_and_errors_in_later_fields(
+        self, connection_model: ComponentDataModelValidation, other_connection: tuple[str, str], reverse_order: bool
+    ) -> None:
+        """
+        Independent peripherals cannot use the same serial port, regardless of field order.
+
+        GIVEN: A GNSS receiver and another peripheral assigned to SERIAL4
+        WHEN: The user validates those connections followed by an odd motor-pole count
+        THEN: The conflicting field and the later motor error are both identified
+        """
+        paths = [("GNSS Receiver", "FC Connection", "Type"), (*other_connection, "Type")]
+        if reverse_order:
+            paths.reverse()
+        entries = dict.fromkeys(paths, "SERIAL4")
+        entries[("Motors", "Specifications", "Poles")] = "13"
+
+        is_valid, errors = connection_model.validate_all_data(entries)
+
+        assert is_valid is False
+        assert errors == [
+            f"Duplicate FC connection type 'SERIAL4' for {'>'.join(paths[1])}",
+            "Number of magnetic rotor poles must be even for Motors>Specifications>Poles",
+        ]
+
+    @pytest.mark.parametrize(
+        "connections",
+        [
+            (("RC Receiver", "FC Connection"), ("Telemetry", "FC Connection")),
+            (("ESC", "FC->ESC Connection"), ("ESC", "ESC->FC Telemetry")),
+        ],
+    )
+    @pytest.mark.parametrize("reverse_order", [False, True])
+    def test_user_can_share_supported_serial_connections_without_hiding_later_errors(
+        self,
+        connection_model: ComponentDataModelValidation,
+        connections: tuple[tuple[str, str], tuple[str, str]],
+        reverse_order: bool,
+    ) -> None:
+        """
+        Supported serial sharing does not grant other peripherals access to that port.
+
+        GIVEN: RC/telemetry or ESC control/back-channel sharing SERIAL4 in either order
+        WHEN: The user validates the pair, then adds a GNSS conflict and an invalid motor count
+        THEN: The pair passes alone and both additional errors remain visible
+        """
+        paths = [(*connection, "Type") for connection in connections]
+        if reverse_order:
+            paths.reverse()
+        entries = dict.fromkeys(paths, "SERIAL4")
+
+        assert connection_model.validate_all_data(entries) == (True, [])
+
+        entries[("GNSS Receiver", "FC Connection", "Type")] = "SERIAL4"
+        entries[("Motors", "Specifications", "Poles")] = "13"
+        is_valid, errors = connection_model.validate_all_data(entries)
+
+        assert is_valid is False
+        assert errors == [
+            "Duplicate FC connection type 'SERIAL4' for GNSS Receiver>FC Connection>Type",
+            "Number of magnetic rotor poles must be even for Motors>Specifications>Poles",
+        ]
+
+    @pytest.mark.parametrize("connection_type", ["CAN1", "CAN2", "None"])
+    @pytest.mark.parametrize("reverse_order", [False, True])
+    def test_user_can_share_can_buses_or_disable_multiple_peripherals(
+        self, connection_model: ComponentDataModelValidation, connection_type: str, reverse_order: bool
+    ) -> None:
+        """
+        A shared CAN bus or multiple disabled peripherals are valid configurations.
+
+        GIVEN: A GNSS receiver and battery monitor on either CAN bus or both disabled
+        WHEN: Their connection types are validated in either order
+        THEN: No duplicate-connection error is reported
+        """
+        paths = [("GNSS Receiver", "FC Connection", "Type"), ("Battery Monitor", "FC Connection", "Type")]
+        if reverse_order:
+            paths.reverse()
+
+        assert connection_model.validate_all_data(dict.fromkeys(paths, connection_type)) == (True, [])
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("RC Receiver", "FC Connection", "Protocol"), "not-a-protocol"),
+            (("Battery", "Specifications", "Chemistry"), "unknown-chemistry"),
+        ],
+    )
+    def test_user_sees_invalid_selection_context_and_continues_to_later_errors(
+        self, connection_model: ComponentDataModelValidation, path: tuple[str, str, str], value: str
+    ) -> None:
+        """
+        Invalid selections explain the correction and do not stop the rest of validation.
+
+        GIVEN: An unsupported protocol or chemistry followed by an odd motor-pole count
+        WHEN: The user validates the component fields together
+        THEN: The first error names the value, field and allowed choices, followed by the motor error
+        """
+        choices = connection_model.get_combobox_values_for_path(path)
+        assert len(choices) > 1
+        entries = {path: value, ("Motors", "Specifications", "Poles"): "13"}
+
+        is_valid, errors = connection_model.validate_all_data(entries)
+
+        assert is_valid is False
+        assert errors == [
+            f"Invalid value '{value}' for {'>'.join(path)}\nAllowed values are: {', '.join(choices)}",
+            "Number of magnetic rotor poles must be even for Motors>Specifications>Poles",
+        ]
+
+    @pytest.mark.parametrize("reverse_order", [False, True])
+    def test_user_can_select_the_same_protocol_for_components_sharing_a_can_bus(
+        self, connection_model: ComponentDataModelValidation, reverse_order: bool
+    ) -> None:
+        """
+        Protocol names are not exclusive physical connections.
+
+        GIVEN: RC and GNSS receivers selecting CAN2 and DroneCAN in the same batch
+        WHEN: The user validates both type/protocol pairs in either component order
+        THEN: Each protocol is checked against its new connection type and both pairs pass
+        """
+        components = ["RC Receiver", "GNSS Receiver"]
+        if reverse_order:
+            components.reverse()
+        entries = {
+            (component, "FC Connection", field): value
+            for component in components
+            for field, value in (("Type", "CAN2"), ("Protocol", "DroneCAN"))
+        }
+
+        assert connection_model.validate_all_data(entries) == (True, [])
+
+
+class TestEscConnectionTransitions:
+    """Control-port changes immediately refresh the telemetry selectors."""
+
+    @pytest.fixture
+    def esc_model(self) -> ComponentDataModelValidation:
+        """Provide an independent real model with offline protocol choices."""
+        return ComponentDataModelFixtures.create_basic_model(ComponentDataModelValidation)
+
+    @staticmethod
+    def select_control(model: ComponentDataModelValidation, settings: tuple[str, str, str]) -> None:
+        """Select the firmware, control port and protocol through the public model API."""
+        vehicle, port, protocol = settings
+        model.set_component_value(("Flight Controller", "Firmware", "Type"), vehicle)
+        model.init_possible_choices({})
+        model.set_component_value(("ESC", "FC->ESC Connection", "Type"), port)
+        model.set_component_value(("ESC", "FC->ESC Connection", "Protocol"), protocol)
+
+    @pytest.mark.parametrize(
+        ("firmware", "parameter"),
+        [("ArduCopter", "MOT_PWM_TYPE"), ("Heli", "MOT_PWM_TYPE"), ("Rover", "MOT_PWM_TYPE"), ("ArduPlane", "Q_M_PWM_TYPE")],
+    )
+    @pytest.mark.parametrize("pwm_port", ["Main Out", "AIO"])
+    def test_user_sees_disabled_telemetry_for_a_metadata_pwm_mode_without_a_known_mapping(
+        self, esc_model: ComponentDataModelValidation, firmware: str, parameter: str, pwm_port: str
+    ) -> None:
+        """
+        Firmware metadata can expose a PWM mode before a telemetry mapping is available.
+
+        GIVEN: Metadata containing a new PWM mode absent from the built-in compatibility table
+        WHEN: The user selects that mode on either PWM output
+        THEN: The mode remains selectable and both telemetry selectors offer only None
+        """
+        esc_model.set_component_value(("Flight Controller", "Firmware", "Type"), firmware)
+        esc_model.init_possible_choices({parameter: {"values": {"0": "Normal", "42": "New firmware PWM mode"}}})
+        esc_model.set_component_value(("ESC", "FC->ESC Connection", "Type"), pwm_port)
+
+        esc_model.set_component_value(("ESC", "FC->ESC Connection", "Protocol"), "New firmware PWM mode")
+
+        assert esc_model.get_combobox_values_for_path(("ESC", "FC->ESC Connection", "Protocol")) == (
+            "Normal",
+            "New firmware PWM mode",
+        )
+        assert esc_model.get_component_value(("ESC", "FC->ESC Connection", "Protocol")) == "New firmware PWM mode"
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Type")) == ("None",)
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == ("None",)
+        assert esc_model.get_valid_esc_telemetry_types() == ("None",)
+
+    @pytest.mark.parametrize("firmware", ["ArduCopter", "ArduPlane"])
+    @pytest.mark.parametrize("can_port", ["CAN1", "CAN2"])
+    def test_user_moves_a_can_esc_and_immediately_sees_the_matching_telemetry_selectors(
+        self, esc_model: ComponentDataModelValidation, firmware: str, can_port: str
+    ) -> None:
+        """
+        Changing the CAN bus preserves its compatible telemetry protocol.
+
+        GIVEN: A DroneCAN ESC on the other CAN bus
+        WHEN: The user changes only the control port
+        THEN: The telemetry port follows immediately and DroneCAN remains the sole protocol
+        """
+        previous_port = "CAN2" if can_port == "CAN1" else "CAN1"
+        self.select_control(esc_model, (firmware, previous_port, "DroneCAN"))
+
+        esc_model.set_component_value(("ESC", "FC->ESC Connection", "Type"), can_port)
+
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Type")) == (can_port,)
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == ("DroneCAN",)
+        assert esc_model.get_component_value(("ESC", "FC->ESC Connection", "Protocol")) == "DroneCAN"
+        assert esc_model.is_esc_telemetry_type_mirrored() is True
+        assert esc_model.is_esc_telemetry_protocol_mirrored() is True
+
+    @pytest.mark.parametrize(
+        "settings",
+        [("ArduCopter", "SERIAL4", "FETtecOneWire"), ("Heli", "SERIAL4", "Torqeedo"), ("Rover", "SERIAL4", "CoDevESC")],
+    )
+    @pytest.mark.parametrize("serial_port", ["SERIAL1", "SERIAL8"])
+    def test_user_moves_a_serial_esc_without_losing_its_mirrored_telemetry_protocol(
+        self, esc_model: ComponentDataModelValidation, settings: tuple[str, str, str], serial_port: str
+    ) -> None:
+        """
+        Same-port serial telemetry follows the new port and retains the selected protocol.
+
+        GIVEN: An ESC using a supported bidirectional serial protocol on SERIAL4
+        WHEN: The user changes only its control port to the first or last serial port
+        THEN: Telemetry offers the new port and the existing protocol without a second field edit
+        """
+        self.select_control(esc_model, settings)
+
+        esc_model.set_component_value(("ESC", "FC->ESC Connection", "Type"), serial_port)
+
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Type")) == (serial_port,)
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == (settings[2],)
+        assert esc_model.get_component_value(("ESC", "FC->ESC Connection", "Protocol")) == settings[2]
+        assert esc_model.get_valid_esc_telemetry_types() == (serial_port,)
+        assert esc_model.is_esc_telemetry_type_mirrored() is True
+        assert esc_model.is_esc_telemetry_protocol_mirrored() is True
+
+    @pytest.mark.parametrize("previous", [("CAN2", "DroneCAN"), ("Main Out", "DShot600")])
+    @pytest.mark.parametrize("protocol", ["FETtecOneWire", "Torqeedo", "CoDevESC"])
+    def test_user_switches_to_serial_then_selects_a_compatible_mirrored_protocol(
+        self, esc_model: ComponentDataModelValidation, previous: tuple[str, str], protocol: str
+    ) -> None:
+        """
+        Stale CAN/PWM protocols do not become valid serial telemetry protocols during a transition.
+
+        GIVEN: A CAN or DShot ESC connection
+        WHEN: The user switches to SERIAL4 and then selects a supported serial protocol
+        THEN: Telemetry initially offers None for the stale protocol, then mirrors the new selection
+        """
+        self.select_control(esc_model, ("ArduCopter", *previous))
+
+        esc_model.set_component_value(("ESC", "FC->ESC Connection", "Type"), "SERIAL4")
+
+        assert esc_model.get_combobox_values_for_path(("ESC", "FC->ESC Connection", "Protocol")) == (
+            "FETtecOneWire",
+            "Torqeedo",
+            "CoDevESC",
+        )
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Type")) == ("SERIAL4",)
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == ("None",)
+        assert esc_model.get_component_value(("ESC", "FC->ESC Connection", "Protocol")) == previous[1]
+
+        esc_model.set_component_value(("ESC", "FC->ESC Connection", "Protocol"), protocol)
+
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Type")) == ("SERIAL4",)
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == (protocol,)
+        assert esc_model.get_valid_esc_telemetry_types() == ("SERIAL4",)
+
+    @pytest.mark.parametrize("previous", [("CAN2", "DroneCAN"), ("SERIAL4", "FETtecOneWire"), ("Main Out", "DShot600")])
+    def test_disabled_esc_connection_clears_previous_telemetry_choices(
+        self, esc_model: ComponentDataModelValidation, previous: tuple[str, str]
+    ) -> None:
+        """
+        A disabled ESC connection does not expose stale telemetry options.
+
+        GIVEN: An active CAN, serial or PWM ESC connection
+        WHEN: The model receives a disabled control connection
+        THEN: Control and telemetry protocol choices and telemetry port choices all become None
+        """
+        self.select_control(esc_model, ("ArduCopter", *previous))
+
+        esc_model.set_component_value(("ESC", "FC->ESC Connection", "Type"), "None")
+
+        assert esc_model.get_combobox_values_for_path(("ESC", "FC->ESC Connection", "Protocol")) == ("None",)
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Type")) == ("None",)
+        assert esc_model.get_combobox_values_for_path(("ESC", "ESC->FC Telemetry", "Protocol")) == ("None",)
+
+
+class TestNumericValidationFeedback:
+    """Users receive precise numeric guidance and corrections when validating component data."""
+
+    RANGE_CASES = (
+        pytest.param(
+            ("Frame", "Specifications", "TOW min Kg"), ("Takeoff Weight", "float", 0.01, 600), id="minimum-takeoff-weight"
+        ),
+        pytest.param(
+            ("Frame", "Specifications", "TOW max Kg"), ("Takeoff Weight", "float", 0.01, 600), id="maximum-takeoff-weight"
+        ),
+        pytest.param(("Battery", "Specifications", "Number of cells"), ("Nr of cells", "int", 1, 50), id="battery-cell-count"),
+        pytest.param(
+            ("Battery", "Specifications", "Capacity mAh"), ("mAh capacity", "int", 100, 1000000), id="battery-capacity"
+        ),
+        pytest.param(("Motors", "Specifications", "Poles"), ("Motor Poles", "int", 2, 100), id="motor-poles"),
+        pytest.param(
+            ("Propellers", "Specifications", "Diameter_inches"),
+            ("Propeller Diameter", "float", 0.3, 400),
+            id="propeller-diameter",
+        ),
+    )
+
+    @pytest.fixture
+    def numeric_model(self) -> ComponentDataModelValidation:
+        """Provide valid takeoff-weight endpoints so each numeric field can be checked independently."""
+        model = ComponentDataModelFixtures.create_basic_model(ComponentDataModelValidation)
+        model.set_component_value(("Frame", "Specifications", "TOW min Kg"), 0.01)
+        model.set_component_value(("Frame", "Specifications", "TOW max Kg"), 600.0)
+        return model
+
+    @pytest.mark.parametrize(("path", "details"), RANGE_CASES)
+    @pytest.mark.parametrize("upper", [False, True], ids=["lower-bound", "upper-bound"])
+    def test_user_can_enter_each_inclusive_numeric_boundary(
+        self,
+        numeric_model: ComponentDataModelValidation,
+        path: tuple[str, str, str],
+        details: tuple[str, str, float, float],
+        upper: bool,
+    ) -> None:
+        """
+        Values at the documented limits do not require correction.
+
+        GIVEN: A component field with a supported numeric range
+        WHEN: The user enters its exact lower or upper bound
+        THEN: Validation accepts it without an error or replacement value
+        """
+        boundary = details[3] if upper else details[2]
+
+        assert numeric_model.validate_entry_limits(str(boundary), path) == ("", None)
+
+    @pytest.mark.parametrize(("path", "details"), RANGE_CASES)
+    @pytest.mark.parametrize("upper", [False, True], ids=["below-range", "above-range"])
+    def test_user_sees_the_numeric_range_and_receives_the_nearest_allowed_value(
+        self,
+        numeric_model: ComponentDataModelValidation,
+        path: tuple[str, str, str],
+        details: tuple[str, str, float, float],
+        upper: bool,
+    ) -> None:
+        """
+        Range errors explain the expected type and limits and clamp to the nearest endpoint.
+
+        GIVEN: A valid project and a value outside a component field's numeric range
+        WHEN: The user previews the validation result and then validates the project data
+        THEN: The preview leaves data unchanged and batch validation applies the advertised correction
+        """
+        label, type_name, minimum, maximum = details
+        boundary = maximum if upper else minimum
+        entered = str(boundary + 1 if upper else boundary - 1)
+        expected_error = f"{label} must be a {type_name} between {minimum} and {maximum}"
+        previous = numeric_model.get_component_value(path)
+
+        error, correction = numeric_model.validate_entry_limits(entered, path)
+
+        assert error == expected_error
+        assert correction == boundary
+        assert numeric_model.get_component_value(path) == previous
+
+        assert numeric_model.validate_all_data({path: entered}) == (False, [expected_error])
+        assert numeric_model.get_component_value(path) == boundary
+        assert numeric_model.validate_entry_limits(str(boundary), path) == ("", None)
+
+    @pytest.mark.parametrize(("path", "details"), RANGE_CASES)
+    def test_user_sees_the_field_and_required_type_when_a_number_cannot_be_parsed(
+        self, numeric_model: ComponentDataModelValidation, path: tuple[str, str, str], details: tuple[str, str, float, float]
+    ) -> None:
+        """
+        Conversion failures identify the field without replacing its existing value.
+
+        GIVEN: A component field with an integer or floating-point requirement
+        WHEN: The user enters text that cannot be converted to that type
+        THEN: Both validation APIs report the field and type and preserve the existing data
+        """
+        label, type_name, _, _ = details
+        expected_error = f"Invalid {type_name} value for {label}"
+        previous = numeric_model.get_component_value(path)
+
+        assert numeric_model.validate_entry_limits("not-a-number", path) == (expected_error, None)
+        assert numeric_model.validate_all_data({path: "not-a-number"}) == (False, [expected_error])
+        assert numeric_model.get_component_value(path) == previous
+
+    @pytest.mark.parametrize(
+        ("field", "entered", "expected"),
+        [
+            ("TOW max Kg", "2.5", ("is below the TOW min Kg of 3.5", 3.51)),
+            ("TOW min Kg", "8.0", ("is above the TOW max Kg of 7.25", 7.24)),
+        ],
+    )
+    def test_user_receives_a_takeoff_weight_correction_one_hundredth_beyond_the_other_endpoint(
+        self, numeric_model: ComponentDataModelValidation, field: str, entered: str, expected: tuple[str, float]
+    ) -> None:
+        """
+        Cross-field errors explain the opposing weight and suggest a correction 0.01 kg beyond it.
+
+        GIVEN: Minimum and maximum takeoff weights of 3.5 kg and 7.25 kg
+        WHEN: The user enters a maximum below the minimum or a minimum above the maximum
+        THEN: The correct opposing field and value appear and only the edited endpoint is corrected
+        """
+        minimum_path = ("Frame", "Specifications", "TOW min Kg")
+        maximum_path = ("Frame", "Specifications", "TOW max Kg")
+        numeric_model.set_component_value(minimum_path, 3.5)
+        numeric_model.set_component_value(maximum_path, 7.25)
+        path = ("Frame", "Specifications", field)
+        other_path = maximum_path if field == "TOW min Kg" else minimum_path
+        other_value = numeric_model.get_component_value(other_path)
+
+        error, correction = numeric_model.validate_entry_limits(entered, path)
+
+        assert error == expected[0]
+        assert correction == pytest.approx(expected[1])
+
+        assert numeric_model.validate_all_data({path: entered}) == (False, [expected[0]])
+        assert numeric_model.get_component_value(path) == pytest.approx(expected[1])
+        assert numeric_model.get_component_value(other_path) == other_value
+        assert numeric_model.validate_entry_limits(str(numeric_model.get_component_value(path)), path) == ("", None)
+
+    @pytest.mark.parametrize("edit", [("TOW min Kg", "TOW max Kg"), ("TOW max Kg", "TOW min Kg")])
+    @pytest.mark.parametrize(
+        "bad_limit",
+        [
+            ({"unexpected": "weight"}, "is not a float nor string"),
+            ("unknown-weight", "is not convertible to float"),
+        ],
+    )
+    def test_user_sees_which_related_weight_is_malformed_without_losing_project_data(
+        self,
+        edit: tuple[str, str],
+        bad_limit: tuple[str | dict[str, str], str],
+    ) -> None:
+        """
+        A malformed related weight is identified without inventing a numeric correction.
+
+        GIVEN: A loaded related takeoff weight with an invalid type or nonnumeric text
+        WHEN: The user validates a numeric value for the other endpoint
+        THEN: The malformed field is named and neither endpoint is overwritten
+        """
+        field, related_field = edit
+        related_value, explanation = bad_limit
+        path = ("Frame", "Specifications", field)
+        related_path = ("Frame", "Specifications", related_field)
+        model = ComponentDataModelFixtures.create_basic_model(
+            ComponentDataModelValidation,
+            data={
+                "Format version": 1,
+                "Components": {"Frame": {"Specifications": {field: 5.0, related_field: related_value}}},
+            },
+        )
+        previous = model.get_component_value(path)
+        expected_error = f"{related_field} {explanation}"
+
+        assert model.validate_entry_limits("5.0", path) == (expected_error, None)
+        assert model.validate_all_data({path: "5.0"}) == (False, [expected_error])
+        assert model.get_component_value(path) == previous
+        assert model.get_component_value(related_path) == related_value
+
+    @pytest.mark.parametrize(
+        ("field", "entered", "expected"),
+        [
+            ("Volt per cell max", "3.7", ("is below the Volt per cell arm of 3.8", 3.81)),
+            ("Volt per cell min", "3.7", ("is above the Volt per cell low of 3.6", 3.59)),
+        ],
+    )
+    def test_user_gets_battery_voltage_constraints_through_the_general_numeric_entry_api(
+        self, numeric_model: ComponentDataModelValidation, field: str, entered: str, expected: tuple[str, float]
+    ) -> None:
+        """
+        The general entry validator retains the battery-specific cross-field rules.
+
+        GIVEN: Valid LiPo cell-voltage thresholds
+        WHEN: The user enters a maximum below arming voltage or a minimum above low voltage
+        THEN: Entry and batch validation report the related threshold and provide the same correction
+        """
+        numeric_model.set_component_value(("Battery", "Specifications", "Chemistry"), "Lipo")
+        for setting, voltage in (
+            ("Volt per cell max", 4.1),
+            ("Volt per cell arm", 3.8),
+            ("Volt per cell low", 3.6),
+            ("Volt per cell crit", 3.3),
+            ("Volt per cell min", 3.2),
+        ):
+            numeric_model.set_component_value(("Battery", "Specifications", setting), voltage)
+        path = ("Battery", "Specifications", field)
+
+        error, correction = numeric_model.validate_entry_limits(entered, path)
+
+        assert error == expected[0]
+        assert correction == pytest.approx(expected[1])
+        assert numeric_model.validate_all_data({path: entered}) == (False, [expected[0]])
+        assert numeric_model.get_component_value(path) == pytest.approx(expected[1])
+        assert numeric_model.validate_entry_limits(str(numeric_model.get_component_value(path)), path) == ("", None)
+
+
+class TestBatteryVoltageValidationFeedback:
+    """Battery validation explains chemistry limits and related thresholds before applying corrections."""
+
+    CHEMISTRY_CASES = (
+        pytest.param("LiIon", (2.5, 4.2), id="li-ion"),
+        pytest.param("LiIonSS", (2.4, 4.2), id="li-ion-solid-state"),
+        pytest.param("LiIonSSHV", (2.4, 4.45), id="li-ion-solid-state-high-voltage"),
+        pytest.param("Lipo", (3.0, 4.2), id="lipo"),
+        pytest.param("LipoHV", (3.0, 4.35), id="lipo-high-voltage"),
+        pytest.param("LipoHVSS", (2.9, 4.2), id="lipo-high-voltage-solid-state"),
+        pytest.param("NiCd", (1.0, 1.45), id="nickel-cadmium"),
+        pytest.param("NiMH", (1.0, 1.45), id="nickel-metal-hydride"),
+    )
+
+    @pytest.fixture
+    def voltage_model(self) -> ComponentDataModelValidation:
+        """Provide valid, distinct LiPo thresholds so each related-field constraint is observable."""
+        model = ComponentDataModelFixtures.create_basic_model(ComponentDataModelValidation)
+        model.set_component_value(("Battery", "Specifications", "Chemistry"), "Lipo")
+        for field, value in (
+            ("Volt per cell max", 4.1),
+            ("Volt per cell arm", 3.8),
+            ("Volt per cell low", 3.6),
+            ("Volt per cell crit", 3.3),
+            ("Volt per cell min", 3.2),
+        ):
+            model.set_component_value(("Battery", "Specifications", field), value)
+        return model
+
+    @pytest.mark.parametrize(("chemistry", "limits"), CHEMISTRY_CASES)
+    @pytest.mark.parametrize("upper", [False, True], ids=["minimum", "maximum"])
+    def test_user_can_enter_the_exact_chemistry_voltage_limits(
+        self, voltage_model: ComponentDataModelValidation, chemistry: str, limits: tuple[float, float], upper: bool
+    ) -> None:
+        """
+        Absolute chemistry limits are inclusive for both voltage endpoints.
+
+        GIVEN: A battery using any supported chemistry and its recommended thresholds
+        WHEN: The user enters the chemistry minimum as minimum voltage or maximum as maximum voltage
+        THEN: Voltage, entry and batch validation accept the exact boundary without a correction
+        """
+        voltage_model.set_component_value(("Battery", "Specifications", "Chemistry"), chemistry)
+        field = "Volt per cell max" if upper else "Volt per cell min"
+        boundary = limits[1] if upper else limits[0]
+        path = ("Battery", "Specifications", field)
+
+        assert voltage_model.validate_cell_voltage(str(boundary), path) == ("", None)
+        assert voltage_model.validate_entry_limits(str(boundary), path) == ("", None)
+        assert voltage_model.validate_all_data({path: str(boundary)}) == (True, [])
+
+    @pytest.mark.parametrize(("chemistry", "limits"), CHEMISTRY_CASES)
+    @pytest.mark.parametrize("upper", [False, True], ids=["below-minimum", "above-maximum"])
+    def test_user_sees_the_chemistry_and_exact_limit_when_voltage_is_out_of_range(
+        self, voltage_model: ComponentDataModelValidation, chemistry: str, limits: tuple[float, float], upper: bool
+    ) -> None:
+        """
+        Chemistry-limit errors identify the battery type and the correction that will be applied.
+
+        GIVEN: A supported battery chemistry with valid related voltage thresholds
+        WHEN: The user enters a minimum below or maximum above its absolute chemistry limit
+        THEN: Both validation APIs name that chemistry and limit and batch validation applies the endpoint
+        """
+        voltage_model.set_component_value(("Battery", "Specifications", "Chemistry"), chemistry)
+        field = "Volt per cell max" if upper else "Volt per cell min"
+        boundary = limits[1] if upper else limits[0]
+        entered = str(round(boundary + 0.1 if upper else boundary - 0.1, 2))
+        description = "above" if upper else "below"
+        limit_name = "maximum" if upper else "minimum"
+        expected_error = f"is {description} the {chemistry} {limit_name} limit of {boundary}"
+        path = ("Battery", "Specifications", field)
+        previous = voltage_model.get_component_value(path)
+
+        assert voltage_model.validate_cell_voltage(entered, path) == (expected_error, boundary)
+        assert voltage_model.validate_entry_limits(entered, path) == (expected_error, boundary)
+        assert voltage_model.get_component_value(path) == previous
+
+        assert voltage_model.validate_all_data({path: entered}) == (False, [expected_error])
+        assert voltage_model.get_component_value(path) == boundary
+        assert voltage_model.validate_entry_limits(str(boundary), path) == ("", None)
+
+    @pytest.mark.parametrize(
+        ("field", "entered", "expected"),
+        [
+            ("Volt per cell max", "3.7", ("is below the Volt per cell arm of 3.8", 3.81)),
+            ("Volt per cell arm", "4.15", ("is above the Volt per cell max of 4.1", 4.09)),
+            ("Volt per cell arm", "3.5", ("is below the Volt per cell low of 3.6", 3.61)),
+            ("Volt per cell low", "3.9", ("is above the Volt per cell arm of 3.8", 3.79)),
+            ("Volt per cell low", "3.25", ("is below the Volt per cell crit of 3.3", 3.31)),
+            ("Volt per cell crit", "3.7", ("is above the Volt per cell low of 3.6", 3.59)),
+            ("Volt per cell min", "3.7", ("is above the Volt per cell low of 3.6", 3.59)),
+        ],
+    )
+    def test_user_sees_the_related_voltage_threshold_and_only_the_edited_field_is_corrected(
+        self, voltage_model: ComponentDataModelValidation, field: str, entered: str, expected: tuple[str, float]
+    ) -> None:
+        """
+        Every voltage relationship names the limiting threshold and preserves the other settings.
+
+        GIVEN: Valid and distinct maximum, arming, low, critical and minimum LiPo thresholds
+        WHEN: The user enters a voltage that crosses one of its related thresholds
+        THEN: The error names that threshold and value and batch validation changes only the edited field
+        """
+        fields = ("Volt per cell max", "Volt per cell arm", "Volt per cell low", "Volt per cell crit", "Volt per cell min")
+        previous = {name: voltage_model.get_component_value(("Battery", "Specifications", name)) for name in fields}
+        path = ("Battery", "Specifications", field)
+
+        error, correction = voltage_model.validate_cell_voltage(entered, path)
+
+        assert error == expected[0]
+        assert correction == pytest.approx(expected[1])
+        assert voltage_model.validate_entry_limits(entered, path) == (error, correction)
+        assert voltage_model.validate_all_data({path: entered}) == (False, [expected[0]])
+        for name in fields:
+            actual = voltage_model.get_component_value(("Battery", "Specifications", name))
+            assert actual == (pytest.approx(expected[1]) if name == field else previous[name])
+        assert voltage_model.validate_entry_limits(str(voltage_model.get_component_value(path)), path) == ("", None)
+
+    @pytest.mark.parametrize(
+        ("field", "recommended"),
+        [
+            ("Volt per cell max", 4.2),
+            ("Volt per cell arm", 3.8),
+            ("Volt per cell low", 3.6),
+            ("Volt per cell crit", 3.3),
+            ("Volt per cell min", 3.2),
+        ],
+    )
+    @pytest.mark.parametrize("entered", ["not-a-number", "", "3,8"], ids=["text", "empty", "decimal-comma"])
+    def test_user_receives_recovery_guidance_and_the_recommended_value_for_invalid_voltage_text(
+        self, voltage_model: ComponentDataModelValidation, field: str, recommended: float, entered: str
+    ) -> None:
+        """
+        Invalid text provides actionable guidance and restores the field's chemistry recommendation.
+
+        GIVEN: A LiPo battery and invalid text for any of its five voltage thresholds
+        WHEN: The user previews the validation result and then validates the batch
+        THEN: The recovery instruction is present and the advertised recommendation is applied
+        """
+        path = ("Battery", "Specifications", field)
+        previous = voltage_model.get_component_value(path)
+
+        error, correction = voltage_model.validate_cell_voltage(entered, path)
+
+        # Check the recovery instruction without depending on Python's conversion-error wording.
+        assert error.endswith("Invalid value. Will be set to the recommended value.")
+        assert correction == recommended
+        assert voltage_model.validate_entry_limits(entered, path) == (error, recommended)
+        assert voltage_model.get_component_value(path) == previous
+
+        assert voltage_model.validate_all_data({path: entered}) == (False, [error])
+        assert voltage_model.get_component_value(path) == recommended
+        assert voltage_model.validate_entry_limits(str(recommended), path) == ("", None)
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("Battery", "Specifications", "Capacity mAh"), "1800"),
+            (("Battery", "Product", "Model"), "LiPo 4S"),
+        ],
+    )
+    def test_voltage_validation_leaves_other_battery_fields_to_their_own_validators(
+        self, voltage_model: ComponentDataModelValidation, path: tuple[str, str, str], value: str
+    ) -> None:
+        """
+        Battery fields unrelated to cell voltage must not receive voltage errors or replacement values.
+
+        GIVEN: A battery capacity or product-model value
+        WHEN: The dedicated cell-voltage validator receives that field
+        THEN: It returns no voltage error and no correction
+        """
+        assert voltage_model.validate_cell_voltage(value, path) == ("", None)

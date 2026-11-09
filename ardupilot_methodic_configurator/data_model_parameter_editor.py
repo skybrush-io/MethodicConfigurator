@@ -20,7 +20,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from csv import writer as csv_writer
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from logging import error as logging_error
 from logging import exception as logging_exception
@@ -2012,7 +2012,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
                 raise FileNotFoundError(msg)
 
             # Generate zip filename with UTC timestamp
-            now_utc = datetime.now(timezone.utc)
+            now_utc = datetime.now(UTC)
             timestamp = now_utc.strftime("%Y%m%d_%H%M%S")
             vehicle_name = vehicle_dir.name
             zip_filename = f"{vehicle_name}_{timestamp}UTC.zip"
@@ -2440,7 +2440,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
                     added.append(param_name)
                 else:
                     skipped.append(param_name)
-            except (InvalidParameterNameError, OperationNotPossibleError):  # noqa: PERF203
+            except (InvalidParameterNameError, OperationNotPossibleError):
                 failed.append(param_name)
 
         return added, skipped, failed
@@ -2911,9 +2911,9 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         """
         self._local_filesystem.vehicle_components_fs.revert_key_in_place("Components")
 
-    def update_vehicle_components(self, components: dict) -> None:
+    def update_vehicle_components(self, components: dict) -> bool:
         """
-        Sync updated component data back into the filesystem's in-memory store.
+        Sync component data in place and report whether its values changed.
 
         The update **must** be done in-place on the existing ``data["Components"]`` dict
         object.  ``_config_step_processor.variables["vehicle_components"]`` holds a
@@ -2923,7 +2923,7 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
         """
         fs_data = self._local_filesystem.vehicle_components_fs.data
         if fs_data is None:
-            return
+            return False
         if "Components" in fs_data:
             # Verify that the evaluator's reference is the same object we are updating.
             # Only check when the variable is already populated; before first load it is absent.
@@ -2935,10 +2935,14 @@ class ParameterEditor:  # pylint: disable=too-many-public-methods, too-many-inst
                 # evaluator at the live object rather than crashing the GUI event loop.
                 logging_error(_("vehicle_components evaluator reference is stale; re-syncing to the live object"))
                 self._config_step_processor.variables["vehicle_components"] = fs_data["Components"]
+            if fs_data["Components"] == components:
+                return False
             fs_data["Components"].clear()
-            fs_data["Components"].update(components)
+            # Sharing the editor's nested dicts would hide its next change.
+            fs_data["Components"].update(deepcopy(components))
         else:
-            fs_data["Components"] = dict(components)
+            fs_data["Components"] = deepcopy(components)
+        return True
 
     def save_vehicle_components(self) -> tuple[bool, str]:
         """Save the vehicle components data to disk."""

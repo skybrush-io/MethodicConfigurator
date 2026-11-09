@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pymavlink.dialects.v20 import ardupilotmega as mavlink
+from telemetry_test_helpers import create_telemetry_link, feed
 
 import ardupilot_methodic_configurator.plugins.frontend_tkinter_motor_test as motor_test_module
 from ardupilot_methodic_configurator.backend_filesystem_program_settings import ProgramSettings
@@ -66,6 +68,8 @@ class FakeMotorTestModel:  # pylint: disable=too-many-instance-attributes, too-m
     """Minimal stand-in for MotorTestDataModel with controllable behavior."""
 
     def __init__(self) -> None:
+        self.flight_controller = MagicMock(spec=FlightController)
+        self.flight_controller.master = None
         self.frame_class = 1
         self.frame_type = 1
         self.motor_count = 2
@@ -283,6 +287,7 @@ def dummy_base_window(tk_root) -> DummyBaseWindow:
 def dialog_spies(mocker) -> SimpleNamespace:
     """Prevent blocking GUI dialogs during tests and expose spies."""
     return SimpleNamespace(
+        showinfo=mocker.patch.object(motor_test_module, "showinfo"),
         showerror=mocker.patch.object(motor_test_module, "showerror"),
         showwarning=mocker.patch.object(motor_test_module, "showwarning"),
         askyesno=mocker.patch.object(motor_test_module, "askyesno", return_value=True),
@@ -296,13 +301,18 @@ def motor_view(
     fake_model,
     dummy_base_window,
     mocker,
+    motor_update_timers: dict[str, Callable[[], None]],  # noqa: ARG001 # pylint: disable=unused-argument
 ) -> Generator[MotorTestView, None, None]:
     parent = ttk.Frame(tk_root)
     view = MotorTestView(parent, fake_model, dummy_base_window)
     mocker.patch.object(parent, "after")
     mocker.patch.object(tk_root, "after")
-    yield view
-    parent.destroy()
+    try:
+        yield view
+    finally:
+        if view.winfo_exists():
+            view.destroy()
+        parent.destroy()
 
 
 @pytest.fixture
@@ -390,6 +400,56 @@ def motor_connection_recovery(motor_view_with_controller: MotorTestView) -> Gene
         yield recovery
     finally:
         recovery.stop()
+
+
+@pytest.mark.parametrize("reason", list(PluginPauseReason))
+def test_motor_view_reuses_live_esc_table_and_cleans_up_its_receiver(
+    motor_view: MotorTestView, fake_model: FakeMotorTestModel, reason: PluginPauseReason
+) -> None:
+    """
+    Keep the embedded table in step with the motor view lifecycle.
+
+    GIVEN motor test controls and a reporting ESC on the shared connection,
+    WHEN the view pauses, resumes, hides and is destroyed,
+    THEN the bottom table displays telemetry and releases its receiver and timer.
+    """
+    link = create_telemetry_link()
+    link.master.target_system = 1
+    link.master.target_component = 1
+    fake_model.flight_controller.master = link.master
+    telemetry = motor_view.esc_telemetry_view
+    assert motor_view._content_frame.pack_slaves()[-1] is telemetry
+    feed(link, mavlink.MAVLink_esc_telemetry_1_to_4_message([40] * 4, [1200] * 4, [0] * 4, [0] * 4, [100] * 4, [1] * 4))
+    telemetry.after_cancel(telemetry._timer_id)
+    telemetry._poll()
+    assert telemetry.table.cget("displaycolumns") == ("1", "2", "3", "4")
+    assert telemetry.table.item("1", "values")[:4] == ("12.00",) * 4
+    assert len(link.master.message_hooks) == 1
+
+    timer = telemetry._timer_id
+    motor_view.on_suspend(reason)
+    assert timer not in telemetry.tk.call("after", "info")
+    assert telemetry._timer_id is None
+    assert not link.master.message_hooks
+    assert not telemetry.table.cget("displaycolumns")
+    assert fake_model.stop_calls == (1 if reason is PluginPauseReason.EXCLUSIVE_OPERATION else 0)
+    telemetry._poll()
+    assert telemetry._timer_id is None
+
+    motor_view.on_resume()
+    timer = telemetry._timer_id
+    motor_view.on_activate()
+    assert telemetry._timer_id == timer
+    motor_view.on_deactivate()
+    assert telemetry._timer_id is None
+    motor_view.on_activate()
+    telemetry.after_cancel(telemetry._timer_id)
+    telemetry._poll()
+    assert len(link.master.message_hooks) == 1
+    timer = telemetry._timer_id
+    motor_view.destroy()
+    assert timer not in telemetry.tk.call("after", "info")
+    assert not link.master.message_hooks
 
 
 class TestDelayedProgressCallback:
@@ -966,45 +1026,68 @@ class TestMotorTestView:  # pylint: disable=too-many-public-methods
 
         GIVEN: The root window used by the view
         WHEN: Shortcuts are configured
-        THEN: The expected bindings and focus calls occur
+        THEN: The expected bindings and focus calls occur, and destruction removes the bindings
         """
-        bind_spy = mocker.patch.object(motor_view.root_window, "bind")
+        # Teardown needs the real bind method to remove scripts as well as callback commands.
+        bind_spy = mocker.spy(motor_view.root_window, "bind")
         focus_spy = mocker.patch.object(motor_view.root_window, "focus_set")
         motor_view._setup_keyboard_shortcuts()
         assert {call.args[0] for call in bind_spy.call_args_list} == {"<Escape>", "<Control-s>"}
         focus_spy.assert_called_once()
 
-    def test_destroy_unbinds_keyboard_shortcuts(self, motor_view: MotorTestView, mocker) -> None:
+        bindings = list(motor_view._keyboard_bindings)
+        motor_view.destroy()
+        for sequence, binding_id in bindings:
+            assert binding_id not in motor_view.root_window.tk.call("bind", str(motor_view.root_window), sequence)
+
+    def test_destroy_unbinds_keyboard_shortcuts(self, motor_view: MotorTestView) -> None:
         """Destroying the view must remove its app-wide actuator shortcuts."""
-        unbind_spy = mocker.patch.object(motor_view.root_window, "unbind")
+        bindings = list(motor_view._keyboard_bindings)
+
+        assert bindings
+        assert all(binding_id in motor_view.root_window.bind(sequence) for sequence, binding_id in bindings)
 
         motor_view.destroy()
 
-        assert unbind_spy.call_count == 2
+        assert all(binding_id not in motor_view.root_window.bind(sequence) for sequence, binding_id in bindings)
 
-    def test_destroy_preserves_preexisting_root_binding(self, motor_view: MotorTestView, mocker) -> None:
-        """Destroying the view must not erase a shortcut owned by another view."""
-        mocker.patch.object(motor_test_module, "sys", SimpleNamespace(version_info=(3, 10)))
+    @pytest.mark.parametrize("legacy_unbind", [False, True])
+    def test_destroy_preserves_preexisting_root_binding(
+        self, motor_view: MotorTestView, mocker: MockerFixture, legacy_unbind: bool
+    ) -> None:
+        """Destroying the view preserves earlier and later shortcuts on all supported Python versions."""
         sequences = ("<Escape>", "<Control-s>", "<Control-a>", "<Control-q>")
         for sequence in sequences:
             motor_view.root_window.unbind(sequence)
-        motor_view.root_window.bind("<Control-s>", lambda _event: "break")
+        earlier_id = motor_view.root_window.bind("<Control-s>", lambda _event: "break")
         motor_view._keyboard_bindings.clear()
         motor_view._setup_keyboard_shortcuts()
+        later_id = motor_view.root_window.bind("<Control-s>", lambda _event: "break", add="+")
+        if legacy_unbind:
+            # Reproduce Python 3.11.0-3.11.7 and 3.12.0 clearing every handler, even with a callback ID.
+            mocker.patch.object(
+                motor_view.root_window,
+                "unbind",
+                side_effect=lambda sequence, _funcid=None: motor_view.root_window.tk.call(
+                    "bind", str(motor_view.root_window), sequence, ""
+                ),
+            )
 
         motor_view.destroy()
 
-        assert str(motor_view.root_window.bind("<Control-s>")).strip()
+        remaining = motor_view.root_window.bind("<Control-s>")
+        for binding_id in (earlier_id, later_id):
+            assert binding_id in remaining
+            assert motor_view.root_window.tk.call("info", "commands", binding_id)
 
-    def test_destroy_deletes_legacy_tcl_binding_commands(self, motor_view: MotorTestView, mocker) -> None:
-        """Legacy cleanup must delete callback commands as well as binding scripts."""
-        mocker.patch.object(motor_test_module, "sys", SimpleNamespace(version_info=(3, 10)))
+    def test_destroy_deletes_tcl_binding_commands(self, motor_view: MotorTestView) -> None:
+        """Cleanup must delete callback commands as well as binding scripts."""
         sequences = ("<Escape>", "<Control-s>", "<Control-a>", "<Control-q>")
         for sequence in sequences:
             motor_view.root_window.unbind(sequence)
         motor_view._keyboard_bindings.clear()
         motor_view._setup_keyboard_shortcuts()
-        binding_ids = [binding_id for _sequence, binding_id, _previous in motor_view._keyboard_bindings]
+        binding_ids = [binding_id for _sequence, binding_id in motor_view._keyboard_bindings]
 
         assert all(motor_view.root_window.tk.call("info", "commands", binding_id) for binding_id in binding_ids)
 
@@ -1282,6 +1365,108 @@ class TestMotorTestViewMotorSwapping:
         assert motor_view.detected_comboboxes[0].get() == ""
 
 
+@pytest.mark.parametrize("control", ["throttle", "duration"])
+@pytest.mark.parametrize("error_kind", ["conversion", "validation", "parameter"])
+def test_invalid_motor_settings_restore_the_last_accepted_value_and_explain_the_failure(
+    motor_view: MotorTestView, fake_model: FakeMotorTestModel, dialog_spies: SimpleNamespace, control: str, error_kind: str
+) -> None:
+    """
+    Keep rejected motor-test input from changing the active test settings.
+
+    GIVEN: An accepted throttle or duration setting
+    WHEN: The user submits a typo or a value rejected by the model
+    THEN: The original setting is restored and the dialog explains the failed input
+    """
+    spinbox = motor_view.throttle_spinbox if control == "throttle" else motor_view.duration_spinbox
+    value = "oops" if error_kind == "conversion" else "77"
+    if error_kind != "conversion":
+        error = (
+            ValidationError("outside the allowed range") if error_kind == "validation" else ParameterError("FC rejected it")
+        )
+        setattr(fake_model, f"raise_{control}_error", error)
+    spinbox.delete(0, "end")
+    spinbox.insert(0, value)
+
+    if control == "throttle":
+        motor_view._on_throttle_change()
+    else:
+        motor_view._on_duration_change()
+
+    expected_value = "25" if control == "throttle" else "3.0"
+    assert spinbox.get() == expected_value
+    assert fake_model.get_test_throttle_pct() == 25
+    assert fake_model.get_test_duration_s() == 3.0
+    title = "Throttle value error" if control == "throttle" else "Duration value error"
+    if error_kind == "conversion":
+        message = (
+            "Invalid throttle value entered, reset to 25%"
+            if control == "throttle"
+            else "Invalid duration value entered, reset to 3 seconds"
+        )
+    else:
+        detail = "outside the allowed range" if error_kind == "validation" else "FC rejected it"
+        message = f"{control.capitalize()} validation failed: {detail}"
+    dialog_spies.showerror.assert_called_once_with(title, message)
+
+
+@pytest.mark.parametrize("action", ["single", "all", "sequence"])
+def test_declining_motor_safety_confirmation_does_not_send_any_test_command(
+    motor_view: MotorTestView, fake_model: FakeMotorTestModel, dialog_spies: SimpleNamespace, action: str
+) -> None:
+    """
+    Respect refusal of the first motor-test safety confirmation.
+
+    GIVEN: The first-test warning has not been acknowledged
+    WHEN: The user declines a single, simultaneous or sequential motor test
+    THEN: No test command is sent and the warning remains pending
+    """
+    dialog_spies.askyesno.return_value = False
+
+    if action == "single":
+        motor_view._test_motor(0, 1)
+    elif action == "all":
+        motor_view._test_all_motors()
+    else:
+        motor_view._test_motors_in_sequence()
+
+    assert fake_model.single_motor_calls == []
+    assert fake_model.all_motor_runs == 0
+    assert fake_model.sequence_runs == 0
+    assert fake_model.should_show_first_test_warning()
+    dialog_spies.askyesno.assert_called_once_with("Safety Confirmation", fake_model.get_safety_warning_message())
+
+
+@pytest.mark.parametrize(
+    ("event", "status", "color"),
+    [(MotorStatusEvent.COMMAND_SENT, "Command sent", "green"), (MotorStatusEvent.STOP_SENT, "Stop sent", "red")],
+)
+def test_motor_status_updates_only_the_selected_motor_and_returns_to_ready_after_the_delay(
+    motor_view: MotorTestView, mocker: MockerFixture, event: MotorStatusEvent, status: str, color: str
+) -> None:
+    """
+    Show command feedback on the affected motor for the intended interval.
+
+    GIVEN: Two ready motor labels
+    WHEN: The second motor reports a test or stop command
+    THEN: Only that motor changes and the scheduled callback restores Ready after two seconds
+    """
+    schedule = mocker.patch.object(motor_view.root_window, "after")
+
+    motor_view._handle_status_event(2, event)
+
+    first, second = motor_view.motor_status_labels
+    assert first.cget("text") == "Ready"
+    assert second.cget("text") == status
+    assert str(second.cget("foreground")) == color
+    schedule.assert_called_once()
+    delay, callback = schedule.call_args.args
+    assert delay == 2000
+    callback()
+    assert second.cget("text") == "Ready"
+    assert str(second.cget("foreground")) == "blue"
+    assert first.cget("text") == "Ready"
+
+
 def test_motor_diagram_displays_a_real_png_and_reuses_the_resolved_path(
     motor_view: MotorTestView,
     fake_model: FakeMotorTestModel,
@@ -1555,6 +1740,9 @@ def test_motor_restart_retains_recovery_ownership_and_resumes_polling(
 
     def restart(*_args: object, **_kwargs: object) -> None:
         assert recovery.operation_active
+        assert motor_view.esc_telemetry_view._timer_id is None
+        motor_view.esc_telemetry_view._poll()
+        telemetry_poll.assert_not_called()
         recovery.check()
         recovery._monitor.poll.assert_not_called()
         recovery._monitor.reconnect.assert_not_called()
@@ -1570,6 +1758,7 @@ def test_motor_restart_retains_recovery_ownership_and_resumes_polling(
         patch.object(motor_test_module, "askfloat", return_value=0.2),
         patch.object(motor_view.model, method, side_effect=restart),
         patch.object(motor_view, "_update_battery_status", wraps=motor_view._update_battery_status) as battery_poll,
+        patch.object(motor_view.esc_telemetry_view.backend, "poll") as telemetry_poll,
     ):
         if handler == "frame":
             motor_view.frame_type_combobox.current(0)
@@ -1577,6 +1766,7 @@ def test_motor_restart_retains_recovery_ownership_and_resumes_polling(
         else:
             motor_view._set_motor_spin_arm()
         assert not recovery.operation_active
+        assert motor_view.esc_telemetry_view._timer_id is not None
         for _tick in range(2):
             motor_update_timers.pop(motor_view._timer_id)()
             assert len(motor_update_timers) == 1

@@ -31,15 +31,20 @@ jobs:
           - ${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}
           - windows-latest
           - macos-latest
-        python-version: ["3.14"]  # to make sure the latest AMC supported python version does not break
+        python-version: ["3.15.2"]  # to make sure the latest AMC supported python version does not break
+        exclude:
+          - os: macos-latest
+            python-version: "3.15.2"
         include:
+          - os: macos-latest
+            python-version: "3.14"
           - os: ${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}
-            python-version: "3.10"  # to make sure the minimum AMC supported python version does not break
+            python-version: "3.11"  # to make sure the minimum AMC supported python version does not break
             # this is also the version used to report test coverage, other versions do not report coverage
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: audit
 
@@ -118,7 +123,7 @@ jobs:
         run: uv pip install --editable "." --no-deps
 
       - name: Verify clean non-editable wheel installation
-        if: matrix.os == (vars.UBUNTU_RUNNER || 'ubuntu-latest') && matrix.python-version == '3.10'
+        if: matrix.os == (vars.UBUNTU_RUNNER || 'ubuntu-latest') && matrix.python-version == '3.11'
         run: |
           PKGS="$(python scripts/list_pypi_build_dependencies.py)"
           uv pip install $PKGS
@@ -227,7 +232,7 @@ jobs:
       - name: Upload coverage xml report
         # Use always() to always run this step to publish test results when there are test failures
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
             name: coverage-${{ matrix.os }}-${{ matrix.python-version }}-xml
             path: tests/*.xml
@@ -236,7 +241,7 @@ jobs:
       - name: Upload coverage report
         # Use always() to always run this step to publish test results when there are test failures
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
             name: coverage-${{ matrix.os }}-${{ matrix.python-version }}
             path: .coverage
@@ -260,7 +265,7 @@ jobs:
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: audit
 
@@ -270,7 +275,7 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           parallel-finished: true
-          carryforward: "run-${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}-py3.10,run-${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}-py3.14,run-windows-latest-py3.14,run-macos-latest-py3.14"
+          carryforward: "run-${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}-py3.11,run-${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}-py3.15.2,run-windows-latest-py3.15.2"
 
       # TODO: create a badge that presents the result of the Upload coverage xml report step
 
@@ -287,7 +292,7 @@ jobs:
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: audit
 
@@ -295,12 +300,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download Artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
 
       - name: Publish Test Results
-        uses: EnricoMi/publish-unit-test-result-action@d0a4676d0e0b938bc201470d88276b7c74c712b3 # v2.24.0
+        uses: EnricoMi/publish-unit-test-result-action@7622c5bf3d112a72ab4fa3951c2aa5723d8ab92d # v2.25.0
         if: always()
         id: test-results
         with:
@@ -344,16 +349,16 @@ jobs:
 
       - name: Download coverage report
         if: needs.pytest.result != 'skipped'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: coverage-${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}-3.10
+          name: coverage-${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}-3.11
 
       # https://docs.astral.sh/uv/guides/integration/github/
       - name: Install uv and set the Python version
         if: needs.pytest.result != 'skipped'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          python-version: '3.10'  # Match with the coverage report Python version
+          python-version: '3.11'  # Match with the coverage report Python version
           activate-environment: true
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
@@ -383,14 +388,14 @@ jobs:
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: audit
 
       - name: Download coverage xml report
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: coverage-${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}-3.10-xml
+          name: coverage-${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}-3.11-xml
 
       - name: Get Cover
         uses: orgoro/coverage@71cf993a407154ad9d8dd027c88a374b0ed002a9 # v3.3

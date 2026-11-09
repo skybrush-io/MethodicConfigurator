@@ -11,10 +11,12 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import contextlib
+import gc
 import tkinter as tk
 from collections.abc import Generator
 from threading import Event, get_ident
 from unittest.mock import MagicMock, patch
+from weakref import finalize
 
 import pytest
 
@@ -580,6 +582,44 @@ def test_sequoia_progress_defers_all_rendering(
         update.assert_not_called()
         idle.assert_not_called()
         bar_idle.assert_not_called()
+
+
+def test_closed_window_resources_are_collected_on_the_ui_thread_before_work_starts(
+    progress_window: ProgressWindow,  # pylint: disable=redefined-outer-name
+) -> None:
+    """
+    Starting background work safely releases resources left by a closed window.
+
+    GIVEN: A closed window, variable and image remain in an unreachable reference cycle
+    WHEN: The user starts a progress task
+    THEN: All three are finalized on the UI thread before the worker starts
+    """
+    ui_thread = get_ident()
+    cleanup_threads: list[tuple[str, int]] = []
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        closed_window = tk.Toplevel(progress_window.parent)
+        closed_window.withdraw()
+        variable = tk.StringVar(master=closed_window, value="Previous window")
+        image = tk.PhotoImage(master=closed_window, width=1, height=1)
+        cycle: list[object] = [closed_window, variable, image]
+        cycle.append(cycle)
+        finalize(closed_window, lambda: cleanup_threads.append(("window", get_ident())))
+        finalize(variable, lambda: cleanup_threads.append(("variable", get_ident())))
+        finalize(image, lambda: cleanup_threads.append(("image", get_ident())))
+        closed_window.destroy()
+        del cycle, closed_window, variable, image
+        assert not cleanup_threads
+
+        finalized_before_work, worker_thread = progress_window.run_task(lambda _report: (cleanup_threads.copy(), get_ident()))
+
+        assert worker_thread != ui_thread
+        assert sorted(finalized_before_work) == [("image", ui_thread), ("variable", ui_thread), ("window", ui_thread)]
+    finally:
+        gc.collect()
+        if gc_was_enabled:
+            gc.enable()
 
 
 @pytest.mark.parametrize("fail_dialog", [False, True])

@@ -60,6 +60,29 @@ The above scripts will:
 * Set up pre-commit hooks for linting and formatting
 * Install GNU gettext tools for internationalization support
 
+### Pymavlink fast log indexing
+
+The uv project configuration enables pymavlink's native DataFlash indexer when it builds
+pymavlink from source. Published wheels may already include the indexer. Source builds need
+Python development headers and a C compiler; on Windows install Microsoft C++ Build Tools
+with the Desktop development with C++ workload. Pymavlink can silently fall back to a pure
+Python build if compilation is unavailable. Check the active environment with:
+
+```bash
+python -c "from pymavlink.dfindexer import available; print(available)"
+```
+
+If it prints `False`, install the build prerequisites and rebuild the pinned dependency from
+the project directory, bypassing previously cached builds:
+
+```bash
+uv pip install --reinstall-package pymavlink --no-binary pymavlink --no-cache -e .
+python -c "from pymavlink.dfindexer import available; assert available"
+```
+
+The uv setting applies to builds run from this project. Other installers need the
+`PYMAVLINK_FAST_INDEX=1` environment variable while building pymavlink from source.
+
 ### Running tests on Linux
 
 On Linux systems without a usable desktop display, the test suite may need the
@@ -83,6 +106,176 @@ SITL tests directly, set `SITL_BINARY` explicitly:
 SITL_BINARY="$PWD/sitl/arducopter" PATH="$PWD/.venv/bin:$PATH" \
   xvfb-run -a python -m pytest -m sitl -v
 ```
+
+### Mutation testing
+
+The optional [Mutmut](https://mutmut.readthedocs.io/en/latest/) suite checks whether
+existing tests detect small changes to modules covering battery voltages,
+parameter validation and serialization, firmware version parsing, parameter
+history, AutoTune acceleration/gain backoff, IMU helpers, firmware upload,
+log-analysis orchestration, usage popups, file browsing and task scheduling, motor-test UI,
+bootloader protocol handling, schema-validated filesystem IO, IMU log analysis,
+vehicle-component validation/display, flight-controller business rules, transfer
+progress accounting, configuration expression evaluation, firmware parameter
+migrations, battery-monitor telemetry and status handling, and configuration-step
+processing. All plugin backends and data models are included, together with shared
+data/ESC telemetry models, telemetry and radio backends, and flight-controller
+command handling used by calibration and motor-testing plugins. External parameter
+upload selection, configured file-upload policy, atomic file replacement, and
+flight-controller diagnostic assembly and device rows are also included, together
+with MAVLink inspector sorting, source identifiers, and decoded-field presentation.
+ESC log analysis covers armed-period RPM and current comparisons, per-output error
+peaks, motor-spin margins, and documented DShot output rates.
+Parameter-table tests cover add-dialog filtering and selection, bulk-add feedback,
+bitmask editing, and completion of batched rendering.
+PM log checks cover current and pre-4.6 internal-error fields, alias precedence,
+non-finite telemetry, and peak error counts.
+It runs on Linux, macOS, or Windows
+through WSL.
+
+Install it into the project virtual environment:
+
+```bash
+uv pip install --python .venv/bin/python --editable '.[dev,mutation]'
+```
+
+Mutmut verifies the configured tests against unmodified behavior before testing
+mutations. Xvfb is needed on Linux because the shared test fixtures import
+PyAutoGUI during collection:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" xvfb-run -a mutmut run --max-children 2
+.venv/bin/mutmut results --all true
+.venv/bin/mutmut browse
+```
+
+On macOS, run `mutmut run --max-children 2` with the virtual environment activated
+and a working desktop display, without `xvfb-run`.
+
+The `[tool.mutmut]` section in `pyproject.toml` selects both the modules to mutate
+and the tests to run. Update those lists together when expanding the suite.
+Plugin `backend_*.py` and `data_model_*.py` targets use globs, and the entire
+`tests/plugins/` directory is selected, so newly added plugin implementations and
+their tests are included automatically. Shared implementations outside the plugin
+directory and their tests must still be added explicitly.
+The command module's source-lint regression is deselected only for mutation runs:
+it checks the hand-written source, while Mutmut generates thousands of function
+variants that make that subprocess exceed the normal test timeout. Normal pytest
+and the pylint CI job continue to run that check.
+Include the module's existing behavior, BDD, and unit tests when auditing the
+selection. A "no tests" result can indicate an omitted test file or missing
+association rather than missing tests in the repository.
+Its `do_not_mutate` list mirrors `[report].omit` in `.coveragerc`, keeping generated
+and externally maintained files out of mutation runs.
+CI reads the same configuration for its separate clean-test run, so new test
+selections do not need to be duplicated in the workflow.
+Add repository resources and test helpers used by selected tests to `also_copy`;
+the AutoTune tests need `TUNING_GUIDE_Heli.md`, component-model tests need the
+`tests/` directory for shared fixtures, and MAVLink inspector tests need the
+PowerShell completion module copied into Mutmut's test tree.
+Plugin packaging regressions also require the `windows/`, `linux/`, and `macos/`
+directories containing the frozen-build specifications.
+Generated copies and results are stored in the ignored `mutants/` directory;
+Mutmut resumes previous work there. For a fresh baseline, remove that generated
+directory first, especially after changing tests or dependencies. Run from the
+repository root so that Mutmut reads its configuration.
+
+The [mutation workflow](.github/workflows/mutation.yml) runs manually or weekly on
+Ubuntu with Python 3.11. It uploads results without enforcing a mutation score;
+clean-test and framework failures still fail the job. Per-mutant timeouts and
+crashes are reported for review. Scheduled runs are disabled in forks.
+The job summary groups all mutation outcomes by module; the
+artifact retains individual results and execution logs. The existing coverage
+gate remains independent.
+
+For surviving mutations, inspect the diff with `mutmut show <mutant-name>` and add
+assertions for observable behavior. Some mutations are equivalent; review those
+individually rather than adding broad suppressions. Mutmut 3 primarily mutates
+function bodies, so explicit tests are still needed for module-level constants.
+Timeouts, missing test associations, and execution errors need separate review.
+Type-check filtering and coverage-only filtering are intentionally disabled for
+the mutation suite.
+
+Audit the selected tests before writing replacements: the manual-override unit,
+acceptance and integration tests exercise parameter editability and serialization,
+while `test_derived_parameter_confirmation.py` checks parameter snapshot differences.
+Keep those suites selected when mutating the parameter models.
+
+Review equivalent survivors separately from missing assertions. For example,
+`float("inf")` and `float("INF")` behave identically; changing the split limit in
+`parse_ver_fields()` does not change its first token; and the battery voltage
+helpers' fallback arguments cannot be reached when the preceding indexed lookup
+already requires the same keys. In the template-name helper, missing product
+fields defaulting to either `None` or an empty string are normalized to the same
+empty string. Do not construct unsupported inputs merely to kill these mutants
+or exclude entire functions because some of their mutants are equivalent.
+
+The flight-controller frame helper's empty default vehicle type and an unknown
+vehicle type both use the standard frame parameters. In transfer accounting,
+the extra zero in `max(previous, current, 0)` is redundant while the previous
+counter starts at zero and never decreases. Changes to the evaluator's
+`typing.cast` type argument also have no runtime effect. Retain these equivalent
+survivors rather than weakening the mutation scope or testing invalid counter states.
+
+For firmware parameter migrations, verify release boundaries and the file,
+parameter names, and version inputs shown in diagnostic warnings. Some survivors
+only change log wording. Others change unused SR helper placeholders, or bypass
+the SERIAL preservation branch and reach the same generic preservation behavior.
+The outer newer-version guard is redundant with the individual migration gates.
+Review these separately from mutations that change migrated tuning.
+
+For battery monitoring, check secondary-battery thresholds and startup recovery
+after reconnecting or re-enabling monitoring. False-valued stream-state resets
+can be equivalent when only their truth value is used. An unset interval of
+`None` or an empty string also compares differently from every positive requested
+interval. Review these and diagnostic wording changes separately from safety
+status and retry behavior.
+
+For configuration steps, exercise computed values with the real expression
+evaluator and check parameter metadata, defaults, identity, and rename feedback.
+Some dictionary fallbacks and empty reasons are normalized to the same domain
+values. Transient-variable cleanup can be redundant with rebuilding the step's
+evaluation context. The current rename planner returns no duplicate removals,
+so that feedback branch is unreachable through normal processing. Review these
+separately from lost metadata, incorrect live inputs, and conflicting renames.
+
+For external parameter and configured file uploads, check omitted-edit warnings,
+verified FC snapshots, complete per-file outcomes including filenames, and executor
+progress callbacks. For atomic writes, verify that failures preserve the original
+and remove temporary files, and that content is synced before replacement.
+Encoding aliases and native newline defaults can behave identically on Linux;
+directory-open flag changes can also be equivalent where `O_RDONLY` is zero.
+For diagnostics, cover timeout boundaries, component isolation, pending-message
+eviction, malformed text, and invalid entries before valid devices. Some split-limit
+changes preserve the first token, category lookups normalize case, and the decoder
+returns an error together with a missing decoded value. Review these separately
+from device-ID and chunk-sequence boundary survivors and platform-specific I/O paths.
+
+For a focused rerun, pass quoted module or function patterns to `mutmut run`,
+for example:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" xvfb-run -a mutmut run --max-children 2 \
+  'ardupilot_methodic_configurator.plugins.imu_helpers.*'
+```
+
+Keep a copy of previous results before refreshing `mutants/`, and report killed,
+surviving, unassociated, timed-out and crashed mutants separately. A partial run
+does not establish a new score for the full configured suite.
+
+The suite uses `forkserver_warmup = "none"` under `[tool.mutmut]` so test-module
+imports, including Tk, initialize inside each worker. Preloading GUI modules in
+the fork server produced worker crashes and timeouts during plugin mutation runs;
+the same mutants were killed with worker-local imports. This costs additional
+worker startup time. Keep worker counts modest and retain crashed or timed-out
+outcomes separately when comparing runs; a worker failure alone does not show
+that a mutant changes application behavior.
+The shared plugin conftest runs direct backend/model assertions before Tk callers
+when `MUTANT_UNDER_TEST` is set. GUI tests remain selected; this ordering lets
+incorrect domain results fail before a GUI callback can stall on them.
+Mutation jobs use pytest-timeout's thread watchdog so a blocked Tk C call cannot
+outlive the per-test timeout while consuming too little CPU for Mutmut's CPU
+limit. Normal pytest runs keep their existing timeout method.
 
 ### Optional local code graph
 

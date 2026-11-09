@@ -383,8 +383,12 @@ class _ParameterHistoryState:
                 self.initialization_complete = True
             self.last_timestamp_us = timestamp_us
 
-        if name not in self.default_values and default is not None:
-            self.default_values[name] = default
+        if default is not None:
+            previous_default = self.default_values.get(name)
+            if previous_default is None or (
+                not math.isfinite(float(cast("Any", previous_default))) and math.isfinite(float(cast("Any", default)))
+            ):
+                self.default_values[name] = default
 
         if not self.initialization_complete:
             previous_value = self.current_values.get(name)
@@ -583,7 +587,22 @@ def _extract_parameter_snapshots_from_log_data(
     if log_data.parameter_history is None:
         msg = "No parameter history found in log"
         raise SystemExit(msg)
-    return log_data.parameter_defaults, log_data.parameter_history.latest_values
+    current_values = log_data.parameter_history.latest_values
+    invalid_current = sorted(name for name, value in current_values.items() if not math.isfinite(value))
+    if invalid_current:
+        msg = _("Log contains non-finite current parameter values: {parameters}").format(parameters=", ".join(invalid_current))
+        raise SystemExit(msg)
+    invalid_defaults = sorted(name for name, value in log_data.parameter_defaults.items() if not math.isfinite(value))
+    defaults = {name: value for name, value in log_data.parameter_defaults.items() if math.isfinite(value)}
+    if not defaults:
+        msg = _("No finite parameter default values found in log")
+        raise SystemExit(msg)
+    if invalid_defaults:
+        logging_warning(
+            _("Ignoring non-finite parameter defaults from the log: %s. Their current values will still be imported."),
+            ", ".join(invalid_defaults),
+        )
+    return defaults, current_values
 
 
 def extract_bin_log_data(
@@ -746,7 +765,7 @@ def _message_values(
     msg: Any,  # noqa: ANN401
     schema: data_model_log_data.MessageSchema,
     payload: dict[str, Any],
-    field_info: Mapping[str, Any],
+    message_dtype: np.dtype[Any],
 ) -> list[Any]:
     """Convert one decoded message into values compatible with its structured-array schema."""
     values: list[Any] = []
@@ -761,13 +780,13 @@ def _message_values(
             multiplier = schema.multipliers[field_index]
             if multiplier is not None:
                 value *= multiplier
-        if field_info[field_name][0].kind == "S" and isinstance(value, str):
+        if message_dtype[field_name].kind == "S" and isinstance(value, str):
             value = value.encode("ascii", "ignore")
         values.append(value)
     return values
 
 
-def _fill_message_arrays(  # pylint: disable=too-many-locals
+def _fill_message_arrays(
     mlog: mavutil.mavfile,
     log_data: data_model_log_data.LogData,
     progress_reporter: _ProgressReporter | None = None,
@@ -806,12 +825,11 @@ def _fill_message_arrays(  # pylint: disable=too-many-locals
         payload = msg.to_dict()
         _validate_message_fields(schema, payload)
 
-        field_info = array.dtype.fields
-        if field_info is None:
+        if array.dtype.fields is None:
             error_message = _("Structured array for {message_type} is missing field metadata").format(message_type=msg_type)
             raise ValueError(error_message)
 
-        array[index] = tuple(_message_values(msg, schema, payload, field_info))
+        array[index] = tuple(_message_values(msg, schema, payload, array.dtype))
         write_positions[msg_type] = index + 1
 
     if progress_reporter is not None:

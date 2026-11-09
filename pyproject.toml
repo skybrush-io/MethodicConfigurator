@@ -31,11 +31,11 @@ classifiers = [
     "Natural Language :: Italian",
     "Natural Language :: Japanese",
     "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Software Development :: Embedded Systems",
     "Topic :: System :: Installation/Setup",
     "Topic :: Scientific/Engineering",
@@ -44,8 +44,8 @@ classifiers = [
 
 dependencies = [
     "argcomplete==3.7.2",
-    "certifi==2026.10.19",
     "defusedxml==0.7.1",
+    "httpx2[socks]==2.16.0",
     "jsonschema==4.26.0",
     "matplotlib==3.10.3; python_version < '3.14'",
     "matplotlib==3.10.9; python_version >= '3.14' and python_version < '3.15'",
@@ -53,46 +53,43 @@ dependencies = [
     "numpy==2.0.2; python_version < '3.13'",
     "numpy==2.3.4; python_version >= '3.13' and python_version < '3.15'",
     "numpy==2.5.4; python_version >= '3.15'",
-    "pillow==12.3.0",
-    "pip_system_certs==5.3",
-    "platformdirs==4.3.8; python_version < '3.11'",
-    "platformdirs==4.13.5; python_version >= '3.11'",
+    "pillow==13.0.0",
+    "platformdirs==4.13.5",
     "pymavlink==2.4.50",
     "pyserial==3.5",
-    "requests==2.34.2",
     "screeninfo==0.8.1",
-    "selenium==4.50.0",
+    "selenium==4.51.0",
     "simpleeval==1.0.8",
     "skybrush-log-analyzer>=0.3.0",
-    "typing_extensions==4.16.0; python_version < '3.11'",
 ]
 
 dynamic = ["version"]
 
 [project.optional-dependencies]
 dev = [
-    "coverage==7.16.2",
+    "coverage==7.17.0",
     "mock==5.2.0",
-    "mypy==2.3.1",
-    "pre-commit==4.6.2",
-    "pylint==4.1.2",
+    "mypy==2.4.0",
+    "pre-commit==4.7.0",
+    "pylint==4.1.3",
     "pyautogui==0.9.54",
     "pyright==1.1.414",
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
     "pytest-md==0.2.0",
-    "pytest-mock==3.16.0",
+    "pytest-mock==3.17.0",
     "pytest-timeout==2.4.0",
     "python-gettext==5.0",
-    "ruff==0.16.9",
-    "tomli==2.2.1; python_version < '3.11'",
-    "types-requests==2.33.0.20260906",
-    "ty==0.0.86",
-    "typing_extensions==4.16.0",
+    "ruff==0.17.3",
+    "ty==0.0.96",
 ]
 
 ci_headless_tests = [
     "pytest-xvfb==3.1.1",
+]
+
+mutation = [
+    "mutmut==3.8.0",
 ]
 
 scripts = [
@@ -104,7 +101,7 @@ scripts = [
 pypi_dist = [
     "build==1.6.1",
     "packaging==26.3",
-    "setuptools==84.0.0",
+    "setuptools==84.1.0",
 ]
 
 win_dist = [
@@ -171,6 +168,8 @@ changelog = "https://github.com/ArduPilot/MethodicConfigurator/releases"
 
 [tool.uv]
 required-version = ">=0.12.6"
+# Pymavlink disables its native DataFlash indexer on Windows and macOS source builds.
+extra-build-variables = { pymavlink = { PYMAVLINK_FAST_INDEX = "1" } }
 
 [tool.setuptools]
 # Discover the application and its subpackages; specify data via package-data.
@@ -190,14 +189,181 @@ check-filenames = true
 ignore-words-list = "datas,intoto,juli,laf,ned,parm,sade,sitl,thst,sie,mot,carisma,ine,InE"
 skip = "*.pdef.xml,*.pdf,*.po"
 
+[tool.mutmut]
+source_paths = ["ardupilot_methodic_configurator/"]
+# Cover parameter handling, parsing, calculations, and every plugin backend/data model.
+only_mutate = [
+    # Globs keep new plugin backends and data models in scope automatically.
+    "ardupilot_methodic_configurator/plugins/backend_*.py",
+    "ardupilot_methodic_configurator/plugins/data_model_*.py",
+    # External parameter selection, file-upload policy, atomic writes, and diagnostics.
+    "ardupilot_methodic_configurator/data_model_parameter_compare_and_upload.py",
+    "ardupilot_methodic_configurator/data_model_file_upload.py",
+    "ardupilot_methodic_configurator/backend_safe_file_io.py",
+    "ardupilot_methodic_configurator/data_model_fc_diagnostics.py",
+    # Shared implementations used by telemetry and calibration plugins.
+    "ardupilot_methodic_configurator/backend_data_telemetry.py",
+    "ardupilot_methodic_configurator/backend_esc_telemetry.py",
+    "ardupilot_methodic_configurator/backend_mavlink_telemetry.py",
+    "ardupilot_methodic_configurator/backend_radio_status.py",
+    "ardupilot_methodic_configurator/backend_flightcontroller_commands.py",
+    "ardupilot_methodic_configurator/data_model_data_telemetry.py",
+    "ardupilot_methodic_configurator/data_model_esc_telemetry.py",
+    "ardupilot_methodic_configurator/data_model_mavlink_inspector.py",
+    "ardupilot_methodic_configurator/data_model_configuration_step.py",
+    "ardupilot_methodic_configurator/data_model_parameter_upgrade.py",
+    "ardupilot_methodic_configurator/backend_flightcontroller_business_logic.py",
+    "ardupilot_methodic_configurator/data_model_transfer_progress.py",
+    "ardupilot_methodic_configurator/data_model_safe_evaluator.py",
+    "ardupilot_methodic_configurator/battery_cell_voltages.py",
+    "ardupilot_methodic_configurator/data_model_ardupilot_parameter.py",
+    "ardupilot_methodic_configurator/data_model_par_dict.py",
+    "ardupilot_methodic_configurator/backend_flightcontroller_bootloader.py",
+    "ardupilot_methodic_configurator/data_model_vehicle_components_display.py",
+    "ardupilot_methodic_configurator/data_model_vehicle_components_validation.py",
+    "ardupilot_methodic_configurator/data_model_vehicle_components_base.py",
+    "ardupilot_methodic_configurator/data_model_vehicle_components_templates.py",
+    "ardupilot_methodic_configurator/data_model_vehicle_components_import.py",
+    "ardupilot_methodic_configurator/data_model_vehicle_components_json_schema.py",
+    "ardupilot_methodic_configurator/backend_firmware_upload.py",
+    "ardupilot_methodic_configurator/frontend_tkinter_usage_popup_windows.py",
+    "ardupilot_methodic_configurator/frontend_tkinter_log_analysis.py",
+    "ardupilot_methodic_configurator/backend_flightcontroller_connection.py",
+    "ardupilot_methodic_configurator/backend_flightcontroller.py",
+    "ardupilot_methodic_configurator/backend_filesystem_program_settings.py",
+    "ardupilot_methodic_configurator/frontend_tkinter_fc_banner_window.py",
+    "ardupilot_methodic_configurator/frontend_tkinter_mavlink_inspector.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_plane_landing.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_availability_imu.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_availability_esc.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_availability_pm.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_log_availability_check.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_availability_gnss.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_gnss_samples.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_gnss_interference.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_gnss_consistency.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_firmware_version.py",
+    "ardupilot_methodic_configurator/log_analysis/data_model_parameter_history.py",
+    "ardupilot_methodic_configurator/plugins/imu_helpers.py",
+    "ardupilot_methodic_configurator/data_model_firmware_upload.py",
+    "ardupilot_methodic_configurator/log_analysis/backend_log_analysis.py",
+    "ardupilot_methodic_configurator/frontend_tkinter_usage_popup_window.py",
+    "ardupilot_methodic_configurator/frontend_tkinter_file_browser.py",
+    "ardupilot_methodic_configurator/frontend_tkinter_file_browser_tasks.py",
+    "ardupilot_methodic_configurator/frontend_tkinter_parameter_editor_table.py",
+    "ardupilot_methodic_configurator/plugins/frontend_tkinter_motor_test.py",
+    "ardupilot_methodic_configurator/backend_filesystem_json_with_schema.py",
+]
+# Keep mutation scope aligned with [report].omit in .coveragerc: these files are
+# generated, synchronized, or maintained in another repository.
+do_not_mutate = [
+    "ardupilot_methodic_configurator/backend_mavftp.py",
+    "ardupilot_methodic_configurator/mavftp_example.py",
+    "ardupilot_methodic_configurator/tempcal_imu.py",
+    "ardupilot_methodic_configurator/data_model_fc_ids.py",
+    "ardupilot_methodic_configurator/configuration_steps_strings.py",
+    "ardupilot_methodic_configurator/vehicle_components.py",
+    "ardupilot_methodic_configurator/decode_devid.py",
+]
+pytest_add_cli_args_test_selection = [
+    # Include model, backend, unit, behavior, and real-widget plugin regressions.
+    "tests/plugins/",
+    "tests/test_data_model_parameter_compare_and_upload.py",
+    "tests/test_data_model_file_upload.py",
+    "tests/unit_backend_safe_file_io.py",
+    "tests/bdd_backend_safe_file_io.py",
+    "tests/test_backend_safe_file_io_write_capture.py",
+    "tests/test_data_model_fc_diagnostics.py",
+    "tests/test_backend_data_telemetry.py",
+    "tests/test_esc_telemetry.py",
+    "tests/test_backend_flightcontroller_commands.py",
+    "tests/unit_backend_flightcontroller_commands.py",
+    "tests/test_data_model_configuration_step.py",
+    "tests/test_data_model_parameter_upgrade.py",
+    "tests/test_backend_flightcontroller_business_logic.py",
+    "tests/test_data_model_transfer_progress.py",
+    "tests/test_data_model_safe_evaluator.py",
+    "tests/unit_battery_cell_voltages.py",
+    "tests/test_data_model_ardupilot_parameter.py",
+    "tests/unit_manual_override.py",
+    "tests/acceptance_manual_override.py",
+    "tests/integration_manual_override.py",
+    "tests/test_data_model_par_dict.py",
+    "tests/test_derived_parameter_confirmation.py",
+    "tests/test_backend_flightcontroller_bootloader.py",
+    "tests/test_bootloader_identity.py",
+    "tests/test_bootloader_partial_read.py",
+    "tests/test_data_model_imu_analysis.py",
+    "tests/test_data_model_availability_models.py",
+    "tests/test_data_model_log_availability_check.py",
+    "tests/test_data_model_gnss_analysis.py",
+    "tests/test_data_model_log_analysis.py",
+    "tests/test_bus_labels.py",
+    "tests/test_data_model_vehicle_components_display.py",
+    "tests/unit_data_model_vehicle_components_display.py",
+    "tests/test_data_model_vehicle_components_validation.py",
+    "tests/test_data_model_vehicle_components_validation_bdd.py",
+    "tests/unit_data_model_vehicle_components_validation_constants.py",
+    "tests/unit_data_model_vehicle_components_validation.py",
+    "tests/test_data_model_vehicle_components_base.py",
+    "tests/unit_data_model_vehicle_components_base.py",
+    "tests/test_data_model_vehicle_components_templates.py",
+    "tests/test_data_model_vehicle_components_import.py",
+    "tests/unit_data_model_vehicle_components_import.py",
+    "tests/test_data_model_vehicle_components_json_schema.py",
+    "tests/unit_data_model_vehicle_components_json_schema.py",
+    "tests/test_backend_firmware_upload.py",
+    "tests/test_data_model_firmware_upload.py",
+    "tests/test_frontend_tkinter_usage_popup_windows.py",
+    "tests/test_frontend_tkinter_log_analysis.py",
+    "tests/test_backend_flightcontroller_connection.py",
+    "tests/test_backend_flightcontroller.py",
+    "tests/test_backend_filesystem_program_settings.py",
+    "tests/bdd_backend_filesystem_program_settings_port_save.py",
+    "tests/test_backend_filesystem_program_settings_validation.py",
+    "tests/test_frontend_tkinter_fc_banner_window.py",
+    "tests/test_frontend_tkinter_mavlink_inspector.py",
+    "tests/test_data_model_mavlink_inspector.py",
+    "tests/test_data_model_plane_landing.py",
+    "tests/test_data_model_firmware_version.py",
+    "tests/test_data_model_parameter_history.py",
+    "tests/test_backend_log_analysis.py",
+    "tests/test_backend_fc_diagnostics.py",
+    "tests/test_frontend_tkinter_usage_popup_window.py",
+    "tests/test_frontend_tkinter_file_browser.py",
+    "tests/bdd_frontend_tkinter_file_browser.py",
+    "tests/test_frontend_tkinter_file_browser_tasks.py",
+    "tests/test_frontend_tkinter_parameter_editor_table.py",
+    "tests/integration_frontend_tkinter_parameter_editor_table.py",
+    "tests/acceptance_bitmask_parameter_editor_usage_popup.py",
+    "tests/test_backend_filesystem_json_with_schema.py",
+]
+pytest_add_cli_args = [
+    "-q", "-x", "-p", "tests.plugins.conftest",
+    # A signal timeout cannot interrupt a blocked Tk C call.
+    "--timeout-method=thread",
+    # Lint the original source in normal pytest/CI, not Mutmut's generated variants.
+    "--deselect=tests/test_backend_flightcontroller_commands.py::test_command_ack_meets_pylint_statement_and_return_limits",
+]
+# Plugin tests also verify helicopter guidance and all three frozen-build specifications.
+also_copy = [
+    "pytest.ini", "TUNING_GUIDE_Heli.md", "tests",
+    "ardupilot_methodic_configurator_command_line_completion.psm1",
+    "windows", "linux", "macos",
+]
+process_isolation = "forkserver"
+# Tk imports must initialize inside each worker, not the fork server.
+forkserver_warmup = "none"
+
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 exclude = [
     ".git",
     ".packaging-check",
     "__pycache__",
     "__target__",
     "dist",
+    "mutants",
     "scripts/test_gui_environment.py",
     "svg_comparison_demo.py",
     "scripts/show_svg_tk_variants.py",
@@ -261,6 +427,7 @@ max-args = 9       # Default is 5
 max-branches = 24  # Default is 12
 
 [tool.mypy]
+exclude = ['^mutants/']
 ignore_missing_imports = true
 disallow_any_unimported = false
 disallow_any_expr = false
@@ -309,6 +476,7 @@ exclude = [
     "__pycache__",
     "__target__",
     "dist",
+    "mutants",
     "scripts/test_gui_environment.py",
     "svg_comparison_demo.py",
     "scripts/show_svg_tk_variants.py",
@@ -330,7 +498,7 @@ exclude = [
     "ardupilot_methodic_configurator/mavftp_example.py",
 ]
 typeCheckingMode = "standard"
-pythonVersion = "3.10"
+pythonVersion = "3.11"
 pythonPlatform = "All"
 deprecateTypingAliases = true
 venvPath = "."

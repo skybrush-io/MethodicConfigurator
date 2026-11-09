@@ -11,6 +11,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 # https://wiki.tcl-lang.org/page/Changing+Widget+Colors
 
 import contextlib
+import gc
 import tkinter as tk
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
@@ -92,7 +93,7 @@ class TkThreadCallbacks:
             for callback, (current, total) in progress.items():
                 try:
                     callback(current, total)
-                except Exception as error:  # noqa: PERF203 # pylint: disable=broad-exception-caught
+                except Exception as error:  # pylint: disable=broad-exception-caught
                     # A paint failure must not strand a dialog or the task's completion.
                     logging_error(_("Updating progress widgets: {_e}").format(_e=error))
             try:
@@ -423,6 +424,8 @@ class ProgressWindow:  # pylint: disable=too-many-instance-attributes
         self._task_active = True
         try:
             with self._suspend_parent_interaction(parent):
+                # Finalize closed Tk windows here before worker allocations trigger garbage collection.
+                gc.collect()
                 runner.start(work, on_progress or self.update_progress_bar, finish)
                 parent.wait_variable(completed)
         finally:

@@ -31,10 +31,12 @@ from logging import info as logging_info
 from logging import warning as logging_warning
 from pathlib import Path
 from sys import exit as sys_exit
+from tkinter import Tk, ttk
 
 import argcomplete
 
 from ardupilot_methodic_configurator import _, __version__
+from ardupilot_methodic_configurator.backend_bin_log_validation import validate_bin_log as _run_bin_log_validation
 from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.backend_filesystem_freedesktop import FreeDesktop
 from ardupilot_methodic_configurator.backend_filesystem_migration import (
@@ -93,11 +95,14 @@ def register_plugins() -> None:
     registrations = (
         ("frontend_tkinter_accelerometer_calibration", "register_accelerometer_calibration_plugin"),
         ("frontend_tkinter_ahrs_orientation", "register_ahrs_orientation_plugin"),
+        ("frontend_tkinter_autotune_accel_backoff", "register_autotune_accel_backoff_plugin"),
         ("frontend_tkinter_autotune_gain_backoff", "register_autotune_gain_backoff_plugin"),
         ("frontend_tkinter_battery_monitor", "register_battery_monitor_plugin"),
         ("frontend_tkinter_compass_calibration", "register_compass_calibration_plugin"),
         ("frontend_tkinter_data_telemetry", "register_data_telemetry_plugin"),
+        ("frontend_tkinter_esc_telemetry", "register_esc_telemetry_plugin"),
         ("frontend_tkinter_esc_rpm_scale", "register_esc_rpm_scale_plugin"),
+        ("frontend_tkinter_gnss", "register_gnss_plugin"),
         ("frontend_tkinter_level_calibration", "register_level_calibration_plugin"),
         ("frontend_tkinter_motor_test", "register_motor_test_plugin"),
         ("frontend_tkinter_rc_calibration", "register_rc_calibration_plugin"),
@@ -126,6 +131,21 @@ def validate_plugin_registration() -> None:
         logging_error("Plugin registration validation failed. Missing plugins: %s", ", ".join(sorted(missing)))
         sys_exit(1)
     logging_info("Validated registration of all %d plugins", len(expected))
+
+
+def validate_tkinter_runtime() -> None:
+    """Verify Tcl, Tk, and ttk initialize using the runtime's bundled library data."""
+    root = Tk()
+    try:
+        root.withdraw()
+        ttk.Button(root, text="Packaging validation").pack()
+        root.update_idletasks()
+        tcl_version = root.tk.call("info", "patchlevel")
+        tk_version = root.tk.call("package", "require", "Tk")
+        tcl_library = root.tk.call("info", "library")
+        print(f"Validated Tcl {tcl_version} and Tk {tk_version} (Tcl library: {tcl_library})")  # noqa: T201
+    finally:
+        root.destroy()
 
 
 class ApplicationState:  # pylint: disable=too-few-public-methods
@@ -172,19 +192,6 @@ def create_argument_parser() -> argparse.ArgumentParser:
 
     argcomplete.autocomplete(parser)
     return parser
-
-
-def _run_bin_log_validation(logfile: str) -> None:
-    """Run the isolated DataFlash validator requested by a frozen child process."""
-    from pymavlink import mavutil  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
-
-    try:
-        mlog = mavutil.mavlink_connection(logfile)
-        close_method = getattr(mlog, "close", None)
-        if callable(close_method):
-            close_method()
-    except (OSError, ValueError, SystemExit) as error:
-        raise SystemExit(str(error)) from None
 
 
 def _validate_command_line_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -798,7 +805,10 @@ def parameter_editor_and_uploader(state: ApplicationState) -> None:
 
 
 def _run_validation_command() -> bool:
-    """Handle headless validation modes before normal application startup."""
+    """Handle packaging validation modes before normal application startup."""
+    if sys.argv[1:] == ["--validate-tkinter"]:
+        validate_tkinter_runtime()
+        return True
     if sys.argv[1:] == ["--validate-plugins"]:
         validate_plugin_registration()
         return True

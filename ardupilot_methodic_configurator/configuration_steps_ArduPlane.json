@@ -273,9 +273,8 @@
             "rename_connection": "vehicle_components['ESC']['ESC->FC Telemetry']['Type']",
             "old_filenames": [],
             "plugin": {
-                "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol'] == 'Scripting'",
-                "name": "esc_rpm_scale",
-                "placement": "left"
+                "name": "esc_telemetry",
+                "placement": "top"
             },
             "related_bin_messages": {
                 "ESC": { "name": "ESC telemetry", "required": true },
@@ -336,8 +335,8 @@
             "auto_changed_by": "",
             "autoimport_nondefault_regexp": ["BATT.*"],
             "forced_parameters": {
-                "BATT_FS_CRT_ACT": { "New Value": 1, "Change Reason": "Land ASAP" },
-                "BATT_FS_LOW_ACT": { "New Value": 2, "Change Reason": "Return and land at home or rally point" }
+                "BATT_FS_CRT_ACT": { "New Value": 2, "Change Reason": "Land: fly the nearest DO_LAND_START landing sequence in AUTO, otherwise RTL" },
+                "BATT_FS_LOW_ACT": { "New Value": 1, "Change Reason": "RTL: return to launch" }
             },
             "derived_parameters": {
                 "BATT_ARM_VOLT": { "New Value": "vehicle_components['Battery']['Specifications']['Volt per cell arm']*vehicle_components['Battery']['Specifications']['Number of cells']", "Change Reason": "Only arm above this voltage, to avoid taking off with insufficient battery capacity" },
@@ -385,6 +384,11 @@
             "mandatory_text": "40% mandatory (60% optional)",
             "component": "Motors",
             "auto_changed_by": "",
+            "plugin": {
+                "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol'] == 'Scripting'",
+                "name": "esc_rpm_scale",
+                "placement": "left"
+            },
             "derived_parameters": {
                 "ESC_HW_POLES": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol'] == 'Scripting'", "New Value": "vehicle_components['Motors']['Specifications']['Poles']", "Change Reason": "Specified in component editor window" },
                 "SERVO_BLH_POLES": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol'] in ['ESC Telemetry', 'BDShotOnly']", "New Value": "vehicle_components['Motors']['Specifications']['Poles']", "Change Reason": "Specified in component editor window" },
@@ -589,6 +593,7 @@
             "external_tool_url": "",
             "mandatory_text": "100% mandatory (0% optional)",
             "component": "GNSS Receiver",
+            "plugin": {"name": "gnss", "placement": "top"},
             "auto_changed_by": "",
             "autoimport_nondefault_regexp": ["BRD_BOOT_DELAY", "GPS.*", "GNSS.*"],
             "derived_parameters": {
@@ -1241,7 +1246,7 @@
         "49_autotune_finish.param": {
             "why": "Q_A_THR_MIX_MAX should be increased after autotune to maximize attitude control authority at high throttle",
             "why_now": "After all autotune flights are complete and the PIDs are finalized",
-            "blog_text": "Finalize autotune by setting the maximum throttle mix parameter",
+            "blog_text": "Finalize autotune by setting the maximum throttle mix and compensating acceleration limits for takeoff weight",
             "blog_url": "https://ardupilot.github.io/MethodicConfigurator/TUNING_GUIDE_ArduPlane#955-roll-and-pitch-axis-re-autotune",
             "wiki_text": "AutoTune",
             "wiki_url": "https://ardupilot.org/copter/docs/autotune.html",
@@ -1249,6 +1254,15 @@
             "external_tool_url": "",
             "mandatory_text": "100% mandatory (0% optional)",
             "auto_changed_by": "",
+            "plugin": {"name": "autotune_accel_backoff", "placement": "top", "if": "vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'"},
+            "add_parameters": {
+                "Q_A_ACCEL_R_MAX": { "if": "'Q_A_ACCEL_R_MAX' in fc_parameters and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'", "Change Reason": "AutoTune acceleration limit before takeoff weight compensation" },
+                "Q_A_ACCEL_P_MAX": { "if": "'Q_A_ACCEL_P_MAX' in fc_parameters and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'", "Change Reason": "AutoTune acceleration limit before takeoff weight compensation" },
+                "Q_A_ACCEL_Y_MAX": { "if": "'Q_A_ACCEL_Y_MAX' in fc_parameters and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'", "Change Reason": "AutoTune acceleration limit before takeoff weight compensation" },
+                "Q_A_ACC_R_MAX": { "if": "'Q_A_ACC_R_MAX' in fc_parameters and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'", "Change Reason": "AutoTune acceleration limit before takeoff weight compensation" },
+                "Q_A_ACC_P_MAX": { "if": "'Q_A_ACC_P_MAX' in fc_parameters and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'", "Change Reason": "AutoTune acceleration limit before takeoff weight compensation" },
+                "Q_A_ACC_Y_MAX": { "if": "'Q_A_ACC_Y_MAX' in fc_parameters and vehicle_components['Frame']['Specifications']['Frame class'] != 'Undefined'", "Change Reason": "AutoTune acceleration limit before takeoff weight compensation" }
+            },
             "forced_parameters": {
                 "Q_A_THR_MIX_MAX": { "New Value": 0.9, "Change Reason": "Maximize attitude control authority at high throttle" }
             },

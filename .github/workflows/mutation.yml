@@ -1,0 +1,110 @@
+name: Mutation testing
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 5 * * 1'  # Every Monday at 05:23 UTC
+
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mutation:
+    # Allow manual runs in forks, but avoid unattended weekly runs there.
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.fork
+    runs-on: ${{ vars.UBUNTU_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 300
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: '3.11'
+          activate-environment: true
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+
+      - name: Install virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth
+
+      - name: Install dependencies
+        run: uv pip install --editable '.[dev,mutation]'
+
+      - name: Verify unmodified selected tests
+        shell: bash
+        run: |
+          mkdir -p .cache/mutation
+          xvfb-run -a python - <<'PY'
+          import tomllib
+
+          import pytest
+
+          with open("pyproject.toml", "rb") as config_file:
+              config = tomllib.load(config_file)["tool"]["mutmut"]
+          raise SystemExit(pytest.main([
+              *config["pytest_add_cli_args_test_selection"],
+              *config["pytest_add_cli_args"],
+              "--junit-xml=.cache/mutation/baseline.xml",
+          ]))
+          PY
+
+      - name: Run mutation suite
+        timeout-minutes: 290
+        shell: bash
+        run: |
+          # Clean-test and framework failures fail this step.
+          # Per-mutant survivors, timeouts, and crashes are reported for review.
+          xvfb-run -a mutmut run --max-children 2 | tee .cache/mutation/run.log
+
+      - name: Report mutation results
+        if: always()
+        shell: bash
+        run: |
+          if [ -d mutants ]; then
+            mutmut results --all true | tee .cache/mutation/results.txt
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          counts = defaultdict(Counter)
+          for line in Path(".cache/mutation/results.txt").read_text().splitlines():
+              mutant, status = line.strip().rsplit(": ", 1)
+              module = mutant.rsplit(".", 1)[0].removeprefix("ardupilot_methodic_configurator.")
+              counts[module][status] += 1
+          statuses = sorted({status for counts_by_status in counts.values() for status in counts_by_status})
+          print("### Mutation testing\n")
+          print("Survivors are reported for review; no mutation-score threshold is enforced yet.\n")
+          print("| Module | " + " | ".join(statuses) + " |")
+          print("| --- | " + " | ".join("---:" for _ in statuses) + " |")
+          for module, counts_by_status in sorted(counts.items()):
+              print(f"| `{module}` | " + " | ".join(str(counts_by_status[status]) for status in statuses) + " |")
+          print("\nDownload the mutation artifact for individual results and execution logs.")
+          PY
+          fi
+
+      - name: Upload mutation reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutation-py311
+          path: |
+            .cache/mutation/
+            mutants/**/*.meta
+            mutants/mutmut-stats.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14

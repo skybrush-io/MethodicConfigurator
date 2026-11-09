@@ -11,7 +11,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -59,6 +59,24 @@ def test_opening_diagnostics_receives_queued_messages_without_another_fc_operati
     enqueue(b"New critical diagnostic")
     assert connection.status_text_buffer == []
     assert connection.poll_status_text() == ["New critical diagnostic"]
+
+
+def test_diagnostics_poll_reads_without_blocking(
+    diagnostics_connection: tuple[FlightControllerConnection, Callable[..., None]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GIVEN an idle diagnostics poll, WHEN it reads MAVLink, THEN the read never blocks."""
+    connection, _enqueue = diagnostics_connection
+    received_blocking_arguments: list[bool] = []
+
+    def receive(*, blocking: bool) -> None:
+        received_blocking_arguments.append(blocking)
+
+    assert connection.master is not None
+    monkeypatch.setattr(connection.master, "recv_match", receive)
+
+    assert connection.poll_status_text() == []
+    assert received_blocking_arguments == [False]
 
 
 def test_other_vehicles_and_components_cannot_displace_the_selected_controllers_diagnostics(
@@ -137,8 +155,8 @@ def test_display_history_is_newest_first_with_local_arrival_times(
     # Arrange: Use the real MAVLink parser while controlling only the arrival clock.
     connection, enqueue = diagnostics_connection
     received_times = [
-        datetime(2026, 10, 13, 12, 34, 56, tzinfo=timezone.utc),
-        datetime(2026, 10, 13, 12, 34, 58, tzinfo=timezone.utc),
+        datetime(2026, 10, 13, 12, 34, 56, tzinfo=UTC),
+        datetime(2026, 10, 13, 12, 34, 58, tzinfo=UTC),
     ]
 
     # Act: Parse each packet separately so each completed message receives its own timestamp.

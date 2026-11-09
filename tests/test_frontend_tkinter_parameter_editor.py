@@ -18,6 +18,7 @@ import re
 import threading
 import tkinter as tk
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from functools import partial
 from sys import platform as sys_platform
 from threading import Event, get_ident
@@ -35,7 +36,10 @@ from ardupilot_methodic_configurator.backend_filesystem import Par
 from ardupilot_methodic_configurator.backend_flightcontroller_reconnect import FlightControllerReconnect
 from ardupilot_methodic_configurator.data_model_ardupilot_parameter import ArduPilotParameter
 from ardupilot_methodic_configurator.data_model_parameter_editor import LogAnalysisInputs, ParameterEditor
+from ardupilot_methodic_configurator.data_model_vehicle_components import ComponentDataModel
+from ardupilot_methodic_configurator.data_model_vehicle_components_json_schema import VehicleComponentsJsonSchema
 from ardupilot_methodic_configurator.frontend_tkinter_base_window import BaseWindow
+from ardupilot_methodic_configurator.frontend_tkinter_component_editor import ComponentEditorWindow
 from ardupilot_methodic_configurator.frontend_tkinter_connection_recovery import (
     ConnectionRecovery,
     RecoveryCallbacks,
@@ -69,6 +73,7 @@ from ardupilot_methodic_configurator.plugins.plugin_protocol import PluginPauseR
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
 
+    from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
     from ardupilot_methodic_configurator.plugins.plugin_protocol import PluginView
 
 # pylint: disable=too-many-lines, redefined-outer-name, protected-access
@@ -277,6 +282,7 @@ def parameter_editor() -> MagicMock:
     manager.handle_param_file_change_workflow.return_value = ("01_initial.param", True)
     manager.get_plugin.return_value = None
     manager.get_current_component.return_value = None
+    manager.update_vehicle_components.return_value = True
     manager.handle_write_changes_workflow = MagicMock()
     manager.handle_copy_fc_values_workflow = MagicMock(return_value="close")
     manager.open_documentation_in_browser = MagicMock()
@@ -3202,10 +3208,20 @@ class TestPluginLayoutRebuild:
                         assert canvas.winfo_height() >= view._continue_btn.winfo_reqheight() + 8
                         canvas.yview_moveto(1)
                         root.update_idletasks()
-                        assert canvas.winfo_rooty() <= view._continue_btn.winfo_rooty()
-                        assert view._continue_btn.winfo_rooty() + view._continue_btn.winfo_height() <= (
-                            canvas.winfo_rooty() + canvas.winfo_height()
-                        )
+                        # Screen coordinates can lag scrolling under a withdrawn Windows root.
+                        # Translate the button position through its parents into canvas coordinates.
+                        button_y = canvas.coords(view._scroll_frame.canvas_window)[1]
+                        ancestor: tk.Misc = view._continue_btn
+                        while ancestor is not view._scroll_frame.view_port:
+                            button_y += ancestor.winfo_y()
+                            parent = ancestor.master
+                            assert parent is not None
+                            ancestor = parent
+                        scroll_top, scroll_bottom = map(float, canvas.cget("scrollregion").split()[1::2])
+                        canvas.yview_moveto((button_y - scroll_top) / (scroll_bottom - scroll_top))
+                        root.update_idletasks()
+                        assert canvas.canvasy(0) <= button_y
+                        assert button_y + view._continue_btn.winfo_height() <= canvas.canvasy(canvas.winfo_height())
                     editor._rebuild_plugin_layout(None)
                     root.update_idletasks()
         finally:
@@ -4635,6 +4651,90 @@ class TestStepInstructionsPopupWorkflows:
 class TestInlineComponentEditorCallbacks:
     """Tests for the inline component editor data-sync and table-refresh callback."""
 
+    @pytest.mark.parametrize(
+        ("path", "original", "edited"),
+        [
+            (("RC Receiver", "FC Connection", "Protocol"), "CRSF", "SRXL"),
+            (("RC Receiver", "FC Connection", "Type"), "SERIAL1", "SERIAL2"),
+            (("Battery", "Specifications", "Capacity mAh"), 1800, 2000),
+        ],
+        ids=["receiver-protocol", "receiver-connection-cascade", "numeric-component"],
+    )
+    def test_unchanged_component_events_do_not_refresh_but_real_edits_do(
+        self,
+        root: tk.Tk,
+        parameter_editor: MagicMock,
+        path: tuple[str, ...],
+        original: str | int,
+        edited: str | int,
+    ) -> None:
+        """
+        Opening a component dropdown does not refresh its parameter table.
+
+        GIVEN: Offline component controls and the real component-sync operation
+        WHEN: Focus changes without editing, then the user changes and restores a value
+        THEN: Only real edits refresh the table, including connection/protocol cascades
+        """
+        data = {
+            "Components": {
+                "RC Receiver": {"FC Connection": {"Type": "SERIAL1", "Protocol": "CRSF"}},
+                "Battery": {"Specifications": {"Capacity mAh": 1800}},
+            }
+        }
+        protocol_path = ("RC Receiver", "FC Connection", "Protocol")
+        choices = {protocol_path: ("CRSF", "SRXL"), ("RC Receiver", "FC Connection", "Type"): ("SERIAL1", "SERIAL2")}
+        synchronizer = ParameterEditor.__new__(ParameterEditor)
+        stored = deepcopy(data)
+        synchronizer._local_filesystem = cast(
+            "LocalFilesystem", SimpleNamespace(vehicle_components_fs=SimpleNamespace(data=stored))
+        )
+        synchronizer._config_step_processor = SimpleNamespace(variables={"vehicle_components": stored["Components"]})
+        parameter_editor.update_vehicle_components.side_effect = synchronizer.update_vehicle_components
+        editor = _create_editor(parameter_editor)
+        editor.repopulate_parameter_table = MagicMock()
+        editor._update_plugin_layout = MagicMock()
+        component = ComponentEditorWindow.__new__(ComponentEditorWindow)
+        component.data_model = ComponentDataModel(data, {}, VehicleComponentsJsonSchema({}))
+        component.data_model.get_combobox_values_for_path = MagicMock(side_effect=lambda field: choices.get(field, ()))
+        component._populating = False
+        component._on_component_change = editor._on_component_data_changed
+        editor.inline_component_editor = component
+        container = ttk.Frame(root)
+        component.entry_widgets = {protocol_path: component.add_entry_or_combobox("CRSF", container, protocol_path)}
+        widget = (
+            component.entry_widgets[protocol_path]
+            if path == protocol_path
+            else component.add_entry_or_combobox(original, container, path)
+        )
+        try:
+            widget.event_generate("<FocusOut>")
+            editor.repopulate_parameter_table.assert_not_called()
+
+            if isinstance(widget, ttk.Combobox):
+                widget.current(widget.list_keys.index(str(edited)))
+                widget.event_generate("<<ComboboxSelected>>")
+            else:
+                widget.delete(0, tk.END)
+                widget.insert(0, str(edited))
+            widget.event_generate("<FocusOut>")
+            editor.repopulate_parameter_table.assert_called_once()
+            assert stored["Components"] == component.get_component_data()["Components"]
+            widget.event_generate("<FocusOut>")
+            editor.repopulate_parameter_table.assert_called_once()
+
+            if isinstance(widget, ttk.Combobox):
+                widget.current(widget.list_keys.index(str(original)))
+                widget.event_generate("<<ComboboxSelected>>")
+            else:
+                widget.delete(0, tk.END)
+                widget.insert(0, str(original))
+            widget.event_generate("<FocusOut>")
+            assert editor.repopulate_parameter_table.call_count == 2
+            assert stored["Components"] == data["Components"]
+            assert component.entry_widgets[protocol_path].get_selected_key() == "CRSF"
+        finally:
+            container.destroy()
+
     @pytest.mark.parametrize("plugin_name", ["rc_calibration", "battery_monitor"])
     def test_offline_component_edits_preserve_plugin_placeholder(
         self,
@@ -4727,18 +4827,19 @@ class TestInlineComponentEditorCallbacks:
         parameter_editor.refresh_current_step_computed_parameters.assert_not_called()
         editor.repopulate_parameter_table.assert_not_called()
 
-    def test_component_data_change_delegates_none_fs_data_to_update_method(self, parameter_editor: MagicMock) -> None:
+    def test_component_data_change_skips_refresh_when_sync_cannot_update(self, parameter_editor: MagicMock) -> None:
         """
-        Callback delegates the None-data guard to update_vehicle_components(), then refreshes.
+        Callback does not refresh when component data cannot be synchronized.
 
         GIVEN: vehicle_components_fs.data is None (file was never loaded)
         WHEN: _on_component_data_changed() is called
         THEN: No AttributeError is raised
         AND: update_vehicle_components() is called (it handles None internally)
-        AND: refresh_current_step_computed_parameters() is called
+        AND: refresh_current_step_computed_parameters() is not called
         """
         editor = _create_editor(parameter_editor)
         editor.repopulate_parameter_table = MagicMock()
+        parameter_editor.update_vehicle_components.return_value = False
 
         mock_inline_editor = MagicMock()
         mock_inline_editor.get_component_data.return_value = {"Components": {"Battery": {}}}
@@ -4747,7 +4848,8 @@ class TestInlineComponentEditorCallbacks:
         editor._on_component_data_changed()
 
         parameter_editor.update_vehicle_components.assert_called_once()
-        parameter_editor.refresh_current_step_computed_parameters.assert_called_once()
+        parameter_editor.refresh_current_step_computed_parameters.assert_not_called()
+        editor.repopulate_parameter_table.assert_not_called()
 
     def test_component_data_change_is_skipped_when_already_updating(self, parameter_editor: MagicMock) -> None:
         """

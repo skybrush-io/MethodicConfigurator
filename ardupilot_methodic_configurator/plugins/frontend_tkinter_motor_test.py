@@ -20,7 +20,6 @@ SPDX-FileCopyrightText: 2024-2026 Amilcar do Carmo Lucas <amilcar.lucas@iav.de>
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
-import sys
 import time
 import tkinter as tk
 from argparse import ArgumentParser, Namespace
@@ -43,9 +42,11 @@ from ardupilot_methodic_configurator.__main__ import (
     setup_logging,
 )
 from ardupilot_methodic_configurator.common_arguments import add_common_arguments
+from ardupilot_methodic_configurator.data_model_esc_telemetry import EscTelemetryDataModel
 from ardupilot_methodic_configurator.frontend_tkinter_base_window import (
     BaseWindow,
 )
+from ardupilot_methodic_configurator.frontend_tkinter_esc_telemetry import EscTelemetryView
 from ardupilot_methodic_configurator.frontend_tkinter_pair_tuple_combobox import PairTupleCombobox
 from ardupilot_methodic_configurator.frontend_tkinter_progress_window import (
     ProgressWindow,
@@ -135,7 +136,7 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
         self._timer_id: str | None = None  # Track scheduled update timer for cleanup
         self._suspended = False
         self._restart_active = False
-        self._keyboard_bindings: list[tuple[str, str, str]] = []
+        self._keyboard_bindings: list[tuple[str, str]] = []
 
         self._create_widgets()
 
@@ -256,6 +257,11 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
             text=_("Set Motor Spin Min"),
             command=self._set_motor_spin_min,
         ).pack(side="left", padx=5)
+
+        self.esc_telemetry_view = EscTelemetryView(
+            content_frame, EscTelemetryDataModel(self.model.flight_controller), self.base_window
+        )
+        self.esc_telemetry_view.pack(padx=10, pady=5, fill="x")
 
     def _create_motor_buttons(self, parent: Frame | ttk.Frame) -> None:
         """
@@ -651,6 +657,7 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
             self.after_cancel(self._timer_id)
             self._timer_id = None
         self._restart_active = True
+        self.esc_telemetry_view.on_suspend()
         try:
             recovery = getattr(self.base_window, "_connection_recovery", None)
             with recovery.operation() if recovery is not None else nullcontext():
@@ -660,6 +667,8 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
                     task(on_progress)
         finally:
             self._restart_active = False
+            if not self._suspended and self.winfo_exists():
+                self.esc_telemetry_view.on_resume()
             if resume_updates and self.winfo_exists():
                 self._timer_id = self.after(1000, self._on_update_timer)
 
@@ -812,7 +821,6 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
             "<Control-s>": self._stop_all_motors,
         }
         for sequence, action in shortcuts.items():
-            previous_binding = str(self.root_window.tk.call("bind", str(self.root_window), sequence))
             callback = cast(
                 "Callable[[Event], str]",
                 lambda _event, shortcut=action: self._handle_keyboard_shortcut(shortcut),
@@ -823,7 +831,7 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
                 add="+",
             )
             if isinstance(binding_id, str):
-                self._keyboard_bindings.append((sequence, binding_id, previous_binding))
+                self._keyboard_bindings.append((sequence, binding_id))
 
         # Focus root window to ensure it can capture key events
         self.root_window.focus_set()
@@ -836,6 +844,7 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
 
     def on_suspend(self, reason: PluginPauseReason = PluginPauseReason.EXCLUSIVE_OPERATION) -> None:
         """Stop actuators for FC tools; yield silently for connection checks and recovery."""
+        self.esc_telemetry_view.on_suspend(reason)
         if reason is PluginPauseReason.EXCLUSIVE_OPERATION:
             self.on_deactivate()
         self._suspended = True
@@ -857,6 +866,7 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
             self._diagram_needs_update = True
             self._update_motor_buttons_layout(force=True)
         self._update_view()
+        self.esc_telemetry_view.on_resume()
 
     def on_activate(self) -> None:
         """Refresh frame configuration and polling when the view becomes visible."""
@@ -869,6 +879,7 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
         Stops all running motor tests for safety when switching away from this plugin.
         Also cancels any pending update timers to prevent resource leaks.
         """
+        self.esc_telemetry_view.on_deactivate()
         # Cancel any pending update timer to prevent updating hidden widget
         if self._timer_id:
             self.after_cancel(self._timer_id)
@@ -902,17 +913,13 @@ class MotorTestView(Frame):  # pylint: disable=too-many-instance-attributes
         if self._timer_id:
             self.after_cancel(self._timer_id)
             self._timer_id = None
-        for sequence, binding_id, previous_binding in self._keyboard_bindings:
+        for sequence, binding_id in self._keyboard_bindings:
             with suppress(tk.TclError):
-                if sys.version_info >= (3, 11):
-                    self.root_window.unbind(sequence, binding_id)
-                else:
-                    # Python 3.10's tkinter.unbind(sequence, funcid) clears the
-                    # complete binding script before deleting funcid. Restore
-                    # the script that was present before this view was bound.
-                    self.root_window.unbind(sequence, binding_id)
-                    if previous_binding:
-                        self.root_window.bind(sequence, previous_binding)
+                # Python < 3.11.8 and Python 3.12.0 clear all handlers even when unbind receives a callback ID.
+                scripts = self.root_window.bind(sequence).splitlines()
+                remaining = "\n".join(line for line in scripts if not line.startswith(f'if {{"[{binding_id} ')).strip("\n")
+                self.root_window.bind(sequence, remaining + "\n" if remaining else "")
+                self.root_window.deletecommand(binding_id)
         self._keyboard_bindings.clear()
         super().destroy()
 

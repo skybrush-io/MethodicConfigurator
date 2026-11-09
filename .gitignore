@@ -42,3 +42,4 @@ tuning_report.csv
 
 .python-version
 uv.lock
+/mutants/

@@ -1435,10 +1435,13 @@ class TestFlightControllerConnectionBannerMethods:
         with (
             patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_time", side_effect=[0, 0, 2]),
             patch("ardupilot_methodic_configurator.backend_flightcontroller_connection.time_sleep"),
+            patch.object(master, "recv_match", wraps=master.recv_match) as recv_match,
         ):
             banner = connection._receive_banner_text()
         assert banner == ["ArduCopter V4.5.0", "ChibiOS: abc1234"]
         assert connection.status_text_buffer == []
+        assert recv_match.call_count > 0
+        assert all(call.kwargs.get("blocking") is False for call in recv_match.call_args_list)
 
     def test_receive_banner_text_returns_empty_list_without_master(self) -> None:
         """
@@ -2112,6 +2115,25 @@ class TestFlightControllerConnectionRetry:
         assert result == "No MAVLink heartbeat received, connection failed."
         master.close.assert_called_once()
         assert connection.master is None
+
+    @pytest.mark.parametrize("timeout", [None, FlightControllerConnection.CONNECTION_RETRY_TIMEOUT])
+    def test_explicit_device_connection_uses_the_requested_heartbeat_window(self, timeout: int | None) -> None:
+        """Remembered probes use the discovery window while ordinary explicit connections keep five seconds."""
+        master = Mock()
+        master.message_hooks = []
+        connection = FlightControllerConnection(info=FlightControllerInfo())
+        with (
+            patch.object(connection, "_create_mavlink_connection", return_value=master),
+            patch.object(connection, "_detect_vehicles_from_heartbeats", return_value={(1, 1): Mock()}) as detect,
+            patch.object(connection, "_select_supported_autopilot", return_value=""),
+            patch.object(connection, "_retrieve_autopilot_version_and_banner", return_value=""),
+        ):
+            result = connection.connect("COM7") if timeout is None else connection.connect("COM7", timeout=timeout)
+
+        assert result == ""
+        detect.assert_called_once()
+        assert detect.call_args.args == (5 if timeout is None else timeout, False)
+        connection.disconnect()
 
     def test_create_connection_registers_status_text_capture_hook(self) -> None:
         """The production connection path installs the STATUSTEXT packet hook."""

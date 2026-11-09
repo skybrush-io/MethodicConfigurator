@@ -495,9 +495,8 @@
             "rename_connection": "vehicle_components['ESC']['ESC->FC Telemetry']['Type']",
             "old_filenames": [],
             "plugin": {
-                "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol'] == 'Scripting'",
-                "name": "esc_rpm_scale",
-                "placement": "left"
+                "name": "esc_telemetry",
+                "placement": "top"
             },
             "related_bin_messages": {
                 "ESC": { "name": "ESC telemetry", "required": true },
@@ -552,8 +551,8 @@
             "auto_changed_by": "",
             "autoimport_nondefault_regexp": ["BATT.*"],
             "forced_parameters": {
-                "BATT_FS_CRT_ACT": { "New Value": 1, "Change Reason": "Land ASAP" },
-                "BATT_FS_LOW_ACT": { "New Value": 2, "Change Reason": "Return and land at home or rally point" }
+                "BATT_FS_CRT_ACT": { "New Value": 2, "Change Reason": "Hold: stop the vehicle" },
+                "BATT_FS_LOW_ACT": { "New Value": 1, "Change Reason": "RTL: return to launch" }
             },
             "derived_parameters": {
                 "BATT_ARM_VOLT": { "New Value": "vehicle_components['Battery']['Specifications']['Volt per cell arm']*vehicle_components['Battery']['Specifications']['Number of cells']", "Change Reason": "Only arm above this voltage, to avoid taking off with insufficient battery capacity" },
@@ -667,6 +666,7 @@
             "external_tool_url": "",
             "mandatory_text": "100% mandatory (0% optional)",
             "component": "GNSS Receiver",
+            "plugin": {"name": "gnss", "placement": "top"},
             "auto_changed_by": "",
             "autoimport_nondefault_regexp": ["BRD_BOOT_DELAY", "GPS.*", "GNSS.*"],
             "derived_parameters": {
@@ -836,6 +836,11 @@
             "mandatory_text": "40% mandatory (60% optional)",
             "component": "Motors",
             "auto_changed_by": "",
+            "plugin": {
+                "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol'] == 'Scripting'",
+                "name": "esc_rpm_scale",
+                "placement": "left"
+            },
             "derived_parameters": {
                 "ESC_HW_POLES": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol'] == 'Scripting'", "New Value": "vehicle_components['Motors']['Specifications']['Poles']", "Change Reason": "Specified in component editor window" },
                 "SERVO_BLH_POLES": { "if": "vehicle_components['ESC']['ESC->FC Telemetry']['Protocol'] in ['ESC Telemetry', 'BDShotOnly']", "New Value": "vehicle_components['Motors']['Specifications']['Poles']", "Change Reason": "Specified in component editor window" },

@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.data_model_par_dict import ParDict
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,74 @@ _LEAF_IDS = [d.relative_to(TEMPLATES_ROOT).as_posix() for d in _LEAF_DIRS]
 
 # Template directories whose duplicate-prefix issues are known and not yet fixed.
 _KNOWN_DUPLICATE_PREFIX_TEMPLATES: frozenset[str] = frozenset()
+
+
+@pytest.mark.parametrize("template_name", ["normal_plane", "empty_4.7.x"])
+def test_generic_plane_step_23_does_not_override_accel_filter(template_name: str) -> None:
+    """Generic Plane templates leave the Step 13 10 Hz setting in place during Step 23."""
+    template_dir = TEMPLATES_ROOT / "ArduPlane" / template_name
+    initial = ParDict.from_file(str(template_dir / "13_initial_atc.param"))
+    general = ParDict.from_file(str(template_dir / "23_general_configuration.param"))
+
+    assert initial["INS_ACCEL_FILTER"].value == 10
+    assert "INS_ACCEL_FILTER" not in general
+    assert set(general) == {"BRD_RTC_TZ_MIN", "INS_POS1_X", "INS_POS1_Y", "SCHED_LOOP_RATE", "SCR_ENABLE"}
+    assert general["SCHED_LOOP_RATE"].value == 50
+    assert general["SCR_ENABLE"].value == (1 if template_name == "normal_plane" else 0)
+
+
+def test_plane_step_13_still_forces_10_hz_accel_filter() -> None:
+    """The configuration-step rule that establishes the Plane accelerometer cutoff remains unchanged."""
+    configuration_file = TEMPLATES_ROOT.parent / "configuration_steps_ArduPlane.json"
+    step = json.loads(configuration_file.read_text(encoding="utf-8"))["steps"]["13_initial_atc.param"]
+
+    assert step["forced_parameters"]["INS_ACCEL_FILTER"]["New Value"] == "10"
+
+
+@pytest.mark.parametrize("template_name", ["normal_plane", "empty_4.7.x"])
+def test_generic_plane_compounded_steps_keep_10_hz_accel_filter(template_name: str) -> None:
+    """Compounding actual template files retains the initial accelerometer-filter setting."""
+    template_dir = TEMPLATES_ROOT / "ArduPlane" / template_name
+    filesystem = LocalFilesystem(
+        str(template_dir),
+        "ArduPlane",
+        "4.7.0",
+        allow_editing_template_files=False,
+        save_component_to_system_templates=False,
+        load_project=False,
+    )
+    filesystem.file_parameters = filesystem.read_params_from_files()
+
+    compounded, _first_step = filesystem.compound_params()
+
+    assert compounded["INS_ACCEL_FILTER"].value == 10
+
+
+def test_saved_plane_project_can_retain_its_own_accel_filter(tmp_path: Path) -> None:
+    """A saved project's later filter value remains authoritative when its files are compounded."""
+    (tmp_path / "13_initial_atc.param").write_text("INS_ACCEL_FILTER,10\n", encoding="utf-8")
+    (tmp_path / "23_general_configuration.param").write_text("INS_ACCEL_FILTER,17\nSCHED_LOOP_RATE,50\n", encoding="utf-8")
+    filesystem = LocalFilesystem(
+        str(tmp_path),
+        "ArduPlane",
+        "4.7.0",
+        allow_editing_template_files=False,
+        save_component_to_system_templates=False,
+        load_project=False,
+    )
+    filesystem.file_parameters = filesystem.read_params_from_files()
+
+    compounded, _first_step = filesystem.compound_params()
+
+    assert compounded["INS_ACCEL_FILTER"].value == 17
+    assert (tmp_path / "23_general_configuration.param").read_text(encoding="utf-8").startswith("INS_ACCEL_FILTER,17\n")
+
+
+def test_copter_general_template_still_sets_its_own_accel_filter() -> None:
+    """The Plane-specific correction does not alter ArduCopter's Step 23 template."""
+    general = ParDict.from_file(str(TEMPLATES_ROOT / "ArduCopter" / "empty_4.7.x" / "23_general_configuration.param"))
+
+    assert general["INS_ACCEL_FILTER"].value == 20
 
 
 @pytest.mark.parametrize("template_dir", _LEAF_DIRS, ids=_LEAF_IDS)
@@ -213,7 +282,7 @@ def test_separate_calibration_steps_preserve_the_existing_vehicle_settings(templ
 
     GIVEN: An independently captured historical template with measured calibration and output settings
     WHEN: The packaged template uses separate calibration, output and mode steps
-    THEN: Its final parameter values match the historical vehicle configuration
+    THEN: Its final parameter values match history apart from corrected Rover battery failsafes
     """
     fixture = Path(__file__).parent / "fixtures" / "vehicle_templates_v1.json"
     historical_files = json.loads(fixture.read_text(encoding="utf-8"))[template_id]["files"]
@@ -225,6 +294,15 @@ def test_separate_calibration_steps_preserve_the_existing_vehicle_settings(templ
             if line.strip() and not line.startswith("#"):
                 name, _, value = line.partition(",")
                 expected[name] = float(value.partition("#")[0])
+
+    if template_id.startswith("Rover/"):
+        # The later battery fix intentionally replaces historical defaults with RTL then Hold.
+        expected.update(
+            BATT_FS_LOW_ACT=1.0,
+            BATT_FS_CRT_ACT=2.0,
+            BATT2_FS_LOW_ACT=1.0,
+            BATT2_FS_CRT_ACT=2.0,
+        )
 
     template_dir = TEMPLATES_ROOT / template_id
     actual: dict[str, float] = {}
