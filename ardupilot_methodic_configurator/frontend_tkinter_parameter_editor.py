@@ -404,7 +404,6 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
         self._close_pending = False
         self._param_download_progress_window: ProgressWindow | None = None
         self._log_availability_report_window: LogAvailabilityReportWindow | None = None
-        self._skybrush_log_analysis_window: SkybrushLogAnalysisWindow | None = None
         self._log_analysis_running = False
         self._file_browser_window: FileBrowserWindow | None = None
         self._log_report_return_pending: bool = False
@@ -1084,7 +1083,7 @@ class ParameterEditorWindow(BaseWindow):  # pylint: disable=too-many-instance-at
         )
         if not filepath:
             return
-        self._skybrush_log_analysis_window = SkybrushLogAnalysisWindow(self.root, filepath)
+        SkybrushLogAnalysisWindow(self.root, filepath)
 
     def _navigate_to_config_step(self, step: str) -> None:
         if self.navigation_lock.locked:
